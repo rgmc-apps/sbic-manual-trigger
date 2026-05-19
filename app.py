@@ -150,7 +150,7 @@ def trigger():
 
     # Call the external endpoint
     try:
-        resp = requests.get(process["endpoint"], timeout=TIMEOUT_SECONDS)
+        resp = requests.post(process["endpoint"], timeout=TIMEOUT_SECONDS)
 
         try:
             response_body = resp.json()
