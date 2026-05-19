@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api *)",
+      "WebFetch(domain:github.com)",
+      "Bash(gh auth *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(New-Item -ItemType Directory -Force \"C:\\\\claude\\\\sbic-manual-trigger-page\\\\templates\")",
+      "Bash(Out-Null)",
+      "Bash(New-Item -ItemType Directory -Force \"C:\\\\claude\\\\sbic-manual-trigger-page\\\\static\")",
+      "Bash(Write-Output \"Directories created\")",
+      "PowerShell(Get-ChildItem \"C:\\\\claude\\\\sbic-manual-trigger-page\" -Recurse | Where-Object { !$_.PSIsContainer } | Select-Object FullName)"
+    ]
+  }
+}

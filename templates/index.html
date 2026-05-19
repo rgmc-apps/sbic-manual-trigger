@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SBIC AI Uploading Manual Trigger</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="logo-mark">
+        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+          <rect width="28" height="28" rx="6" fill="#4f8ef7"/>
+          <path d="M7 14l5 5 9-10" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="site-title">SBIC AI Uploading Manual Trigger</h1>
+        <p class="site-subtitle">Manually trigger and monitor AI upload processes</p>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Main ── -->
+  <main class="main">
+
+    <!-- Trigger Form Card -->
+    <section class="card" id="form-card">
+      <h2 class="card-title">Trigger a Process</h2>
+
+      <form id="trigger-form" novalidate>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="name">Full Name <span class="required">*</span></label>
+            <input
+              class="form-input"
+              type="text"
+              id="name"
+              name="name"
+              placeholder="e.g. Juan dela Cruz"
+              required
+              autocomplete="name"
+            />
+            <span class="field-error" id="name-error"></span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="department">Department <span class="required">*</span></label>
+            <input
+              class="form-input"
+              type="text"
+              id="department"
+              name="department"
+              placeholder="e.g. Finance"
+              required
+              autocomplete="organization"
+            />
+            <span class="field-error" id="department-error"></span>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="process">Process <span class="required">*</span></label>
+          <div class="select-wrapper">
+            <select class="form-select" id="process" name="process" required>
+              <option value="">— Select a process —</option>
+              {% for key, proc in processes.items() %}
+              <option value="{{ key }}">{{ proc.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <span class="field-error" id="process-error"></span>
+        </div>
+
+        <button class="btn-trigger" type="submit" id="submit-btn">
+          <span class="btn-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M5 3l14 9-14 9V3z" fill="currentColor"/>
+            </svg>
+          </span>
+          Run Process
+        </button>
+
+      </form>
+    </section>
+
+    <!-- Progress Card (hidden until running) -->
+    <section class="card card-progress hidden" id="progress-card">
+      <h2 class="card-title">Running…</h2>
+      <p class="progress-label" id="progress-label">Connecting to endpoint…</p>
+      <div class="progress-track">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <p class="progress-hint">This may take a few minutes. Please keep this tab open.</p>
+    </section>
+
+    <!-- Result Card (hidden until done) -->
+    <section class="card card-result hidden" id="result-card">
+      <div class="result-header" id="result-header">
+        <div class="result-icon" id="result-icon"></div>
+        <div>
+          <h2 class="result-title" id="result-title"></h2>
+          <p class="result-meta" id="result-meta"></p>
+        </div>
+      </div>
+
+      <div class="result-body" id="result-body"></div>
+
+      <div class="error-notice hidden" id="error-notice">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2L1 21h22L12 2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+          <path d="M12 9v5M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        An error occurred. A notification email has been sent to the developer.
+      </div>
+
+      <button class="btn-reset" id="reset-btn">Trigger Another Process</button>
+    </section>
+
+  </main>
+
+  <!-- ── Footer ── -->
+  <footer class="site-footer">
+    SBIC &mdash; AI Upload Services &mdash; IT Department
+  </footer>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
