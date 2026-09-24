@@ -42,9 +42,14 @@
         };
       }
       if (type === "branch") {
+        // extra stays the raw customerNumber (used when saving the link);
+        // extraLabel is what's actually shown, preferring the resolved name
+        // (attached server-side for suggestions) so candidates are easy to tell apart.
         return {
           code: c.code, name: c.name || "",
-          score: c.score, extra: c.customerNumber, raw: c,
+          score: c.score, extra: c.customerNumber,
+          extraLabel: c.customerName ? `${c.customerName} (${c.customerNumber})` : c.customerNumber,
+          raw: c,
         };
       }
       // customer — RGMC's custom customers page uses customerNo/name
@@ -83,9 +88,10 @@
       item.className = "candidate-item";
       const main = document.createElement("div");
       main.className = "candidate-main";
+      const extraLabel = c.extraLabel || c.extra;
       main.innerHTML =
         `<div class="candidate-code">${escapeHtml(c.code || "")}</div>` +
-        `<div class="candidate-name">${escapeHtml(c.name || "")}${c.extra ? " · " + escapeHtml(c.extra) : ""}</div>`;
+        `<div class="candidate-name">${escapeHtml(c.name || "")}${extraLabel ? " · " + escapeHtml(extraLabel) : ""}</div>`;
       item.appendChild(main);
       if (typeof c.score === "number") {
         const score = document.createElement("span");

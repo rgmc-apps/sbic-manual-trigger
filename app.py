@@ -303,12 +303,48 @@ def api_buffer():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+def _enrich_shipto_customer_names(body: dict) -> dict:
+    """Attach a readable customerName to each ship-to candidate.
+
+    shipto-match's candidates only carry the BC customerNumber (e.g. "DS001") — not
+    enough to tell candidates apart at a glance when picking a link. Resolves every
+    distinct customerNumber in one batched rgmc-bc-api call and merges the name back in.
+    """
+    company = body.get("bcCompany")
+    candidates = list(body.get("fuzzyMatches") or [])
+    exact = body.get("exactCodeMatch")
+    if exact:
+        candidates = candidates + [exact]
+    numbers = sorted({c.get("customerNumber") for c in candidates if c.get("customerNumber")})
+    if not company or not numbers:
+        return body
+
+    try:
+        esc_numbers = [n.replace("'", "''") for n in numbers]
+        odata_filter = " or ".join(f"customerNo eq '{n}'" for n in esc_numbers)
+        resp = _bc_api("GET", "/bc/custom/v2/customers", params={"company": company, "filter": odata_filter})
+        cust_body, status_code = _proxy_json(resp)
+        if status_code != 200:
+            return body
+        name_by_no = {c.get("customerNo"): c.get("name") for c in cust_body.get("data", [])}
+    except requests.RequestException:
+        return body  # Suggestions still work without names if this lookup fails.
+
+    for c in candidates:
+        no = c.get("customerNumber")
+        if no in name_by_no:
+            c["customerName"] = name_by_no[no]
+    return body
+
+
 @app.route("/api/suggest/shipto/<po_ref>")
 def api_suggest_shipto(po_ref):
     """Fuzzy BC ship-to suggestions for one PO, via rgmc-gcp-api (Cloud SQL + BC)."""
     try:
         resp = _gcp_api("GET", f"/customerpoul/{po_ref}/shipto-match")
         body, status_code = _proxy_json(resp)
+        if status_code == 200:
+            body = _enrich_shipto_customer_names(body)
         return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
