@@ -67,10 +67,12 @@
       if (type === "branch") {
         // extra stays the raw customerNumber (used when saving the link, and to
         // auto-apply the matching customer link); extraLabel is what's shown.
+        const custLabel = c.customerName ? `${c.customerName} (${c.customerNumber})` : c.customerNumber;
         return {
           code: c.code, name: c.name || "",
           score: c.score, extra: c.customerNumber, customerName: c.customerName || null,
-          extraLabel: c.customerName ? `${c.customerName} (${c.customerNumber})` : c.customerNumber,
+          lookupCode: c.lookupCode || null,
+          extraLabel: c.lookupCode ? `${custLabel} · lookup: ${c.lookupCode}` : custLabel,
           raw: c,
         };
       }
@@ -300,6 +302,9 @@
 
     // Manual search (BC list/search via rgmc-bc-api).
     const searchInput = row.querySelector(".search-input");
+    if (type === "branch") {
+      searchInput.placeholder = "Search by ship-to name, code, or lookup code…";
+    }
     const searchResults = row.querySelector(".search-results");
     let searchTimer = null;
     searchInput.addEventListener("input", () => {
