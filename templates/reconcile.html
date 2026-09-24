@@ -54,9 +54,14 @@
 
       <div class="summary-row hidden" id="summary-row">
         <div class="summary-stat"><span class="summary-value" id="stat-orders">0</span><span class="summary-label">Buffered POs</span></div>
-        <div class="summary-stat"><span class="summary-value" id="stat-sku">0</span><span class="summary-label">SKU groups</span></div>
-        <div class="summary-stat"><span class="summary-value" id="stat-branch">0</span><span class="summary-label">Branch groups</span></div>
-        <div class="summary-stat"><span class="summary-value" id="stat-customer">0</span><span class="summary-label">Customer groups</span></div>
+        <div class="summary-stat"><span class="summary-value" id="stat-sku">0/0</span><span class="summary-label">SKU groups resolved</span></div>
+        <div class="summary-stat"><span class="summary-value" id="stat-branch">0/0</span><span class="summary-label">Branch groups resolved</span></div>
+        <div class="summary-stat"><span class="summary-value" id="stat-customer">0/0</span><span class="summary-label">Customer groups resolved</span></div>
+      </div>
+
+      <div class="overall-progress hidden" id="overall-progress">
+        <div class="overall-progress-track"><div class="overall-progress-fill" id="overall-progress-fill"></div></div>
+        <span class="overall-progress-text" id="overall-progress-text"></span>
       </div>
 
       <p class="status-line" id="status-line"></p>
@@ -65,10 +70,10 @@
     <!-- Tabs -->
     <section class="card tabs-card hidden" id="tabs-card">
       <div class="tabs">
-        <button class="tab-btn active" data-tab="sku">Items (SKU)</button>
-        <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To)</button>
-        <button class="tab-btn" data-tab="customer">Customers</button>
-        <button class="tab-btn" data-tab="orders">Buffered Orders</button>
+        <button class="tab-btn active" data-tab="sku">Items (SKU) <span class="tab-count" id="tab-count-sku"></span></button>
+        <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To) <span class="tab-count" id="tab-count-branch"></span></button>
+        <button class="tab-btn" data-tab="customer">Customers <span class="tab-count" id="tab-count-customer"></span></button>
+        <button class="tab-btn" data-tab="orders">Buffered Orders <span class="tab-count" id="tab-count-orders"></span></button>
       </div>
 
       <div class="tab-panel" id="panel-sku" data-lookup="items"></div>
@@ -112,6 +117,10 @@
           <input type="text" class="search-input" placeholder="Search existing BC records…" />
         </div>
         <div class="search-results"></div>
+        <div class="history-section">
+          <button class="btn-history-toggle" type="button">Past resolutions for this…</button>
+          <div class="history-results hidden"></div>
+        </div>
       </div>
     </div>
   </template>

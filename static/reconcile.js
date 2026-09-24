@@ -20,12 +20,35 @@
     statusLine.classList.toggle("error", !!isError);
   }
 
+  function resolvedCount(list) {
+    return list.filter((g) => g.resolved).length;
+  }
+
   function renderSummary() {
-    document.getElementById("stat-orders").textContent   = state.order_count;
-    document.getElementById("stat-sku").textContent      = state.groups.sku.length;
-    document.getElementById("stat-branch").textContent   = state.groups.branch.length;
-    document.getElementById("stat-customer").textContent = state.groups.customer.length;
+    document.getElementById("stat-orders").textContent = state.order_count;
+
+    let totalGroups = 0, totalResolved = 0;
+    ["sku", "branch", "customer"].forEach((type) => {
+      const list = state.groups[type];
+      const done = resolvedCount(list);
+      document.getElementById(`stat-${type}`).textContent = `${done}/${list.length}`;
+      document.getElementById(`tab-count-${type}`).textContent = list.length ? `(${done}/${list.length})` : "";
+      totalGroups += list.length;
+      totalResolved += done;
+    });
+
+    const readyOrders = state.orders.filter((o) => orderReadiness(o).ready).length;
+    document.getElementById("tab-count-orders").textContent =
+      state.orders.length ? `(${readyOrders}/${state.orders.length} ready)` : "";
+
     summaryRow.classList.remove("hidden");
+
+    const progressEl = document.getElementById("overall-progress");
+    const pct = totalGroups ? Math.round((totalResolved / totalGroups) * 100) : 0;
+    document.getElementById("overall-progress-fill").style.width = pct + "%";
+    document.getElementById("overall-progress-text").textContent =
+      totalGroups ? `${totalResolved}/${totalGroups} groups resolved (${pct}%)` : "Nothing to resolve.";
+    progressEl.classList.remove("hidden");
   }
 
   // ── Candidate normalization ──────────────────────────────────────────────
@@ -42,12 +65,11 @@
         };
       }
       if (type === "branch") {
-        // extra stays the raw customerNumber (used when saving the link);
-        // extraLabel is what's actually shown, preferring the resolved name
-        // (attached server-side for suggestions) so candidates are easy to tell apart.
+        // extra stays the raw customerNumber (used when saving the link, and to
+        // auto-apply the matching customer link); extraLabel is what's shown.
         return {
           code: c.code, name: c.name || "",
-          score: c.score, extra: c.customerNumber,
+          score: c.score, extra: c.customerNumber, customerName: c.customerName || null,
           extraLabel: c.customerName ? `${c.customerName} (${c.customerNumber})` : c.customerNumber,
           raw: c,
         };
@@ -61,6 +83,29 @@
     if (type === "sku") return { itemNo: candidate.code, description: candidate.name };
     if (type === "branch") return { customerNo: candidate.extra, shipToCode: candidate.code, name: candidate.name };
     return { customerNo: candidate.code, displayName: candidate.name };
+  }
+
+  async function saveOverride(type, key, resolved, resolvedBy) {
+    const res = await fetch("/api/overrides", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, key, resolved, resolved_by: resolvedBy || "" }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Save failed");
+    return data;
+  }
+
+  function findGroup(type, key) {
+    const upper = (key || "").trim().toUpperCase();
+    return state.groups[type].find((g) => g.key.trim().toUpperCase() === upper);
+  }
+
+  function applyResolvedFields(g, resolved, data) {
+    g.resolved = resolved;
+    g.resolved_by = data.resolved_by || "";
+    g.resolved_at = data.resolved_at || "";
+    g.override_id = data.id;
   }
 
   function resolvedDisplay(resolved) {
@@ -175,6 +220,8 @@
         group.resolved_by = null;
         group.override_id = null;
         applyResolvedState(group);
+        renderOrdersPanel();
+        renderSummary();
       } catch (e) {
         setStatus("Could not remove link: " + e.message, true);
       } finally {
@@ -185,20 +232,30 @@
     async function saveLink(candidate) {
       const resolved = resolvedPayload(type, candidate);
       try {
-        const res = await fetch("/api/overrides", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type, key: group.key, resolved, resolved_by: "" }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "Save failed");
-        group.resolved = resolved;
-        group.resolved_by = data.resolved_by || "";
-        group.resolved_at = data.resolved_at || "";
-        group.override_id = data.id;
+        const data = await saveOverride(type, group.key, resolved, "");
+        applyResolvedFields(group, resolved, data);
         applyResolvedState(group);
         linkPanel.classList.add("hidden");
+
+        // A ship-to address belongs to a specific BC customer — selecting one tells
+        // us that customer too, so auto-apply it instead of making the user search
+        // the Customers tab separately for the same information.
+        if (type === "branch" && group.customer_name && candidate.extra) {
+          const custResolved = { customerNo: candidate.extra, displayName: candidate.customerName || candidate.extra };
+          try {
+            const custData = await saveOverride("customer", group.customer_name, custResolved, "");
+            const custGroup = findGroup("customer", group.customer_name);
+            if (custGroup) {
+              applyResolvedFields(custGroup, custResolved, custData);
+              renderGroupsPanel("customer");
+            }
+          } catch (e) {
+            setStatus("Branch linked, but auto-linking the customer failed: " + e.message, true);
+          }
+        }
+
         renderOrdersPanel(); // readiness may have changed
+        renderSummary();
       } catch (e) {
         setStatus("Could not save link: " + e.message, true);
       }
@@ -265,6 +322,38 @@
       }, 350);
     });
 
+    // History — past resolutions for this exact key, for reference (e.g. it was
+    // resolved before under a different link, or by someone else).
+    const historyToggle = row.querySelector(".btn-history-toggle");
+    const historyResults = row.querySelector(".history-results");
+    let historyLoaded = false;
+    historyToggle.addEventListener("click", async () => {
+      const nowHidden = historyResults.classList.toggle("hidden");
+      if (nowHidden || historyLoaded) return;
+      historyLoaded = true;
+      historyResults.innerHTML = `<div class="search-hint">Loading…</div>`;
+      try {
+        const url = `/api/reference?type=${encodeURIComponent(type)}&key=${encodeURIComponent(group.key)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
+        const rows = data.data || [];
+        if (!rows.length) {
+          historyResults.innerHTML = `<div class="search-hint">No past resolutions for this key.</div>`;
+          return;
+        }
+        historyResults.innerHTML = rows.map((h) => `
+          <div class="history-item">
+            <strong>${escapeHtml(resolvedDisplay(h.resolved))}</strong>
+            — ${escapeHtml(h.resolved_at || "")}${h.resolved_by ? " by " + escapeHtml(h.resolved_by) : ""}
+          </div>
+        `).join("");
+      } catch (e) {
+        historyResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+        historyLoaded = false;
+      }
+    });
+
     return row;
   }
 
@@ -290,6 +379,27 @@
     return !!(g && g.resolved);
   }
 
+  // Per-order resolution progress — mirrors _group_buffer's key derivation
+  // server-side so a blank-SKU line (keyed by description instead) still counts.
+  function orderReadiness(order) {
+    const header = order.header || {};
+    const lines = order.lines || [];
+    const branchOk = groupResolvedFor("branch", header.customerBranchName);
+    const customerOk = groupResolvedFor("customer", header.customerName);
+    const skuKeys = [...new Set(lines.map((l) => {
+      const sku = (l.customerSKUCode || "").trim();
+      if (sku) return sku;
+      return (l.customerSKUDesc || "").trim() || "(no SKU code, no description)";
+    }))];
+    const skuResolved = skuKeys.filter((s) => groupResolvedFor("sku", s)).length;
+    const skuOk = skuKeys.length === 0 || skuResolved === skuKeys.length;
+    return {
+      branchOk, customerOk, skuOk,
+      skuResolved, skuTotal: skuKeys.length,
+      ready: branchOk && customerOk && skuOk,
+    };
+  }
+
   function renderOrdersPanel() {
     const panel = document.getElementById("panel-orders");
     panel.innerHTML = "";
@@ -303,31 +413,26 @@
     state.orders.forEach((order) => {
       const header = order.header || {};
       const lines = order.lines || [];
-      const branchOk = groupResolvedFor("branch", header.customerBranchName);
-      const customerOk = groupResolvedFor("customer", header.customerName);
-      // Mirror _group_buffer's key derivation server-side: a blank SKU code still
-      // needs reconciling, keyed by description (or a fixed bucket) instead.
-      const skuKeys = [...new Set(lines.map((l) => {
-        const sku = (l.customerSKUCode || "").trim();
-        if (sku) return sku;
-        return (l.customerSKUDesc || "").trim() || "(no SKU code, no description)";
-      }))];
-      const skuOk = skuKeys.length === 0 || skuKeys.every((s) => groupResolvedFor("sku", s));
-      const ready = branchOk && customerOk && skuOk;
+      const r = orderReadiness(order);
 
       const row = document.createElement("div");
       row.className = "order-row";
       row.innerHTML = `
         <div class="order-row-head">
           <span class="order-ref">${escapeHtml(header.poRefNumber || order.id)}</span>
-          <span class="order-badge ${ready ? "ready" : "pending"}">
-            ${ready ? "All links resolved" : "Unresolved links remain"}
+          <span class="order-badge ${r.ready ? "ready" : "pending"}">
+            ${r.ready ? "All links resolved" : "Unresolved links remain"}
           </span>
         </div>
         <div class="order-detail">
           Customer: ${escapeHtml(header.customerName || "—")} &middot;
           Branch: ${escapeHtml(header.customerBranchName || "—")} &middot;
           ${lines.length} line(s) &middot; attempt ${order.attempt_count || 0}
+        </div>
+        <div class="order-links">
+          <span class="link-chip ${r.branchOk ? "ok" : "pending"}">Branch ${r.branchOk ? "✓" : "✗"}</span>
+          <span class="link-chip ${r.customerOk ? "ok" : "pending"}">Customer ${r.customerOk ? "✓" : "✗"}</span>
+          <span class="link-chip ${r.skuOk ? "ok" : "pending"}">Items ${r.skuResolved}/${r.skuTotal}</span>
         </div>
         <div class="order-error">${escapeHtml(order.last_error || "")}</div>
       `;
