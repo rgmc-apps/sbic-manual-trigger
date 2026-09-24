@@ -302,7 +302,9 @@ def api_lookup_items():
     try:
         resp = _bc_api("GET", "/bc/custom/v2/items", params={
             "company": company,
-            "filter": f"contains(displayName,'{esc}')",
+            # RGMC's custom items page (Pag50310) names this field "description",
+            # not BC standard's "displayName".
+            "filter": f"contains(description,'{esc}')",
         })
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
@@ -321,7 +323,9 @@ def api_lookup_customers():
     try:
         resp = _bc_api("GET", "/bc/custom/v2/customers", params={
             "company": company,
-            "filter": f"contains(displayName,'{esc}')",
+            # RGMC's custom customers page names these fields "name" and "customerNo",
+            # not BC standard's "displayName"/"number".
+            "filter": f"contains(name,'{esc}')",
         })
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code

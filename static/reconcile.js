@@ -28,12 +28,16 @@
     summaryRow.classList.remove("hidden");
   }
 
-  // ── Candidate normalization (each BC entity names things differently) ───
+  // ── Candidate normalization ──────────────────────────────────────────────
+  // Search results (rgmc-bc-api's RGMC custom pages) and suggestion results
+  // (rgmc-gcp-api, which reads BC's *standard* items API) name fields
+  // differently for the same entity, so both are checked here.
   function normalizeCandidates(type, rawList) {
     return (rawList || []).map((c) => {
       if (type === "sku") {
         return {
-          code: c.number, name: c.displayName || c.displayName2 || "",
+          code: c.number,
+          name: c.description || c.displayName || c.displayName2 || "",
           score: c.score, extra: null, raw: c,
         };
       }
@@ -43,8 +47,8 @@
           score: c.score, extra: c.customerNumber, raw: c,
         };
       }
-      // customer
-      return { code: c.number, name: c.displayName || "", score: c.score, extra: null, raw: c };
+      // customer — RGMC's custom customers page uses customerNo/name
+      return { code: c.customerNo, name: c.name || "", score: c.score, extra: null, raw: c };
     });
   }
 
