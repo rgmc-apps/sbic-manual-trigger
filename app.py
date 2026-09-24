@@ -438,9 +438,18 @@ def _enrich_customer_names(candidates: list, company: str) -> None:
 
 @app.route("/api/suggest/shipto/<po_ref>")
 def api_suggest_shipto(po_ref):
-    """Fuzzy BC ship-to suggestions for one PO, via rgmc-gcp-api (Cloud SQL + BC)."""
+    """Fuzzy BC ship-to suggestions for one PO, via rgmc-gcp-api (Cloud SQL + BC).
+
+    Passes the page's selected company through explicitly: manually-encoded orders
+    (manualEncoded: true) often have a blank header.companyName, which gcp-api needs
+    to derive the BC company from when ?company= isn't given -- without this override
+    those orders 400 with "Could not resolve a BC company from companyName=''" even
+    though we already know the company from the buffer view the user is looking at.
+    """
+    company = (request.args.get("company") or "").strip()
+    params = {"company": company} if company else {}
     try:
-        resp = _gcp_api("GET", f"/customerpoul/{po_ref}/shipto-match")
+        resp = _gcp_api("GET", f"/customerpoul/{po_ref}/shipto-match", params=params)
         body, status_code = _proxy_json(resp)
         if status_code == 200:
             candidates = list(body.get("fuzzyMatches") or [])
@@ -454,9 +463,14 @@ def api_suggest_shipto(po_ref):
 
 @app.route("/api/suggest/item/<po_ref>")
 def api_suggest_item(po_ref):
-    """Fuzzy BC item suggestions for one PO's lines, via rgmc-gcp-api (Cloud SQL + BC)."""
+    """Fuzzy BC item suggestions for one PO's lines, via rgmc-gcp-api (Cloud SQL + BC).
+
+    See api_suggest_shipto for why ?company= is passed through explicitly.
+    """
+    company = (request.args.get("company") or "").strip()
+    params = {"company": company} if company else {}
     try:
-        resp = _gcp_api("GET", f"/customerpoul/{po_ref}/item-match")
+        resp = _gcp_api("GET", f"/customerpoul/{po_ref}/item-match", params=params)
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
     except requests.RequestException as exc:

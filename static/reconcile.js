@@ -278,7 +278,7 @@
           const poRef = group.po_refs[0];
           const path = type === "sku" ? `/api/suggest/item/${encodeURIComponent(poRef)}`
                                        : `/api/suggest/shipto/${encodeURIComponent(poRef)}`;
-          const res = await fetch(path);
+          const res = await fetch(`${path}?company=${encodeURIComponent(state.company)}`);
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
 
