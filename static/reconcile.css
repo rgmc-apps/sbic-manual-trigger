@@ -240,6 +240,16 @@
 .order-badge.ready { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
 .order-badge.pending { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); }
 .order-detail { margin-top: 8px; font-size: .8125rem; color: var(--text-muted); }
+.recovered-badge {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: .7rem;
+  font-weight: 600;
+  color: var(--brand-dark);
+  background: #eef4ff;
+  border-radius: 999px;
+  padding: 2px 9px;
+}
 .order-error { margin-top: 6px; font-size: .76rem; color: var(--error); word-break: break-word; }
 
 .order-links { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }

@@ -1,6 +1,7 @@
 import os
 import smtplib
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, render_template, request, jsonify
@@ -275,30 +276,133 @@ def reconcile_page():
     return render_template("reconcile.html", companies=RECONCILE_COMPANIES)
 
 
+def _recover_lines_for_order(po_ref: str) -> tuple:
+    """Best-effort recovery of an order's lines when the buffer doc has none.
+
+    The buffer doc only has what was in the Pub/Sub message at the time the order
+    failed — a bug fixed 2026-09-24 in rgmc-gcp-api's SO-import bridge means orders
+    buffered before that fix have `lines: []` even though the source data exists.
+    Tries Cloud SQL (CustomerPOULDetail, via rgmc-gcp-api) first, since it's the
+    same table the bridge itself reads from, then falls back to BigQuery
+    (int_document_ai_detail, the Document AI-parsed record of the same PO) if Cloud
+    SQL has nothing. Returns (lines, source) where source is "cloudsql", "bigquery",
+    or None if neither had anything -- never raises, so one bad lookup can't break
+    the whole buffer listing.
+    """
+    # Shorter, dedicated timeout: this runs once per empty-lines order, in parallel,
+    # on every buffer page load -- a single slow Cloud SQL call shouldn't be allowed
+    # to eat the full general-purpose API_TIMEOUT before falling back to BigQuery.
+    recovery_timeout = min(API_TIMEOUT, 12)
+    try:
+        resp = requests.get(f"{GCP_API_BASE}/customerpouldetail/{po_ref}", timeout=recovery_timeout)
+        if resp.status_code == 200:
+            rows = resp.json().get("data", [])
+            if rows:
+                return rows, "cloudsql"
+    except requests.RequestException:
+        pass
+
+    try:
+        resp = requests.get(f"{GCP_API_BASE}/bigquery_routes/by_table/value", params={
+            "table_name": "int_document_ai_detail",
+            "where_column": "po_ref_number",
+            "where_value": po_ref,
+        }, timeout=recovery_timeout)
+        if resp.status_code == 200:
+            rows = resp.json().get("data", [])
+            if rows:
+                # BigQuery's dbt-built table uses snake_case; normalize to the same
+                # camelCase shape CustomerPOULDetail (and _group_buffer) expect.
+                lines = [{
+                    "customerSKUCode": r.get("customer_sku_code"),
+                    "customerSKUDesc": r.get("customer_sku_desc"),
+                    "poQty": r.get("po_qty"),
+                    "poQtyPcs": r.get("po_qty_pcs"),
+                    "unitOfMeasurement": r.get("unit_of_measurement"),
+                    "unitPrice": r.get("unit_price"),
+                    "netPrice": r.get("net_price"),
+                } for r in rows]
+                return lines, "bigquery"
+    except requests.RequestException:
+        pass
+
+    return [], None
+
+
+def _recover_missing_lines(orders: list) -> None:
+    """Fill in `lines` (in place) for any order whose buffer doc has none, in parallel."""
+    targets = [o for o in orders if not o.get("lines")]
+    if not targets:
+        return
+
+    def _po_ref(order):
+        return (order.get("header") or {}).get("poRefNumber") or order.get("id")
+
+    with ThreadPoolExecutor(max_workers=min(20, len(targets))) as ex:
+        futures = {ex.submit(_recover_lines_for_order, _po_ref(o)): o for o in targets}
+        for future, order in futures.items():
+            try:
+                lines, source = future.result()
+            except Exception:
+                continue  # best-effort — leave this one order's lines empty
+            if lines:
+                order["lines"] = lines
+                order["_lines_recovered_from"] = source
+
+
+def _build_buffer_response(company: str, recover: bool):
+    orders_resp = _bc_api("GET", "/bc/custom/v2/so-buffer", params={"company": company})
+    orders_body, orders_status = _proxy_json(orders_resp)
+    if orders_status != 200:
+        return orders_body, orders_status
+
+    overrides_resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides")
+    overrides_body, overrides_status = _proxy_json(overrides_resp)
+    overrides = overrides_body.get("data", []) if overrides_status == 200 else []
+
+    orders = orders_body.get("data", [])
+    if recover:
+        _recover_missing_lines(orders)
+    return {
+        "company": company,
+        "order_count": len(orders),
+        "orders": orders,
+        "groups": _group_buffer(orders, overrides),
+    }, 200
+
+
 @app.route("/api/buffer")
 def api_buffer():
     """Buffered orders for one company, pre-grouped by SKU / branch / customer,
-    with any previously-saved manual links merged in."""
+    with any previously-saved manual links merged in.
+
+    Loads fast by default (no line recovery) -- see /api/buffer/lines for the
+    slower pass that also fills in missing lines from Cloud SQL/BigQuery.
+    """
     company = (request.args.get("company") or "").strip().upper()
     if not company:
         return jsonify({"error": "company is required"}), 400
     try:
-        orders_resp = _bc_api("GET", "/bc/custom/v2/so-buffer", params={"company": company})
-        orders_body, orders_status = _proxy_json(orders_resp)
-        if orders_status != 200:
-            return jsonify(orders_body), orders_status
+        body, status_code = _build_buffer_response(company, recover=False)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
-        overrides_resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides")
-        overrides_body, overrides_status = _proxy_json(overrides_resp)
-        overrides = overrides_body.get("data", []) if overrides_status == 200 else []
 
-        orders = orders_body.get("data", [])
-        return jsonify({
-            "company": company,
-            "order_count": len(orders),
-            "orders": orders,
-            "groups": _group_buffer(orders, overrides),
-        })
+@app.route("/api/buffer/lines")
+def api_buffer_lines():
+    """Same as /api/buffer, but also recovers missing lines from Cloud SQL/BigQuery.
+
+    This is slow (one lookup per empty-lines order, parallelized, but each Cloud SQL
+    call can take seconds under load) -- called by the page as a background follow-up
+    after the fast /api/buffer response has already rendered, not on initial load.
+    """
+    company = (request.args.get("company") or "").strip().upper()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    try:
+        body, status_code = _build_buffer_response(company, recover=True)
+        return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 

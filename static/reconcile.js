@@ -428,6 +428,7 @@
           Customer: ${escapeHtml(header.customerName || "—")} &middot;
           Branch: ${escapeHtml(header.customerBranchName || "—")} &middot;
           ${lines.length} line(s) &middot; attempt ${order.attempt_count || 0}
+          ${order._lines_recovered_from ? `<span class="recovered-badge">lines recovered from ${escapeHtml(order._lines_recovered_from === "cloudsql" ? "Cloud SQL" : "BigQuery")}</span>` : ""}
         </div>
         <div class="order-links">
           <span class="link-chip ${r.branchOk ? "ok" : "pending"}">Branch ${r.branchOk ? "✓" : "✗"}</span>
@@ -451,6 +452,16 @@
   });
 
   // ── Load buffer ───────────────────────────────────────────────────────────
+  function renderAll() {
+    renderSummary();
+    renderGroupsPanel("sku");
+    renderGroupsPanel("branch");
+    renderGroupsPanel("customer");
+    renderOrdersPanel();
+    tabsCard.classList.remove("hidden");
+    reprocessBtn.disabled = state.order_count === 0;
+  }
+
   async function loadBuffer() {
     const company = companySelect.value;
     if (!company) {
@@ -460,18 +471,33 @@
     loadBtn.disabled = true;
     setStatus("Loading buffer…");
     try {
+      // Fast pass first — buffered orders as Firestore actually has them, so the
+      // page renders immediately instead of waiting on line recovery.
       const res = await fetch(`/api/buffer?company=${encodeURIComponent(company)}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Failed to load buffer");
       state = data;
-      renderSummary();
-      renderGroupsPanel("sku");
-      renderGroupsPanel("branch");
-      renderGroupsPanel("customer");
-      renderOrdersPanel();
-      tabsCard.classList.remove("hidden");
-      reprocessBtn.disabled = state.order_count === 0;
+      renderAll();
       setStatus(`Loaded ${state.order_count} buffered order(s) for ${company}.`);
+
+      // Background pass — recovers any missing lines from Cloud SQL/BigQuery (can
+      // take a while per order under load) and re-renders once it's back, so the
+      // SKU tab doesn't stay empty for orders buffered before the lines bug was fixed.
+      const anyMissingLines = state.orders.some((o) => !o.lines || !o.lines.length);
+      if (anyMissingLines) {
+        setStatus(`Loaded ${state.order_count} order(s) for ${company} — recovering missing lines…`);
+        fetch(`/api/buffer/lines?company=${encodeURIComponent(company)}`)
+          .then((r) => r.json().then((d) => [r, d]))
+          .then(([r, d]) => {
+            if (!r.ok || company !== companySelect.value) return; // stale response, ignore
+            state = d;
+            renderAll();
+            const n = state.orders.filter((o) => o._lines_recovered_from).length;
+            setStatus(`Loaded ${state.order_count} buffered order(s) for ${company}.` +
+              (n ? ` Recovered lines for ${n} order(s).` : ""));
+          })
+          .catch(() => { /* best-effort — page already works with what it has */ });
+      }
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {
