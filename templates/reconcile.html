@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SBIC Buffer Reconciliation</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/reconcile.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="logo-mark">
+        <img src="/static/logo.png" alt="SBIC Logo" class="site-logo" />
+      </div>
+      <div>
+        <h1 class="site-title">SO-Import Buffer Reconciliation</h1>
+        <p class="site-subtitle">Link buffered orders' SKU / branch / customer to existing Business Central records</p>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/">Manual Trigger</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="main main-wide">
+
+    <!-- Notice: overrides are groundwork, not yet consumed by reprocessing -->
+    <section class="card notice-card">
+      <strong>Note:</strong> resolving a link below saves it for reference. Reprocessing
+      still re-runs the normal buffer retry as-is — it does not yet automatically apply
+      the links you save here. That wiring is a separate, tracked follow-up.
+    </section>
+
+    <!-- Company picker + summary -->
+    <section class="card">
+      <div class="toolbar">
+        <div class="form-group toolbar-select">
+          <label class="form-label" for="company-select">Company</label>
+          <div class="select-wrapper">
+            <select class="form-select" id="company-select">
+              <option value="">— Select a company —</option>
+              {% for c in companies %}
+              <option value="{{ c }}">{{ c }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <button class="btn-trigger" id="load-btn" type="button">Load Buffer</button>
+        <button class="btn-reprocess" id="reprocess-btn" type="button" disabled>Reprocess Buffer</button>
+      </div>
+
+      <div class="summary-row hidden" id="summary-row">
+        <div class="summary-stat"><span class="summary-value" id="stat-orders">0</span><span class="summary-label">Buffered POs</span></div>
+        <div class="summary-stat"><span class="summary-value" id="stat-sku">0</span><span class="summary-label">SKU groups</span></div>
+        <div class="summary-stat"><span class="summary-value" id="stat-branch">0</span><span class="summary-label">Branch groups</span></div>
+        <div class="summary-stat"><span class="summary-value" id="stat-customer">0</span><span class="summary-label">Customer groups</span></div>
+      </div>
+
+      <p class="status-line" id="status-line"></p>
+    </section>
+
+    <!-- Tabs -->
+    <section class="card tabs-card hidden" id="tabs-card">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="sku">Items (SKU)</button>
+        <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To)</button>
+        <button class="tab-btn" data-tab="customer">Customers</button>
+        <button class="tab-btn" data-tab="orders">Buffered Orders</button>
+      </div>
+
+      <div class="tab-panel" id="panel-sku" data-lookup="items"></div>
+      <div class="tab-panel hidden" id="panel-branch" data-lookup="ship-to"></div>
+      <div class="tab-panel hidden" id="panel-customer" data-lookup="customers"></div>
+      <div class="tab-panel hidden" id="panel-orders"></div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    SBIC &mdash; AI Upload Services &mdash; RGMC IT/MIS Department
+  </footer>
+
+  <!-- Group row template -->
+  <template id="group-row-template">
+    <div class="group-row">
+      <div class="group-head">
+        <div class="group-key-wrap">
+          <span class="group-key"></span>
+          <span class="group-desc"></span>
+        </div>
+        <div class="group-meta">
+          <span class="group-po-count"></span>
+          <button class="btn-link-toggle" type="button">Link…</button>
+        </div>
+      </div>
+      <div class="group-resolved hidden">
+        Linked to <strong class="resolved-text"></strong>
+        <span class="resolved-by"></span>
+        <button class="btn-unlink" type="button">Undo</button>
+      </div>
+      <div class="group-po-refs"></div>
+      <div class="group-link-panel hidden">
+        <div class="suggest-row">
+          <button class="btn-suggest" type="button">Show suggested matches</button>
+          <span class="suggest-status"></span>
+        </div>
+        <div class="suggest-results"></div>
+        <div class="search-row">
+          <input type="text" class="search-input" placeholder="Search existing BC records…" />
+        </div>
+        <div class="search-results"></div>
+      </div>
+    </div>
+  </template>
+
+  <script src="/static/reconcile.js"></script>
+</body>
+</html>

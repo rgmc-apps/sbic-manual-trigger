@@ -46,6 +46,19 @@ body {
   align-items: center;
   gap: 16px;
 }
+.site-nav { margin-left: auto; flex-shrink: 0; }
+.nav-link {
+  color: #cbd5e1;
+  font-size: .8125rem;
+  font-weight: 600;
+  text-decoration: none;
+  padding: 8px 14px;
+  border: 1.5px solid rgba(255,255,255,.18);
+  border-radius: 8px;
+  transition: border-color .2s ease, color .2s ease;
+  white-space: nowrap;
+}
+.nav-link:hover { color: #f8fafc; border-color: var(--brand); }
 .logo-mark { flex-shrink: 0; }
 .site-logo { height: 48px; width: auto; display: block; }
 .site-title {
