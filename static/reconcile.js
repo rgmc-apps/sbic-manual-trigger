@@ -9,6 +9,19 @@
   const tabsCard      = document.getElementById("tabs-card");
   const rowTemplate   = document.getElementById("group-row-template");
 
+  // ── Button loading spinner (caller still manages .disabled separately) ────
+  function setBtnLoading(spinnerId, labelId, loading, loadingText) {
+    const spinner = document.getElementById(spinnerId);
+    const label = document.getElementById(labelId);
+    spinner.classList.toggle("hidden", !loading);
+    if (loading) {
+      if (!label.dataset.origLabel) label.dataset.origLabel = label.textContent;
+      label.textContent = loadingText;
+    } else if (label.dataset.origLabel) {
+      label.textContent = label.dataset.origLabel;
+    }
+  }
+
   const LOOKUP_PATH = { sku: "items", branch: "ship-to", customer: "customers" };
 
   // { company, order_count, orders, groups: { sku: [...], branch: [...], customer: [...] } }
@@ -87,11 +100,11 @@
     return { customerNo: candidate.code, displayName: candidate.name };
   }
 
-  async function saveOverride(type, key, resolved, resolvedBy) {
+  async function saveOverride(type, key, resolved, resolvedBy, bufferIds) {
     const res = await fetch("/api/overrides", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type, key, resolved, resolved_by: resolvedBy || "" }),
+      body: JSON.stringify({ type, key, resolved, resolved_by: resolvedBy || "", buffer_ids: bufferIds || [] }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Save failed");
@@ -234,7 +247,7 @@
     async function saveLink(candidate) {
       const resolved = resolvedPayload(type, candidate);
       try {
-        const data = await saveOverride(type, group.key, resolved, "");
+        const data = await saveOverride(type, group.key, resolved, "", group.buffer_ids);
         applyResolvedFields(group, resolved, data);
         applyResolvedState(group);
         linkPanel.classList.add("hidden");
@@ -245,8 +258,10 @@
         if (type === "branch" && group.customer_name && candidate.extra) {
           const custResolved = { customerNo: candidate.extra, displayName: candidate.customerName || candidate.extra };
           try {
-            const custData = await saveOverride("customer", group.customer_name, custResolved, "");
             const custGroup = findGroup("customer", group.customer_name);
+            const custData = await saveOverride(
+              "customer", group.customer_name, custResolved, "", custGroup ? custGroup.buffer_ids : []
+            );
             if (custGroup) {
               applyResolvedFields(custGroup, custResolved, custData);
               renderGroupsPanel("customer");
@@ -474,6 +489,7 @@
       return;
     }
     loadBtn.disabled = true;
+    setBtnLoading("load-spinner", "load-btn-label", true, "Loading…");
     setStatus("Loading buffer…");
     try {
       // Fast pass first — buffered orders as Firestore actually has them, so the
@@ -507,6 +523,7 @@
       setStatus("Error: " + e.message, true);
     } finally {
       loadBtn.disabled = false;
+      setBtnLoading("load-spinner", "load-btn-label", false);
     }
   }
 
@@ -518,6 +535,7 @@
       return;
     }
     reprocessBtn.disabled = true;
+    setBtnLoading("reprocess-spinner", "reprocess-btn-label", true, "Reprocessing…");
     setStatus("Triggering reprocess…");
     try {
       const res = await fetch("/api/reprocess", {
@@ -531,6 +549,7 @@
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {
+      setBtnLoading("reprocess-spinner", "reprocess-btn-label", false);
       reprocessBtn.disabled = false;
     }
   });

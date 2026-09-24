@@ -20,6 +20,9 @@
 .toolbar-select { margin-bottom: 0; min-width: 220px; }
 
 .btn-reprocess {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   padding: 12px 22px;
   background: #fff;
   color: var(--brand-dark);
@@ -32,6 +35,21 @@
 }
 .btn-reprocess:hover:not(:disabled) { background: var(--brand); color: #fff; }
 .btn-reprocess:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ── Button loading spinner ── */
+.btn-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  opacity: .7;
+  animation: btn-spin .7s linear infinite;
+}
+@keyframes btn-spin {
+  to { transform: rotate(360deg); }
+}
 
 .status-line { font-size: .8125rem; color: var(--text-muted); margin-top: 14px; min-height: 18px; }
 .status-line.error { color: var(--error); }

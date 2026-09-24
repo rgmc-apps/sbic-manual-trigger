@@ -48,8 +48,14 @@
             </select>
           </div>
         </div>
-        <button class="btn-trigger" id="load-btn" type="button">Load Buffer</button>
-        <button class="btn-reprocess" id="reprocess-btn" type="button" disabled>Reprocess Buffer</button>
+        <button class="btn-trigger" id="load-btn" type="button">
+          <span class="btn-spinner hidden" id="load-spinner"></span>
+          <span id="load-btn-label">Load Buffer</span>
+        </button>
+        <button class="btn-reprocess" id="reprocess-btn" type="button" disabled>
+          <span class="btn-spinner hidden" id="reprocess-spinner"></span>
+          <span id="reprocess-btn-label">Reprocess Buffer</span>
+        </button>
       </div>
 
       <div class="summary-row hidden" id="summary-row">
