@@ -547,6 +547,7 @@ def api_save_override():
     key = (data.get("key") or "").strip()
     resolved = data.get("resolved") or {}
     resolved_by = (data.get("resolved_by") or "").strip()
+    buffer_ids = data.get("buffer_ids") or []
 
     if override_type not in ("sku", "branch", "customer"):
         return jsonify({"error": "type must be sku, branch, or customer"}), 400
@@ -561,6 +562,7 @@ def api_save_override():
             "key": key,
             "resolved": resolved,
             "resolved_by": resolved_by,
+            "buffer_ids": buffer_ids,
         })
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
