@@ -179,7 +179,12 @@ def _group_buffer(orders: list, overrides: list) -> dict:
 
         if branch_name:
             g = branch_groups.setdefault(branch_name.upper(), {
-                "key": branch_name, "po_refs": [], "buffer_ids": [],
+                "key": branch_name,
+                # Display-only context (not part of the consolidation key) — the
+                # frontend renders "<branch> (<customer> - <company>)" from these.
+                "customer_name": customer_name,
+                "company_name": (header.get("companyName") or "").strip(),
+                "po_refs": [], "buffer_ids": [],
             })
             g["po_refs"].append(po_ref)
             g["buffer_ids"].append(buffer_id)
@@ -191,15 +196,44 @@ def _group_buffer(orders: list, overrides: list) -> dict:
             g["po_refs"].append(po_ref)
             g["buffer_ids"].append(buffer_id)
 
-        for line in order.get("lines") or []:
+        lines = order.get("lines") or []
+        if not lines:
+            continue
+        for line in lines:
             sku = (line.get("customerSKUCode") or "").strip()
-            if not sku:
-                continue
-            g = sku_groups.setdefault(sku.upper(), {
-                "key": sku,
-                "description": line.get("customerSKUDesc") or "",
+            desc = (line.get("customerSKUDesc") or "").strip()
+
+            def _positive(v):
+                try:
+                    return float(v) > 0
+                except (TypeError, ValueError):
+                    return False
+
+            # Approximation of the worker's pcs/non-pcs unit check — good enough for
+            # an informational badge, not used for any actual reprocessing decision.
+            qty_ok = _positive(line.get("poQtyPcs")) or _positive(line.get("poQty"))
+
+            if sku:
+                dict_key = sku.upper()
+                display_key = sku
+            else:
+                # Blank SKU code — these are exactly the lines that fail with
+                # "missing SKU/item reference or non-positive quantity" and must
+                # still surface here, not be silently dropped. Group by
+                # description (the only distinguishing raw text available), or a
+                # fixed bucket if that's blank too.
+                display_key = desc or "(no SKU code, no description)"
+                dict_key = f"__NOSKU__::{display_key.upper()}"
+
+            g = sku_groups.setdefault(dict_key, {
+                "key": display_key,
+                "description": desc,
+                "missing_sku": not sku,
+                "has_nonpositive_qty": False,
                 "po_refs": [], "buffer_ids": [],
             })
+            if not qty_ok:
+                g["has_nonpositive_qty"] = True
             if po_ref not in g["po_refs"]:
                 g["po_refs"].append(po_ref)
             if buffer_id not in g["buffer_ids"]:

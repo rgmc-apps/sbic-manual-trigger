@@ -105,13 +105,34 @@
     })[ch]);
   }
 
+  // ── Group label / flags ───────────────────────────────────────────────────
+  function groupDisplayLabel(type, group) {
+    if (type === "branch") {
+      const customer = group.customer_name || "—";
+      const company = group.company_name || "—";
+      return `${group.key} (${customer} - ${company})`;
+    }
+    return group.key;
+  }
+
+  function groupDescText(type, group) {
+    const flags = [];
+    if (type === "sku" && group.missing_sku) flags.push("no SKU code");
+    if (type === "sku" && group.has_nonpositive_qty) flags.push("non-positive quantity");
+    const flagText = flags.length ? `[${flags.join(", ")}] ` : "";
+    return flagText + (group.description || "");
+  }
+
   // ── One group row ────────────────────────────────────────────────────────
   function buildGroupRow(type, group) {
     const node = rowTemplate.content.cloneNode(true);
     const row = node.querySelector(".group-row");
 
-    row.querySelector(".group-key").textContent = group.key;
-    row.querySelector(".group-desc").textContent = group.description || "";
+    row.querySelector(".group-key").textContent = groupDisplayLabel(type, group);
+    row.querySelector(".group-desc").textContent = groupDescText(type, group);
+    if (type === "sku" && (group.missing_sku || group.has_nonpositive_qty)) {
+      row.classList.add("group-flagged");
+    }
     row.querySelector(".group-po-count").textContent =
       `${group.po_count} PO${group.po_count === 1 ? "" : "s"}`;
     row.querySelector(".group-po-refs").textContent = "POs: " + group.po_refs.join(", ");
@@ -278,8 +299,14 @@
       const lines = order.lines || [];
       const branchOk = groupResolvedFor("branch", header.customerBranchName);
       const customerOk = groupResolvedFor("customer", header.customerName);
-      const skus = [...new Set(lines.map((l) => l.customerSKUCode).filter(Boolean))];
-      const skuOk = skus.length === 0 || skus.every((s) => groupResolvedFor("sku", s));
+      // Mirror _group_buffer's key derivation server-side: a blank SKU code still
+      // needs reconciling, keyed by description (or a fixed bucket) instead.
+      const skuKeys = [...new Set(lines.map((l) => {
+        const sku = (l.customerSKUCode || "").trim();
+        if (sku) return sku;
+        return (l.customerSKUDesc || "").trim() || "(no SKU code, no description)";
+      }))];
+      const skuOk = skuKeys.length === 0 || skuKeys.every((s) => groupResolvedFor("sku", s));
       const ready = branchOk && customerOk && skuOk;
 
       const row = document.createElement("div");

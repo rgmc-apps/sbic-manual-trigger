@@ -79,6 +79,8 @@
   padding: 14px 16px;
 }
 .group-row.is-resolved { border-color: var(--success-border); background: var(--success-bg); }
+.group-row.group-flagged:not(.is-resolved) { border-left: 3px solid var(--error); }
+.group-row.group-flagged .group-desc { color: var(--error); font-weight: 600; }
 
 .group-head {
   display: flex;
