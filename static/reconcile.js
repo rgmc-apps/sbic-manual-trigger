@@ -671,12 +671,15 @@
   loadBtn.addEventListener("click", loadBuffer);
 
   // ── Reprocess: trigger + watch ───────────────────────────────────────────
-  // The trigger itself only kicks off an async worker-pool job — real results
-  // land by email a minute or more later. Rather than fake a progress bar, this
-  // polls the real buffer count on an interval and reports genuine change only.
-  const WATCH_POLL_MS = 20000;  // check the live buffer every 20s
-  const WATCH_MAX_POLLS = 15;   // auto-stop after ~5 minutes so an open tab doesn't poll forever
-  let watcher = null; // { startedAt, baselineCount, pollCount, pollTimer, tickTimer }
+  // The trigger only kicks off an async worker-pool job. Primary signal: poll
+  // rgmc-worker-pool's actual run status (ongoing/done/error), written to
+  // Firestore as it processes the job and read back via rgmc-bc-api — real
+  // state, not a guess. Falls back to inferring progress from the buffer count
+  // only if the backend didn't hand back a run_id (e.g. not yet deployed).
+  const RUN_POLL_MS = 4000;              // check run status every 4s — real work, not a long wait
+  const BUFFER_POLL_MS = 20000;          // fallback mode: check the live buffer every 20s
+  const MAX_WATCH_MS = 10 * 60 * 1000;   // auto-stop after 10 minutes either way
+  let watcher = null; // { mode: "run"|"buffer-count", startedAt, runId?, baselineCount?, pollTimer, tickTimer }
 
   function formatElapsed(ms) {
     const s = Math.max(0, Math.floor(ms / 1000));
@@ -689,7 +692,7 @@
     clearTimeout(watcher.pollTimer);
     watcher = null;
     if (finalMessage) {
-      reprocessStatusEl.classList.remove("is-success", "is-stopped");
+      reprocessStatusEl.classList.remove("is-success", "is-error", "is-stopped");
       if (variant) reprocessStatusEl.classList.add(variant);
       reprocessTitleEl.textContent = finalMessage;
       reprocessDetailEl.textContent = "";
@@ -699,7 +702,64 @@
     }
   }
 
-  async function pollBufferOnce() {
+  function summarizeRun(summary) {
+    if (!summary) return "";
+    const parts = [`${summary.orders_created || 0} order(s) created`];
+    if (summary.orders_failed) parts.push(`${summary.orders_failed} still failed`);
+    parts.push(`${summary.lines_created || 0} line(s) created`);
+    if (summary.lines_skipped) parts.push(`${summary.lines_skipped} line(s) skipped`);
+    if (summary.unmatched_items) parts.push(`${summary.unmatched_items} item(s) with no BC match`);
+    return parts.join(", ") + ".";
+  }
+
+  // Silently re-fetch the buffer (no skeleton, no status-line spam) so the
+  // table/groups/stats reflect what the run just changed.
+  async function refreshBufferSilently() {
+    if (!state) return;
+    try {
+      const res = await fetch(`/api/buffer?company=${encodeURIComponent(state.company)}`);
+      const data = await res.json();
+      if (!res.ok) return;
+      state = data;
+      renderAll();
+      refreshPulse(tabsCard);
+    } catch (e) { /* best-effort */ }
+  }
+
+  async function pollRunStatusOnce() {
+    if (!watcher) return;
+    try {
+      const res = await fetch(`/api/reprocess-status/${encodeURIComponent(watcher.runId)}`);
+      const data = await res.json();
+      if (!watcher || !res.ok) return;
+
+      if (data.status === "done") {
+        reprocessDetailEl.textContent = summarizeRun(data.summary);
+        stopWatching("Reprocessing done.", "is-success");
+        refreshBufferSilently();
+        return;
+      }
+      if (data.status === "error") {
+        reprocessDetailEl.textContent = data.error || "Unknown error.";
+        stopWatching("Reprocessing failed.", "is-error");
+        return;
+      }
+      // "queued" or "processing" — still ongoing.
+      reprocessTitleEl.textContent = data.status === "queued"
+        ? "Reprocessing triggered — waiting for the worker to pick it up…"
+        : "Reprocessing in progress…";
+
+      if (Date.now() - watcher.startedAt >= MAX_WATCH_MS) {
+        stopWatching("Stopped auto-checking after 10 minutes — reload to see the latest.", "is-stopped");
+        return;
+      }
+      watcher.pollTimer = setTimeout(pollRunStatusOnce, RUN_POLL_MS);
+    } catch (e) {
+      if (watcher) watcher.pollTimer = setTimeout(pollRunStatusOnce, RUN_POLL_MS); // transient hiccup — try again next tick
+    }
+  }
+
+  async function pollBufferCountOnce() {
     if (!watcher) return;
     try {
       const res = await fetch(`/api/buffer?company=${encodeURIComponent(state.company)}`);
@@ -710,7 +770,6 @@
       state = data;
       renderAll();
       if (changed) refreshPulse(tabsCard);
-      watcher.pollCount += 1;
 
       if (data.order_count === 0) {
         stopWatching("All buffered orders cleared.", "is-success");
@@ -722,20 +781,21 @@
           ? `${delta} order(s) cleared since you triggered this — ${data.order_count} still buffered.`
           : `Buffer count changed — ${data.order_count} order(s) currently buffered.`;
       }
-      if (watcher.pollCount >= WATCH_MAX_POLLS) {
-        stopWatching("Stopped auto-checking after 5 minutes — reload to see the latest.", "is-stopped");
+      if (Date.now() - watcher.startedAt >= MAX_WATCH_MS) {
+        stopWatching("Stopped auto-checking after 10 minutes — reload to see the latest.", "is-stopped");
         return;
       }
-      watcher.pollTimer = setTimeout(pollBufferOnce, WATCH_POLL_MS);
+      watcher.pollTimer = setTimeout(pollBufferCountOnce, BUFFER_POLL_MS);
     } catch (e) {
-      if (watcher) watcher.pollTimer = setTimeout(pollBufferOnce, WATCH_POLL_MS); // transient hiccup — try again next tick
+      if (watcher) watcher.pollTimer = setTimeout(pollBufferCountOnce, BUFFER_POLL_MS); // transient hiccup — try again next tick
     }
   }
 
-  function startWatching(baselineCount) {
+  function startWatching(runId, baselineCount) {
     stopWatching();
-    watcher = { startedAt: Date.now(), baselineCount, pollCount: 0, pollTimer: null, tickTimer: null };
-    reprocessStatusEl.classList.remove("hidden", "is-success", "is-stopped");
+    const mode = runId ? "run" : "buffer-count";
+    watcher = { mode, startedAt: Date.now(), runId, baselineCount, pollTimer: null, tickTimer: null };
+    reprocessStatusEl.classList.remove("hidden", "is-success", "is-error", "is-stopped");
     reprocessTitleEl.textContent = "Reprocessing triggered — watching for results…";
     reprocessDetailEl.textContent = `You'll also get an email at ${employeeFields.email.value.trim()}.`;
     stopWatchingBtn.classList.remove("hidden");
@@ -743,7 +803,11 @@
     watcher.tickTimer = setInterval(() => {
       if (watcher) reprocessElapsedEl.textContent = formatElapsed(Date.now() - watcher.startedAt);
     }, 1000);
-    watcher.pollTimer = setTimeout(pollBufferOnce, WATCH_POLL_MS);
+    if (mode === "run") {
+      watcher.pollTimer = setTimeout(pollRunStatusOnce, RUN_POLL_MS);
+    } else {
+      watcher.pollTimer = setTimeout(pollBufferCountOnce, BUFFER_POLL_MS);
+    }
   }
 
   stopWatchingBtn.addEventListener("click", () => stopWatching());
@@ -769,7 +833,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Reprocess trigger failed");
       setStatus(`Reprocess triggered for ${state.company}.`);
-      startWatching(state.order_count);
+      startWatching(data.run_id || null, state.order_count);
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {

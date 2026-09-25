@@ -644,6 +644,21 @@ def api_reprocess():
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
 
 
+@app.route("/api/reprocess-status/<run_id>")
+def api_reprocess_status(run_id):
+    """Status of one reprocess-buffer run — queued / processing / done / error.
+
+    run_id comes from /api/reprocess's response. Proxies rgmc-bc-api, which reads
+    the Firestore doc rgmc-worker-pool writes as it processes the run.
+    """
+    try:
+        resp = _bc_api("GET", f"/bc/custom/v2/so-buffer/reprocess-status/{run_id}")
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/trigger", methods=["POST"])
 def trigger():
     data = request.get_json(silent=True) or {}
