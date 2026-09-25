@@ -8,6 +8,81 @@
   const summaryRow    = document.getElementById("summary-row");
   const tabsCard      = document.getElementById("tabs-card");
   const rowTemplate   = document.getElementById("group-row-template");
+  const skeletonBlock = document.getElementById("skeleton-block");
+  const overallProgress = document.getElementById("overall-progress");
+
+  const reprocessStatusEl = document.getElementById("reprocess-status");
+  const reprocessTitleEl  = document.getElementById("reprocess-status-title");
+  const reprocessDetailEl = document.getElementById("reprocess-status-detail");
+  const reprocessElapsedEl = document.getElementById("reprocess-elapsed");
+  const stopWatchingBtn   = document.getElementById("stop-watching-btn");
+
+  // ── Your Details gate ────────────────────────────────────────────────────
+  // Required before the buffer data becomes usable, and sent along with a
+  // reprocess trigger so rgmc-worker-pool can email this person the result.
+  // Persisted in localStorage (this browser only) so it's pre-filled next time.
+  const EMPLOYEE_STORAGE_KEY = "sbic_reconcile_employee_details";
+  const gatedArea  = document.getElementById("gated-area");
+  const gateHint   = document.getElementById("gate-hint");
+  const employeeFields = {
+    name:       document.getElementById("employee-name"),
+    company:    document.getElementById("employee-company"),
+    department: document.getElementById("employee-department"),
+    email:      document.getElementById("employee-email"),
+  };
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  function loadEmployeeDetails() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(EMPLOYEE_STORAGE_KEY) || "{}");
+      Object.keys(employeeFields).forEach((key) => {
+        if (saved[key]) employeeFields[key].value = saved[key];
+      });
+    } catch (e) { /* corrupt/blocked storage — start blank */ }
+  }
+
+  function saveEmployeeDetails() {
+    try {
+      const values = {};
+      Object.keys(employeeFields).forEach((key) => { values[key] = employeeFields[key].value.trim(); });
+      localStorage.setItem(EMPLOYEE_STORAGE_KEY, JSON.stringify(values));
+    } catch (e) { /* storage unavailable — details just won't persist */ }
+  }
+
+  function employeeDetailsValid() {
+    return (
+      employeeFields.name.value.trim() &&
+      employeeFields.company.value.trim() &&
+      employeeFields.department.value.trim() &&
+      EMAIL_RE.test(employeeFields.email.value.trim())
+    );
+  }
+
+  function getEmployeeDetails() {
+    return {
+      employee_name: employeeFields.name.value.trim(),
+      employee_company: employeeFields.company.value.trim(),
+      employee_department: employeeFields.department.value.trim(),
+      email: employeeFields.email.value.trim(),
+    };
+  }
+
+  function refreshGate() {
+    const valid = employeeDetailsValid();
+    gatedArea.classList.toggle("is-locked", !valid);
+    gateHint.classList.toggle("hidden", valid);
+    return valid;
+  }
+
+  Object.values(employeeFields).forEach((el) => {
+    el.addEventListener("input", () => {
+      saveEmployeeDetails();
+      refreshGate();
+    });
+  });
+
+  loadEmployeeDetails();
+  refreshGate();
 
   // ── Button loading spinner (caller still manages .disabled separately) ────
   function setBtnLoading(spinnerId, labelId, loading, loadingText) {
@@ -27,6 +102,36 @@
   // { company, order_count, orders, groups: { sku: [...], branch: [...], customer: [...] } }
   let state = null;
 
+  // ── Shared motion helpers ────────────────────────────────────────────────
+  // Reveal an element the first time it goes visible (state entry), never on
+  // repeat re-renders — repeated reveal animation is decoration, not state.
+  function revealOnce(el) {
+    if (!el.classList.contains("hidden")) return;
+    el.classList.remove("hidden");
+    el.classList.add("reveal-in");
+    el.addEventListener("animationend", () => el.classList.remove("reveal-in"), { once: true });
+  }
+
+  // Set a stat's text and give it a brief pulse only when the value actually changed.
+  function setStatText(id, newText) {
+    const el = document.getElementById(id);
+    newText = String(newText);
+    if (el.textContent === newText) return;
+    el.textContent = newText;
+    el.classList.remove("stat-pulse");
+    void el.offsetWidth; // restart the animation if it's mid-flight
+    el.classList.add("stat-pulse");
+  }
+
+  // Brief opacity dip + recover on a region that just got new data in place
+  // (background line-recovery pass, a live reprocess poll) — signals "this
+  // just refreshed" without a jarring full-DOM flash.
+  function refreshPulse(el) {
+    el.classList.remove("data-refresh");
+    void el.offsetWidth;
+    el.classList.add("data-refresh");
+  }
+
   // ── Status / summary ────────────────────────────────────────────────────
   function setStatus(msg, isError) {
     statusLine.textContent = msg || "";
@@ -38,13 +143,13 @@
   }
 
   function renderSummary() {
-    document.getElementById("stat-orders").textContent = state.order_count;
+    setStatText("stat-orders", state.order_count);
 
     let totalGroups = 0, totalResolved = 0;
     ["sku", "branch", "customer"].forEach((type) => {
       const list = state.groups[type];
       const done = resolvedCount(list);
-      document.getElementById(`stat-${type}`).textContent = `${done}/${list.length}`;
+      setStatText(`stat-${type}`, `${done}/${list.length}`);
       document.getElementById(`tab-count-${type}`).textContent = list.length ? `(${done}/${list.length})` : "";
       totalGroups += list.length;
       totalResolved += done;
@@ -54,14 +159,13 @@
     document.getElementById("tab-count-orders").textContent =
       state.orders.length ? `(${readyOrders}/${state.orders.length} ready)` : "";
 
-    summaryRow.classList.remove("hidden");
+    revealOnce(summaryRow);
 
-    const progressEl = document.getElementById("overall-progress");
     const pct = totalGroups ? Math.round((totalResolved / totalGroups) * 100) : 0;
     document.getElementById("overall-progress-fill").style.width = pct + "%";
     document.getElementById("overall-progress-text").textContent =
       totalGroups ? `${totalResolved}/${totalGroups} groups resolved (${pct}%)` : "Nothing to resolve.";
-    progressEl.classList.remove("hidden");
+    revealOnce(overallProgress);
   }
 
   // ── Candidate normalization ──────────────────────────────────────────────
@@ -224,7 +328,7 @@
     }
     applyResolvedState(group);
 
-    toggleBtn.addEventListener("click", () => linkPanel.classList.toggle("hidden"));
+    toggleBtn.addEventListener("click", () => linkPanel.classList.toggle("is-open"));
 
     unlinkBtn.addEventListener("click", async () => {
       if (!group.override_id) return;
@@ -246,11 +350,14 @@
 
     async function saveLink(candidate) {
       const resolved = resolvedPayload(type, candidate);
+      linkPanel.classList.add("is-saving");
       try {
         const data = await saveOverride(type, group.key, resolved, "", group.buffer_ids);
         applyResolvedFields(group, resolved, data);
         applyResolvedState(group);
-        linkPanel.classList.add("hidden");
+        resolvedBox.classList.add("pop-in");
+        resolvedBox.addEventListener("animationend", () => resolvedBox.classList.remove("pop-in"), { once: true });
+        linkPanel.classList.remove("is-open");
 
         // A ship-to address belongs to a specific BC customer — selecting one tells
         // us that customer too, so auto-apply it instead of making the user search
@@ -275,6 +382,8 @@
         renderSummary();
       } catch (e) {
         setStatus("Could not save link: " + e.message, true);
+      } finally {
+        linkPanel.classList.remove("is-saving");
       }
     }
 
@@ -462,13 +571,35 @@
   }
 
   // ── Tabs ──────────────────────────────────────────────────────────────────
+  // Crossfade instead of an instant hide/show — the panels hold genuinely
+  // different content (SKU vs branch vs customer vs orders), so this is a
+  // state transition, not decoration.
+  const TAB_EXIT_MS = 150;
+  function activateTab(tabKey) {
+    const targetBtn = document.querySelector(`.tab-btn[data-tab="${tabKey}"]`);
+    const next = document.getElementById(`panel-${tabKey}`);
+    if (!targetBtn || !next || targetBtn.classList.contains("active")) return;
+
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    targetBtn.classList.add("active");
+
+    const current = document.querySelector(".tab-panel:not(.hidden)");
+    if (current && current !== next) {
+      current.classList.add("tab-panel-exit");
+      setTimeout(() => {
+        current.classList.add("hidden");
+        current.classList.remove("tab-panel-exit");
+      }, TAB_EXIT_MS);
+    }
+
+    next.classList.remove("hidden");
+    next.classList.add("tab-panel-enter");
+    void next.offsetWidth; // force reflow so the enter state is registered before transitioning out of it
+    requestAnimationFrame(() => next.classList.remove("tab-panel-enter"));
+  }
+
   document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
-      btn.classList.add("active");
-      document.getElementById(`panel-${btn.dataset.tab}`).classList.remove("hidden");
-    });
+    btn.addEventListener("click", () => activateTab(btn.dataset.tab));
   });
 
   // ── Load buffer ───────────────────────────────────────────────────────────
@@ -478,19 +609,26 @@
     renderGroupsPanel("branch");
     renderGroupsPanel("customer");
     renderOrdersPanel();
-    tabsCard.classList.remove("hidden");
+    revealOnce(tabsCard);
     reprocessBtn.disabled = state.order_count === 0;
   }
 
   async function loadBuffer() {
+    if (!refreshGate()) {
+      setStatus("Fill in your details above first.", true);
+      return;
+    }
     const company = companySelect.value;
     if (!company) {
       setStatus("Select a company first.", true);
       return;
     }
+    stopWatching(); // a fresh load already gives the current truth — no need to keep polling
     loadBtn.disabled = true;
     setBtnLoading("load-spinner", "load-btn-label", true, "Loading…");
     setStatus("Loading buffer…");
+    const isFirstLoad = !state;
+    if (isFirstLoad) skeletonBlock.classList.remove("hidden");
     try {
       // Fast pass first — buffered orders as Firestore actually has them, so the
       // page renders immediately instead of waiting on line recovery.
@@ -498,6 +636,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Failed to load buffer");
       state = data;
+      skeletonBlock.classList.add("hidden");
       renderAll();
       setStatus(`Loaded ${state.order_count} buffered order(s) for ${company}.`);
 
@@ -513,6 +652,7 @@
             if (!r.ok || company !== companySelect.value) return; // stale response, ignore
             state = d;
             renderAll();
+            refreshPulse(tabsCard);
             const n = state.orders.filter((o) => o._lines_recovered_from).length;
             setStatus(`Loaded ${state.order_count} buffered order(s) for ${company}.` +
               (n ? ` Recovered lines for ${n} order(s).` : ""));
@@ -522,6 +662,7 @@
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {
+      skeletonBlock.classList.add("hidden");
       loadBtn.disabled = false;
       setBtnLoading("load-spinner", "load-btn-label", false);
     }
@@ -529,9 +670,91 @@
 
   loadBtn.addEventListener("click", loadBuffer);
 
+  // ── Reprocess: trigger + watch ───────────────────────────────────────────
+  // The trigger itself only kicks off an async worker-pool job — real results
+  // land by email a minute or more later. Rather than fake a progress bar, this
+  // polls the real buffer count on an interval and reports genuine change only.
+  const WATCH_POLL_MS = 20000;  // check the live buffer every 20s
+  const WATCH_MAX_POLLS = 15;   // auto-stop after ~5 minutes so an open tab doesn't poll forever
+  let watcher = null; // { startedAt, baselineCount, pollCount, pollTimer, tickTimer }
+
+  function formatElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }
+
+  function stopWatching(finalMessage, variant) {
+    if (!watcher) return;
+    clearInterval(watcher.tickTimer);
+    clearTimeout(watcher.pollTimer);
+    watcher = null;
+    if (finalMessage) {
+      reprocessStatusEl.classList.remove("is-success", "is-stopped");
+      if (variant) reprocessStatusEl.classList.add(variant);
+      reprocessTitleEl.textContent = finalMessage;
+      reprocessDetailEl.textContent = "";
+      stopWatchingBtn.classList.add("hidden");
+    } else {
+      reprocessStatusEl.classList.add("hidden");
+    }
+  }
+
+  async function pollBufferOnce() {
+    if (!watcher) return;
+    try {
+      const res = await fetch(`/api/buffer?company=${encodeURIComponent(state.company)}`);
+      const data = await res.json();
+      if (!watcher || !res.ok) return;
+
+      const changed = data.order_count !== state.order_count;
+      state = data;
+      renderAll();
+      if (changed) refreshPulse(tabsCard);
+      watcher.pollCount += 1;
+
+      if (data.order_count === 0) {
+        stopWatching("All buffered orders cleared.", "is-success");
+        return;
+      }
+      if (changed) {
+        const delta = watcher.baselineCount - data.order_count;
+        reprocessDetailEl.textContent = delta > 0
+          ? `${delta} order(s) cleared since you triggered this — ${data.order_count} still buffered.`
+          : `Buffer count changed — ${data.order_count} order(s) currently buffered.`;
+      }
+      if (watcher.pollCount >= WATCH_MAX_POLLS) {
+        stopWatching("Stopped auto-checking after 5 minutes — reload to see the latest.", "is-stopped");
+        return;
+      }
+      watcher.pollTimer = setTimeout(pollBufferOnce, WATCH_POLL_MS);
+    } catch (e) {
+      if (watcher) watcher.pollTimer = setTimeout(pollBufferOnce, WATCH_POLL_MS); // transient hiccup — try again next tick
+    }
+  }
+
+  function startWatching(baselineCount) {
+    stopWatching();
+    watcher = { startedAt: Date.now(), baselineCount, pollCount: 0, pollTimer: null, tickTimer: null };
+    reprocessStatusEl.classList.remove("hidden", "is-success", "is-stopped");
+    reprocessTitleEl.textContent = "Reprocessing triggered — watching for results…";
+    reprocessDetailEl.textContent = `You'll also get an email at ${employeeFields.email.value.trim()}.`;
+    stopWatchingBtn.classList.remove("hidden");
+    reprocessElapsedEl.textContent = "0:00";
+    watcher.tickTimer = setInterval(() => {
+      if (watcher) reprocessElapsedEl.textContent = formatElapsed(Date.now() - watcher.startedAt);
+    }, 1000);
+    watcher.pollTimer = setTimeout(pollBufferOnce, WATCH_POLL_MS);
+  }
+
+  stopWatchingBtn.addEventListener("click", () => stopWatching());
+
   reprocessBtn.addEventListener("click", async () => {
     if (!state) return;
-    if (!confirm(`Trigger the reprocess-buffer retry for ${state.company}? This re-runs the normal buffer retry — it does not automatically apply the links saved above yet.`)) {
+    if (!refreshGate()) {
+      setStatus("Fill in your details above first.", true);
+      return;
+    }
+    if (!confirm(`Trigger the reprocess-buffer retry for ${state.company}? This re-runs the normal buffer retry — it does not automatically apply the links saved above yet. You'll get an email at ${employeeFields.email.value.trim()} with the result.`)) {
       return;
     }
     reprocessBtn.disabled = true;
@@ -541,11 +764,12 @@
       const res = await fetch("/api/reprocess", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ company: state.company }),
+        body: JSON.stringify({ company: state.company, ...getEmployeeDetails() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Reprocess trigger failed");
-      setStatus(`Reprocess triggered for ${state.company}. Reload the buffer in a minute to see results.`);
+      setStatus(`Reprocess triggered for ${state.company}.`);
+      startWatching(state.order_count);
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {

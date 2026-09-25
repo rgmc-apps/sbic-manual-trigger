@@ -611,13 +611,33 @@ def api_reprocess():
     caused the original failure will likely fail again the same way until that
     follow-up ships. This still re-triggers correctly for orders that were buffered
     for an unrelated, since-resolved reason.
+
+    employee_name/employee_company/employee_department/email identify who triggered
+    this from the page (required client-side before the page is usable at all — see
+    reconcile.js). Forwarded to rgmc-gcp-api as notify_* so rgmc-worker-pool can CC
+    this person on the reprocess result emails.
     """
     data = request.get_json(silent=True) or {}
     company = (data.get("company") or "").strip().upper()
     if not company:
         return jsonify({"error": "company is required"}), 400
+
+    employee_name = (data.get("employee_name") or "").strip()
+    employee_company = (data.get("employee_company") or "").strip()
+    employee_department = (data.get("employee_department") or "").strip()
+    email = (data.get("email") or "").strip()
+    if not employee_name or not employee_company or not employee_department or not email:
+        return jsonify({"error": "employee_name, employee_company, employee_department, and email are required"}), 400
+
+    params = {
+        "companies": company,
+        "notify_name": employee_name,
+        "notify_company": employee_company,
+        "notify_department": employee_department,
+        "notify_email": email,
+    }
     try:
-        resp = _gcp_api("POST", "/customerpoul/reprocess-buffer", params={"companies": company})
+        resp = _gcp_api("POST", "/customerpoul/reprocess-buffer", params=params)
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
     except requests.RequestException as exc:
