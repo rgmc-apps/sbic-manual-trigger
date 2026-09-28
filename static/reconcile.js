@@ -353,7 +353,8 @@
       const resolved = resolvedPayload(type, candidate);
       linkPanel.classList.add("is-saving");
       try {
-        const data = await saveOverride(type, group.key, resolved, "", group.buffer_ids);
+        const resolvedBy = getEmployeeDetails().employee_name;
+        const data = await saveOverride(type, group.key, resolved, resolvedBy, group.buffer_ids);
         applyResolvedFields(group, resolved, data);
         applyResolvedState(group);
         resolvedBox.classList.add("pop-in");
@@ -368,7 +369,7 @@
           try {
             const custGroup = findGroup("customer", group.customer_name);
             const custData = await saveOverride(
-              "customer", group.customer_name, custResolved, "", custGroup ? custGroup.buffer_ids : []
+              "customer", group.customer_name, custResolved, resolvedBy, custGroup ? custGroup.buffer_ids : []
             );
             if (custGroup) {
               applyResolvedFields(custGroup, custResolved, custData);
