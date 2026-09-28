@@ -11,6 +11,7 @@
   const rowTemplate   = document.getElementById("group-row-template");
   const skeletonBlock = document.getElementById("skeleton-block");
   const overallProgress = document.getElementById("overall-progress");
+  const allResolvedHint = document.getElementById("all-resolved-hint");
 
   const reprocessStatusEl = document.getElementById("reprocess-status");
   const reprocessTitleEl  = document.getElementById("reprocess-status-title");
@@ -113,6 +114,22 @@
     el.addEventListener("animationend", () => el.classList.remove("reveal-in"), { once: true });
   }
 
+  // Like revealOnce, but re-triggers the reveal animation every time the element
+  // transitions from hidden to shown (not just the first time) — for state that can
+  // legitimately toggle back and forth, like "everything's resolved" after an undo.
+  function toggleReveal(el, show) {
+    const isHidden = el.classList.contains("hidden");
+    if (show) {
+      if (isHidden) {
+        el.classList.remove("hidden");
+        el.classList.add("reveal-in");
+        el.addEventListener("animationend", () => el.classList.remove("reveal-in"), { once: true });
+      }
+    } else if (!isHidden) {
+      el.classList.add("hidden");
+    }
+  }
+
   // Set a stat's text and give it a brief pulse only when the value actually changed.
   function setStatText(id, newText) {
     const el = document.getElementById(id);
@@ -167,6 +184,9 @@
     document.getElementById("overall-progress-text").textContent =
       totalGroups ? `${totalResolved}/${totalGroups} groups resolved (${pct}%)` : "Nothing to resolve.";
     revealOnce(overallProgress);
+
+    const allResolved = totalGroups > 0 && totalResolved === totalGroups && state.order_count > 0;
+    toggleReveal(allResolvedHint, allResolved);
   }
 
   // ── Candidate normalization ──────────────────────────────────────────────

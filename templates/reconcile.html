@@ -124,7 +124,13 @@
         </div>
 
         <div class="summary-row hidden" id="summary-row">
-          <div class="summary-stat"><span class="summary-value" id="stat-orders">0</span><span class="summary-label">Buffered POs</span></div>
+          <div class="summary-stat">
+            <span class="summary-value" id="stat-orders">0</span>
+            <span class="summary-label">
+              Buffered POs
+              <span class="info-tip" tabindex="0" data-tooltip="A purchase order that failed to import into Business Central automatically — usually because its SKU code, customer branch, or customer name didn't exactly match an existing BC record. It sits here until you link it below (or it's fixed at the source), then Reprocess Buffer retries creating it in BC.">ⓘ</span>
+            </span>
+          </div>
           <div class="summary-stat"><span class="summary-value" id="stat-sku">0/0</span><span class="summary-label">SKU groups resolved</span></div>
           <div class="summary-stat"><span class="summary-value" id="stat-branch">0/0</span><span class="summary-label">Branch groups resolved</span></div>
           <div class="summary-stat"><span class="summary-value" id="stat-customer">0/0</span><span class="summary-label">Customer groups resolved</span></div>
@@ -133,6 +139,13 @@
         <div class="overall-progress hidden" id="overall-progress">
           <div class="overall-progress-track"><div class="overall-progress-fill" id="overall-progress-fill"></div></div>
           <span class="overall-progress-text" id="overall-progress-text"></span>
+        </div>
+
+        <!-- Shown only when every SKU/branch/customer group is resolved and there's
+             something left in the buffer to act on. -->
+        <div class="all-resolved-hint hidden" id="all-resolved-hint">
+          <span class="all-resolved-icon" aria-hidden="true">✓</span>
+          <span>Everything's linked. Click <strong>Reprocess Buffer</strong> above to retry these orders in Business Central.</span>
         </div>
 
         <p class="status-line" id="status-line"></p>
@@ -145,6 +158,7 @@
           <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To) <span class="tab-count" id="tab-count-branch"></span></button>
           <button class="tab-btn" data-tab="customer">Customers <span class="tab-count" id="tab-count-customer"></span></button>
           <button class="tab-btn" data-tab="orders">Buffered Orders <span class="tab-count" id="tab-count-orders"></span></button>
+          <span class="info-tip tabs-info-tip" tabindex="0" data-tooltip="The buffer is Firestore storage for orders Business Central rejected on auto-import. Each one stays here — with whatever lines it has — until its SKU/branch/customer links are resolved and it's successfully reprocessed into BC.">ⓘ</span>
         </div>
 
         <div class="tab-panel" id="panel-sku" data-lookup="items"></div>
