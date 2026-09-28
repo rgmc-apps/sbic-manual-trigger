@@ -25,6 +25,7 @@
 
 /* ── Your Details gate ── */
 .details-hint { font-size: .8125rem; color: var(--text-muted); margin-top: -12px; margin-bottom: 20px; }
+.sync-hint { margin-top: 12px; margin-bottom: 0; }
 .gate-hint { color: var(--warn-text); margin-top: 12px; }
 
 .gated {

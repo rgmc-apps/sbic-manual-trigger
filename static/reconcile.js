@@ -4,6 +4,7 @@
   const companySelect = document.getElementById("company-select");
   const loadBtn       = document.getElementById("load-btn");
   const reprocessBtn  = document.getElementById("reprocess-btn");
+  const syncBtn       = document.getElementById("sync-btn");
   const statusLine    = document.getElementById("status-line");
   const summaryRow    = document.getElementById("summary-row");
   const tabsCard      = document.getElementById("tabs-card");
@@ -839,6 +840,46 @@
     } finally {
       setBtnLoading("reprocess-spinner", "reprocess-btn-label", false);
       reprocessBtn.disabled = false;
+    }
+  });
+
+  // Sync from Cloud SQL doesn't need a loaded buffer — just a company — so it's
+  // enabled independently of `state`.
+  companySelect.addEventListener("change", () => {
+    syncBtn.disabled = !companySelect.value;
+  });
+
+  syncBtn.addEventListener("click", async () => {
+    const company = companySelect.value;
+    if (!company) {
+      setStatus("Select a company first.", true);
+      return;
+    }
+    if (!refreshGate()) {
+      setStatus("Fill in your details above first.", true);
+      return;
+    }
+    if (!confirm(`Sync inserted orders for ${company} from Cloud SQL? This backfills missing lines onto BC orders already created for CustomerPOUL rows (createBy='trigger') — any line that still can't be matched gets buffered for reconciliation. You'll get an email at ${employeeFields.email.value.trim()} with the result.`)) {
+      return;
+    }
+    syncBtn.disabled = true;
+    setBtnLoading("sync-spinner", "sync-btn-label", true, "Syncing…");
+    setStatus("Triggering Cloud SQL sync…");
+    try {
+      const res = await fetch("/api/sync-inserted-orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company, ...getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Sync trigger failed");
+      setStatus(`Cloud SQL sync triggered for ${company}.`);
+      startWatching(data.run_id || null, state && state.company === company ? state.order_count : 0);
+    } catch (e) {
+      setStatus("Error: " + e.message, true);
+    } finally {
+      setBtnLoading("sync-spinner", "sync-btn-label", false);
+      syncBtn.disabled = false;
     }
   });
 })();

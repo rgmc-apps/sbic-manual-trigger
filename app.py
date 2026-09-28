@@ -600,6 +600,23 @@ def api_reference():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+def _employee_notify_params(data: dict):
+    """Validate the 4 required employee fields and return them as rgmc-gcp-api's
+    notify_* query params, or (None, error_response) if any are missing."""
+    employee_name = (data.get("employee_name") or "").strip()
+    employee_company = (data.get("employee_company") or "").strip()
+    employee_department = (data.get("employee_department") or "").strip()
+    email = (data.get("email") or "").strip()
+    if not employee_name or not employee_company or not employee_department or not email:
+        return None, (jsonify({"error": "employee_name, employee_company, employee_department, and email are required"}), 400)
+    return {
+        "notify_name": employee_name,
+        "notify_company": employee_company,
+        "notify_department": employee_department,
+        "notify_email": email,
+    }, None
+
+
 @app.route("/api/reprocess", methods=["POST"])
 def api_reprocess():
     """Trigger the existing POUL SO reprocess-buffer pass for one company.
@@ -622,22 +639,43 @@ def api_reprocess():
     if not company:
         return jsonify({"error": "company is required"}), 400
 
-    employee_name = (data.get("employee_name") or "").strip()
-    employee_company = (data.get("employee_company") or "").strip()
-    employee_department = (data.get("employee_department") or "").strip()
-    email = (data.get("email") or "").strip()
-    if not employee_name or not employee_company or not employee_department or not email:
-        return jsonify({"error": "employee_name, employee_company, employee_department, and email are required"}), 400
+    notify_params, err = _employee_notify_params(data)
+    if err:
+        return err
 
-    params = {
-        "companies": company,
-        "notify_name": employee_name,
-        "notify_company": employee_company,
-        "notify_department": employee_department,
-        "notify_email": email,
-    }
+    params = {"companies": company, **notify_params}
     try:
         resp = _gcp_api("POST", "/customerpoul/reprocess-buffer", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
+@app.route("/api/sync-inserted-orders", methods=["POST"])
+def api_sync_inserted_orders():
+    """Backfill lines onto BC sales orders already inserted for CustomerPOUL rows
+    with a given createBy (default 'trigger' — the BigQuery bridge's automated
+    inserts), using Cloud SQL (CustomerPOUL/CustomerPOULDetailBQ) as the source of
+    truth. Finds each order by externalDocumentNo == poRefNumber, so it works even
+    for orders whose Firestore buffer doc is already gone. Any line that still can't
+    be resolved gets buffered (with the order's so_number) for manual reconciliation.
+
+    Same employee-notify requirement and run_id/status tracking as /api/reprocess.
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip().upper()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    create_by = (data.get("create_by") or "trigger").strip()
+
+    notify_params, err = _employee_notify_params(data)
+    if err:
+        return err
+
+    params = {"companies": company, "create_by": create_by, **notify_params}
+    try:
+        resp = _gcp_api("POST", "/customerpoul/sync-inserted-orders", params=params)
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
     except requests.RequestException as exc:

@@ -93,7 +93,14 @@
             <span class="btn-spinner hidden" id="reprocess-spinner"></span>
             <span id="reprocess-btn-label">Reprocess Buffer</span>
           </button>
+          <button class="btn-reprocess" id="sync-btn" type="button" disabled>
+            <span class="btn-spinner hidden" id="sync-spinner"></span>
+            <span id="sync-btn-label">Sync from Cloud SQL</span>
+          </button>
         </div>
+        <p class="details-hint sync-hint">
+          "Sync from Cloud SQL" backfills lines onto BC orders already inserted (found by PO ref) whose lines are missing or incomplete — for orders whose buffer entry is already gone. It does not require a loaded buffer above.
+        </p>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->
         <div class="skeleton-block hidden" id="skeleton-block" aria-hidden="true">
