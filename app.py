@@ -432,6 +432,43 @@ def api_buffer_lines():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+def _multi_field_contains_search(path: str, company: str, search: str, fields: list) -> list:
+    """contains(field, search) against each of `fields` in parallel, merged/deduped by id.
+
+    BC's OData implementation rejects an `or` across distinct fields in one $filter
+    ("BadRequest_MethodNotImplemented" / the documented /food/customers 501 limitation —
+    see rgmc_ship_to_v2_routes.py's docstring in rgmc-bc-api for the same workaround).
+    Querying one field per request and merging client-side is how ship-to-addresses
+    already searches name/code/lookupCode together; this generalizes that pattern so a
+    search matches ANY of `fields` containing the term, not just the first one checked.
+    """
+    esc = search.replace("'", "''")
+    errors: list = []
+
+    def _one(field: str) -> list:
+        try:
+            resp = _bc_api("GET", path, params={"company": company, "filter": f"contains({field},'{esc}')"})
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                return body.get("data", [])
+            errors.append(f"{field}: {status_code} {body}")
+        except requests.RequestException as exc:
+            errors.append(f"{field}: {exc}")
+        return []
+
+    merged: dict = {}
+    with ThreadPoolExecutor(max_workers=len(fields)) as ex:
+        for rows in ex.map(_one, fields):
+            for row in rows:
+                merged[row.get("id") or id(row)] = row
+
+    if not merged and errors:
+        # Every field failed — surface it as a connectivity/BC error instead of a
+        # silent "no matches", same as rgmc_ship_to_v2_routes.py's equivalent check.
+        raise requests.RequestException("; ".join(errors))
+    return list(merged.values())
+
+
 def _enrich_customer_names(candidates: list, company: str) -> None:
     """Attach a readable customerName to each ship-to candidate, in place.
 
@@ -504,42 +541,37 @@ def api_suggest_item(po_ref):
 
 @app.route("/api/lookup/items")
 def api_lookup_items():
-    """Search existing BC items by description, via rgmc-bc-api."""
+    """Search existing BC items by description OR item number, via rgmc-bc-api.
+
+    RGMC's custom items page (Pag50310) names these fields "description" and "number"
+    (not BC standard's "displayName"). A term is matched against either — e.g. the user
+    might recognize the item by its code just as easily as by a fragment of its name.
+    """
     company = request.args.get("company", "")
     search = (request.args.get("search") or "").strip()
     if not search:
         return jsonify({"data": []})
-    esc = search.replace("'", "''")
     try:
-        resp = _bc_api("GET", "/bc/custom/v2/items", params={
-            "company": company,
-            # RGMC's custom items page (Pag50310) names this field "description",
-            # not BC standard's "displayName".
-            "filter": f"contains(description,'{esc}')",
-        })
-        body, status_code = _proxy_json(resp)
-        return jsonify(body), status_code
+        rows = _multi_field_contains_search("/bc/custom/v2/items", company, search, ["description", "number"])
+        return jsonify({"data": rows})
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
 @app.route("/api/lookup/customers")
 def api_lookup_customers():
-    """Search existing BC customers by name, via rgmc-bc-api."""
+    """Search existing BC customers by name OR customer number, via rgmc-bc-api.
+
+    RGMC's custom customers page names these fields "name" and "customerNo" (not BC
+    standard's "displayName"/"number"). A term is matched against either.
+    """
     company = request.args.get("company", "")
     search = (request.args.get("search") or "").strip()
     if not search:
         return jsonify({"data": []})
-    esc = search.replace("'", "''")
     try:
-        resp = _bc_api("GET", "/bc/custom/v2/customers", params={
-            "company": company,
-            # RGMC's custom customers page names these fields "name" and "customerNo",
-            # not BC standard's "displayName"/"number".
-            "filter": f"contains(name,'{esc}')",
-        })
-        body, status_code = _proxy_json(resp)
-        return jsonify(body), status_code
+        rows = _multi_field_contains_search("/bc/custom/v2/customers", company, search, ["name", "customerNo"])
+        return jsonify({"data": rows})
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 

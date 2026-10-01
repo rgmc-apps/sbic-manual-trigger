@@ -505,7 +505,7 @@
     } else {
       suggestBtn.addEventListener("click", async () => {
         suggestBtn.disabled = true;
-        suggestStatus.textContent = "Loading…";
+        suggestStatus.innerHTML = `<span class="btn-spinner"></span> Looking up BC…`;
         suggestResults.innerHTML = "";
         try {
           const poRef = group.po_refs[0];
@@ -548,13 +548,18 @@
         return;
       }
       searchTimer = setTimeout(async () => {
+        searchResults.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
         try {
           const url = `/api/lookup/${LOOKUP_PATH[type]}?search=${encodeURIComponent(term)}&company=${encodeURIComponent(state.company)}`;
           const res = await fetch(url);
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
+          // Stale response guard — the debounce already waits 350ms, but a slow BC
+          // round-trip can still resolve after the user has typed something newer.
+          if (searchInput.value.trim() !== term) return;
           renderCandidateList(searchResults, type, normalizeCandidates(type, data.data), saveLink);
         } catch (e) {
+          if (searchInput.value.trim() !== term) return;
           searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
         }
       }, 350);

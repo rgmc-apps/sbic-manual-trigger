@@ -178,6 +178,15 @@
   to { transform: rotate(360deg); }
 }
 
+/* ── BC lookup loading state (manual search box + suggested-matches button) ── */
+.search-hint.search-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+.suggest-status .btn-spinner, .search-hint .btn-spinner { border-color: var(--text-muted); border-top-color: transparent; }
+
 .status-line { font-size: .8125rem; color: var(--text-muted); margin-top: 14px; min-height: 18px; }
 .status-line.error { color: var(--error); }
 
