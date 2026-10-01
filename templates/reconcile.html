@@ -73,52 +73,75 @@
 
       <!-- Company picker + summary -->
       <section class="card">
-        <div class="toolbar">
-          <div class="form-group toolbar-select">
-            <label class="form-label" for="company-select">Company</label>
-            <div class="select-wrapper">
-              <select class="form-select" id="company-select">
-                <option value="">— Select a company —</option>
-                {% for c in companies %}
-                <option value="{{ c }}">{{ c }}</option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-          <button class="btn-trigger" id="load-btn" type="button">
-            <span class="btn-spinner hidden" id="load-spinner"></span>
-            <span id="load-btn-label">Load Buffer</span>
-          </button>
-          <button class="btn-reprocess" id="reprocess-btn" type="button" disabled>
-            <span class="btn-spinner hidden" id="reprocess-spinner"></span>
-            <span id="reprocess-btn-label">Reprocess Buffer</span>
-          </button>
-          <button class="btn-reprocess" id="sync-btn" type="button" disabled>
-            <span class="btn-spinner hidden" id="sync-spinner"></span>
-            <span id="sync-btn-label">Sync from Cloud SQL</span>
-          </button>
+        <div class="action-tabs">
+          <button class="action-tab-btn active" data-action-tab="buffer" type="button">Buffer</button>
+          <button class="action-tab-btn" data-action-tab="cloudsql" type="button">Cloud SQL</button>
         </div>
-        <p class="details-hint sync-hint">
-          "Sync from Cloud SQL" backfills lines onto BC orders already inserted (found by PO ref) whose lines are missing or incomplete — for orders whose buffer entry is already gone. It does not require a loaded buffer above.
-        </p>
 
-        <div class="toolbar backfill-toolbar">
-          <div class="form-group">
-            <label class="form-label" for="backfill-date-from">From</label>
-            <input class="form-input" type="date" id="backfill-date-from" />
+        <div class="action-tab-panel" id="action-panel-buffer">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="company-select">
+                  <option value="">— Select a company —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <button class="btn-trigger" id="load-btn" type="button">
+              <span class="btn-spinner hidden" id="load-spinner"></span>
+              <span id="load-btn-label">Load Buffer</span>
+            </button>
+            <button class="btn-reprocess" id="reprocess-btn" type="button" disabled>
+              <span class="btn-spinner hidden" id="reprocess-spinner"></span>
+              <span id="reprocess-btn-label">Reprocess Buffer</span>
+            </button>
           </div>
-          <div class="form-group">
-            <label class="form-label" for="backfill-date-to">To</label>
-            <input class="form-input" type="date" id="backfill-date-to" />
-          </div>
-          <button class="btn-reprocess" id="backfill-btn" type="button" disabled>
-            <span class="btn-spinner hidden" id="backfill-spinner"></span>
-            <span id="backfill-btn-label">Backfill from Cloud SQL</span>
-          </button>
         </div>
-        <p class="details-hint sync-hint">
-          "Backfill from Cloud SQL" creates BC sales orders (header + lines) straight from SBIC's SQL Server (CustomerPOUL where createBy='trigger', joined to CustomerPOULDetail) for POs never inserted into BC at all — the opposite of Sync from Cloud SQL above. A PO whose external document number already exists in BC is skipped untouched. From/To are optional and filter by the PO's own date; leave both blank to consider every createBy='trigger' row. Anything that can't be fully resolved is buffered below for reconciliation, same as every other import path.
-        </p>
+
+        <div class="action-tab-panel hidden" id="action-panel-cloudsql">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="cloudsql-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="cloudsql-company-select">
+                  <option value="">— Select a company —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <button class="btn-reprocess" id="sync-btn" type="button" disabled>
+              <span class="btn-spinner hidden" id="sync-spinner"></span>
+              <span id="sync-btn-label">Sync from Cloud SQL</span>
+            </button>
+          </div>
+          <p class="details-hint sync-hint">
+            "Sync from Cloud SQL" backfills lines onto BC orders already inserted (found by PO ref) whose lines are missing or incomplete — for orders whose buffer entry is already gone. It does not require a loaded buffer above.
+          </p>
+
+          <div class="toolbar backfill-toolbar">
+            <div class="form-group">
+              <label class="form-label" for="backfill-date-from">From</label>
+              <input class="form-input" type="date" id="backfill-date-from" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="backfill-date-to">To</label>
+              <input class="form-input" type="date" id="backfill-date-to" />
+            </div>
+            <button class="btn-reprocess" id="backfill-btn" type="button" disabled>
+              <span class="btn-spinner hidden" id="backfill-spinner"></span>
+              <span id="backfill-btn-label">Backfill from Cloud SQL</span>
+            </button>
+          </div>
+          <p class="details-hint sync-hint">
+            "Backfill from Cloud SQL" creates BC sales orders (header + lines) straight from SBIC's SQL Server (CustomerPOUL where createBy='trigger', joined to CustomerPOULDetail) for POs never inserted into BC at all — the opposite of Sync from Cloud SQL above. A PO whose external document number already exists in BC is skipped untouched. From/To are optional and filter by the PO's own date; leave both blank to consider every createBy='trigger' row. Anything that can't be fully resolved is buffered below for reconciliation, same as every other import path.
+          </p>
+        </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->
         <div class="skeleton-block hidden" id="skeleton-block" aria-hidden="true">

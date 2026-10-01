@@ -2,6 +2,7 @@
   "use strict";
 
   const companySelect = document.getElementById("company-select");
+  const cloudsqlCompanySelect = document.getElementById("cloudsql-company-select");
   const loadBtn       = document.getElementById("load-btn");
   const reprocessBtn  = document.getElementById("reprocess-btn");
   const syncBtn       = document.getElementById("sync-btn");
@@ -802,6 +803,26 @@
     btn.addEventListener("click", () => activateTab(btn.dataset.tab));
   });
 
+  // ── Action tabs (Buffer vs Cloud SQL process controls) ───────────────────
+  // Separate class names/selectors from the .tab-btn/.tab-panel system above —
+  // these switch which *controls* are shown (Load Buffer/Reprocess vs Sync/Backfill),
+  // not buffer content, and must not be managed by activateTab's generic
+  // ".tab-panel:not(.hidden)" lookup, which would otherwise treat both tab groups as
+  // one set. A plain instant swap is enough here — no crossfade needed for controls.
+  function activateActionTab(tabKey) {
+    const targetBtn = document.querySelector(`.action-tab-btn[data-action-tab="${tabKey}"]`);
+    const next = document.getElementById(`action-panel-${tabKey}`);
+    if (!targetBtn || !next || targetBtn.classList.contains("active")) return;
+
+    document.querySelectorAll(".action-tab-btn").forEach((b) => b.classList.remove("active"));
+    targetBtn.classList.add("active");
+    document.querySelectorAll(".action-tab-panel").forEach((p) => p.classList.toggle("hidden", p !== next));
+  }
+
+  document.querySelectorAll(".action-tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => activateActionTab(btn.dataset.actionTab));
+  });
+
   // ── Load buffer ───────────────────────────────────────────────────────────
   function renderAll() {
     renderSummary();
@@ -1045,14 +1066,15 @@
   });
 
   // Sync from Cloud SQL / Backfill from Cloud SQL don't need a loaded buffer — just
-  // a company — so they're enabled independently of `state`.
-  companySelect.addEventListener("change", () => {
-    syncBtn.disabled = !companySelect.value;
-    backfillBtn.disabled = !companySelect.value;
+  // a company, picked from their own dropdown on the Cloud SQL tab, independent of
+  // the Buffer tab's selection — so they're enabled independently of `state`.
+  cloudsqlCompanySelect.addEventListener("change", () => {
+    syncBtn.disabled = !cloudsqlCompanySelect.value;
+    backfillBtn.disabled = !cloudsqlCompanySelect.value;
   });
 
   syncBtn.addEventListener("click", async () => {
-    const company = companySelect.value;
+    const company = cloudsqlCompanySelect.value;
     if (!company) {
       setStatus("Select a company first.", true);
       return;
@@ -1086,7 +1108,7 @@
   });
 
   backfillBtn.addEventListener("click", async () => {
-    const company = companySelect.value;
+    const company = cloudsqlCompanySelect.value;
     if (!company) {
       setStatus("Select a company first.", true);
       return;
