@@ -821,7 +821,7 @@
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   }
 
-  function stopWatching(finalMessage, variant) {
+  function stopWatching(finalMessage, variant, detailMessage) {
     if (!watcher) return;
     clearInterval(watcher.tickTimer);
     clearTimeout(watcher.pollTimer);
@@ -830,7 +830,10 @@
       reprocessStatusEl.classList.remove("is-success", "is-error", "is-stopped");
       if (variant) reprocessStatusEl.classList.add(variant);
       reprocessTitleEl.textContent = finalMessage;
-      reprocessDetailEl.textContent = "";
+      // detailMessage is the caller's final-state text (e.g. the run summary or error
+      // string) — pass it in here rather than setting reprocessDetailEl separately
+      // beforehand, since this used to unconditionally blank it back to "" right after.
+      reprocessDetailEl.textContent = detailMessage || "";
       stopWatchingBtn.classList.add("hidden");
     } else {
       reprocessStatusEl.classList.add("hidden");
@@ -869,14 +872,12 @@
       if (!watcher || !res.ok) return;
 
       if (data.status === "done") {
-        reprocessDetailEl.textContent = summarizeRun(data.summary);
-        stopWatching("Reprocessing done.", "is-success");
-        refreshBufferSilently();
+        stopWatching("Reprocessing done.", "is-success", summarizeRun(data.summary));
+        refreshBufferSilently(); // numbers on screen (buffered POs, SKU/branch/customer counts) catch up to what this run just changed
         return;
       }
       if (data.status === "error") {
-        reprocessDetailEl.textContent = data.error || "Unknown error.";
-        stopWatching("Reprocessing failed.", "is-error");
+        stopWatching("Reprocessing failed.", "is-error", data.error || "Unknown error.");
         return;
       }
       // "queued" or "processing" — still ongoing.
