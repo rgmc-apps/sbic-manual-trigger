@@ -5,6 +5,9 @@
   const loadBtn       = document.getElementById("load-btn");
   const reprocessBtn  = document.getElementById("reprocess-btn");
   const syncBtn       = document.getElementById("sync-btn");
+  const backfillBtn   = document.getElementById("backfill-btn");
+  const backfillDateFrom = document.getElementById("backfill-date-from");
+  const backfillDateTo   = document.getElementById("backfill-date-to");
   const statusLine    = document.getElementById("status-line");
   const summaryRow    = document.getElementById("summary-row");
   const tabsCard      = document.getElementById("tabs-card");
@@ -1041,10 +1044,11 @@
     }
   });
 
-  // Sync from Cloud SQL doesn't need a loaded buffer — just a company — so it's
-  // enabled independently of `state`.
+  // Sync from Cloud SQL / Backfill from Cloud SQL don't need a loaded buffer — just
+  // a company — so they're enabled independently of `state`.
   companySelect.addEventListener("change", () => {
     syncBtn.disabled = !companySelect.value;
+    backfillBtn.disabled = !companySelect.value;
   });
 
   syncBtn.addEventListener("click", async () => {
@@ -1078,6 +1082,49 @@
     } finally {
       setBtnLoading("sync-spinner", "sync-btn-label", false);
       syncBtn.disabled = false;
+    }
+  });
+
+  backfillBtn.addEventListener("click", async () => {
+    const company = companySelect.value;
+    if (!company) {
+      setStatus("Select a company first.", true);
+      return;
+    }
+    if (!refreshGate()) {
+      setStatus("Fill in your details above first.", true);
+      return;
+    }
+    const dateFrom = backfillDateFrom.value;
+    const dateTo = backfillDateTo.value;
+    if (dateFrom && dateTo && dateFrom > dateTo) {
+      setStatus("The From date must be on or before the To date.", true);
+      return;
+    }
+    const rangeText = dateFrom || dateTo
+      ? ` (${dateFrom || "earliest"} through ${dateTo || "latest"})`
+      : " (no date range — every createBy='trigger' row)";
+    if (!confirm(`Backfill BC sales orders for ${company} from Cloud SQL${rangeText}? This creates a BC order for any CustomerPOUL row not already in BC — anything unresolved gets buffered for reconciliation. You'll get an email at ${employeeFields.email.value.trim()} with the result.`)) {
+      return;
+    }
+    backfillBtn.disabled = true;
+    setBtnLoading("backfill-spinner", "backfill-btn-label", true, "Backfilling…");
+    setStatus("Triggering Cloud SQL backfill…");
+    try {
+      const res = await fetch("/api/backfill-from-cloudsql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company, date_from: dateFrom, date_to: dateTo, ...getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Backfill trigger failed");
+      setStatus(`Cloud SQL backfill triggered for ${company}.`);
+      startWatching(data.run_id || null, state && state.company === company ? state.order_count : 0);
+    } catch (e) {
+      setStatus("Error: " + e.message, true);
+    } finally {
+      setBtnLoading("backfill-spinner", "backfill-btn-label", false);
+      backfillBtn.disabled = false;
     }
   });
 })();

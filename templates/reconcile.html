@@ -102,6 +102,24 @@
           "Sync from Cloud SQL" backfills lines onto BC orders already inserted (found by PO ref) whose lines are missing or incomplete — for orders whose buffer entry is already gone. It does not require a loaded buffer above.
         </p>
 
+        <div class="toolbar backfill-toolbar">
+          <div class="form-group">
+            <label class="form-label" for="backfill-date-from">From</label>
+            <input class="form-input" type="date" id="backfill-date-from" />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="backfill-date-to">To</label>
+            <input class="form-input" type="date" id="backfill-date-to" />
+          </div>
+          <button class="btn-reprocess" id="backfill-btn" type="button" disabled>
+            <span class="btn-spinner hidden" id="backfill-spinner"></span>
+            <span id="backfill-btn-label">Backfill from Cloud SQL</span>
+          </button>
+        </div>
+        <p class="details-hint sync-hint">
+          "Backfill from Cloud SQL" creates BC sales orders (header + lines) straight from SBIC's SQL Server (CustomerPOUL where createBy='trigger', joined to CustomerPOULDetail) for POs never inserted into BC at all — the opposite of Sync from Cloud SQL above. A PO whose external document number already exists in BC is skipped untouched. From/To are optional and filter by the PO's own date; leave both blank to consider every createBy='trigger' row. Anything that can't be fully resolved is buffered below for reconciliation, same as every other import path.
+        </p>
+
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->
         <div class="skeleton-block hidden" id="skeleton-block" aria-hidden="true">
           <div class="skeleton-row skeleton-summary">

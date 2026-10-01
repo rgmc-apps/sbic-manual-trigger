@@ -771,6 +771,43 @@ def api_sync_inserted_orders():
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
 
 
+@app.route("/api/backfill-from-cloudsql", methods=["POST"])
+def api_backfill_from_cloudsql():
+    """Create missing BC sales orders (header + lines) from Cloud SQL CustomerPOUL/
+    CustomerPOULDetail for a given createBy (default 'trigger') and poDate range.
+
+    Opposite skip condition from /api/sync-inserted-orders: a PO whose
+    externalDocumentNo already matches an existing BC sales order is skipped
+    untouched, never re-created. Anything that can't be fully resolved is buffered
+    for manual reconciliation, same as every other import path.
+
+    Same employee-notify requirement and run_id/status tracking as /api/reprocess.
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip().upper()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    create_by = (data.get("create_by") or "trigger").strip()
+    date_from = (data.get("date_from") or "").strip()
+    date_to = (data.get("date_to") or "").strip()
+
+    notify_params, err = _employee_notify_params(data)
+    if err:
+        return err
+
+    params = {"companies": company, "create_by": create_by, **notify_params}
+    if date_from:
+        params["date_from"] = date_from
+    if date_to:
+        params["date_to"] = date_to
+    try:
+        resp = _gcp_api("POST", "/customerpoul/backfill-from-cloudsql", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
 @app.route("/api/reprocess-status/<run_id>")
 def api_reprocess_status(run_id):
     """Status of one reprocess-buffer run — queued / processing / done / error.
