@@ -389,6 +389,32 @@
 .btn-unlink { color: var(--error); border-color: var(--error-border); font-size: .72rem; padding: 4px 10px; }
 .btn-unlink:hover { background: var(--error-bg); }
 
+/* ── Mark Inactive / Inactive Items tab ── */
+.btn-mark-inactive { color: var(--text-muted); font-size: .72rem; padding: 6px 12px; background: #fff; border: 1.5px solid var(--border); border-radius: 7px; font-weight: 600; cursor: pointer; transition: border-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-out-quart); }
+.btn-mark-inactive:hover { border-color: var(--text-muted); color: var(--text); }
+.btn-mark-inactive:active { transform: scale(.96); }
+
+.group-row.is-inactive { opacity: .72; }
+.group-row.is-inactive .group-resolved.inactive-marked-by {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+.btn-reactivate {
+  padding: 6px 14px;
+  background: #fff;
+  border: 1.5px solid var(--border);
+  border-radius: 7px;
+  font-size: .78rem;
+  font-weight: 600;
+  color: var(--brand-dark);
+  cursor: pointer;
+  transition: border-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-out-quart);
+  white-space: nowrap;
+}
+.btn-reactivate:hover { border-color: var(--brand); }
+.btn-reactivate:active { transform: scale(.96); }
+
 .group-resolved {
   margin-top: 10px;
   padding: 8px 12px;

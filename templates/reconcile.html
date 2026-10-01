@@ -64,11 +64,11 @@
 
     <div id="gated-area" class="gated">
 
-      <!-- Notice: overrides are groundwork, not yet consumed by reprocessing -->
+      <!-- Notice: overrides are now consumed by reprocessing/sync -->
       <section class="card notice-card">
-        <strong>Note:</strong> resolving a link below saves it for reference. Reprocessing
-        still re-runs the normal buffer retry as-is — it does not yet automatically apply
-        the links you save here. That wiring is a separate, tracked follow-up.
+        <strong>Note:</strong> resolving a link below is applied the next time this PO is
+        reprocessed or synced — a saved branch/customer link takes priority over automatic
+        ship-to matching, and a saved SKU link takes priority over automatic item matching.
       </section>
 
       <!-- Company picker + summary -->
@@ -155,6 +155,7 @@
       <section class="card tabs-card hidden" id="tabs-card">
         <div class="tabs">
           <button class="tab-btn active" data-tab="sku">Items (SKU) <span class="tab-count" id="tab-count-sku"></span></button>
+          <button class="tab-btn" data-tab="sku-inactive">Inactive Items <span class="tab-count" id="tab-count-sku-inactive"></span></button>
           <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To) <span class="tab-count" id="tab-count-branch"></span></button>
           <button class="tab-btn" data-tab="customer">Customers <span class="tab-count" id="tab-count-customer"></span></button>
           <button class="tab-btn" data-tab="orders">Buffered Orders <span class="tab-count" id="tab-count-orders"></span></button>
@@ -162,6 +163,7 @@
         </div>
 
         <div class="tab-panel" id="panel-sku" data-lookup="items"></div>
+        <div class="tab-panel hidden" id="panel-sku-inactive"></div>
         <div class="tab-panel hidden" id="panel-branch" data-lookup="ship-to"></div>
         <div class="tab-panel hidden" id="panel-customer" data-lookup="customers"></div>
         <div class="tab-panel hidden" id="panel-orders"></div>
@@ -185,6 +187,7 @@
         </div>
         <div class="group-meta">
           <span class="group-po-count"></span>
+          <button class="btn-mark-inactive hidden" type="button">Mark Inactive</button>
           <button class="btn-link-toggle" type="button">Link…</button>
         </div>
       </div>

@@ -173,6 +173,12 @@
       totalResolved += done;
     });
 
+    // Inactive items are excluded from the SKU resolved/total counts entirely — just
+    // show how many are parked here, not a resolved/total ratio (there's nothing to
+    // resolve for an inactive SKU).
+    const inactiveList = state.groups.sku_inactive || [];
+    document.getElementById("tab-count-sku-inactive").textContent = inactiveList.length ? `(${inactiveList.length})` : "";
+
     const readyOrders = state.orders.filter((o) => orderReadiness(o).ready).length;
     document.getElementById("tab-count-orders").textContent =
       state.orders.length ? `(${readyOrders}/${state.orders.length} ready)` : "";
@@ -332,6 +338,41 @@
     const linkPanel = row.querySelector(".group-link-panel");
     const toggleBtn = row.querySelector(".btn-link-toggle");
     const unlinkBtn = row.querySelector(".btn-unlink");
+    const markInactiveBtn = row.querySelector(".btn-mark-inactive");
+
+    if (type === "sku") {
+      markInactiveBtn.classList.remove("hidden");
+      markInactiveBtn.addEventListener("click", async () => {
+        markInactiveBtn.disabled = true;
+        try {
+          const res = await fetch("/api/inactive-skus", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: group.key, marked_by: getEmployeeDetails().employee_name }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Could not mark inactive");
+
+          const skuList = state.groups.sku;
+          const idx = skuList.indexOf(group);
+          if (idx !== -1) skuList.splice(idx, 1);
+          group.inactive_id = data.id;
+          group.inactive_marked_by = data.marked_by;
+          group.inactive_marked_at = data.marked_at;
+          state.groups.sku_inactive.push(group);
+
+          renderGroupsPanel("sku");
+          renderInactivePanel();
+          renderOrdersPanel(); // readiness may have changed
+          renderSummary();
+          setStatus(`Marked "${group.key}" inactive.`);
+        } catch (e) {
+          setStatus("Could not mark inactive: " + e.message, true);
+        } finally {
+          markInactiveBtn.disabled = false;
+        }
+      });
+    }
 
     function applyResolvedState(g) {
       if (g.resolved) {
@@ -522,12 +563,83 @@
     groups.forEach((g) => panel.appendChild(buildGroupRow(type, g)));
   }
 
+  // ── Inactive Items tab — SKUs marked inactive, excluded from the SKU counts ──
+  function renderInactivePanel() {
+    const panel = document.getElementById("panel-sku-inactive");
+    panel.innerHTML = "";
+    const groups = state.groups.sku_inactive || [];
+    if (!groups.length) {
+      const empty = document.createElement("div");
+      empty.className = "tab-empty";
+      empty.textContent = "No SKUs marked inactive.";
+      panel.appendChild(empty);
+      return;
+    }
+    groups.forEach((g) => panel.appendChild(buildInactiveRow(g)));
+  }
+
+  function buildInactiveRow(group) {
+    const row = document.createElement("div");
+    row.className = "group-row is-inactive";
+    row.innerHTML = `
+      <div class="group-head">
+        <div class="group-key-wrap">
+          <span class="group-key">${escapeHtml(group.key)}</span>
+          <span class="group-desc">${escapeHtml(groupDescText("sku", group))}</span>
+        </div>
+        <div class="group-meta">
+          <span class="group-po-count">${group.po_count} PO${group.po_count === 1 ? "" : "s"}</span>
+          <button class="btn-reactivate" type="button">Reactivate</button>
+        </div>
+      </div>
+      <div class="group-resolved inactive-marked-by">
+        Marked inactive${group.inactive_marked_by ? ` by ${escapeHtml(group.inactive_marked_by)}` : ""}${group.inactive_marked_at ? ` (${escapeHtml(group.inactive_marked_at)})` : ""}
+      </div>
+      <div class="group-po-refs">POs: ${escapeHtml(group.po_refs.join(", "))}</div>
+    `;
+    row.querySelector(".btn-reactivate").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/inactive-skus/${encodeURIComponent(group.inactive_id)}`, { method: "DELETE" });
+        if (!res.ok && res.status !== 204) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || "Could not reactivate");
+        }
+        const inactiveList = state.groups.sku_inactive;
+        const idx = inactiveList.indexOf(group);
+        if (idx !== -1) inactiveList.splice(idx, 1);
+        delete group.inactive_id;
+        delete group.inactive_marked_by;
+        delete group.inactive_marked_at;
+        state.groups.sku.push(group);
+
+        renderGroupsPanel("sku");
+        renderInactivePanel();
+        renderOrdersPanel(); // readiness may have changed
+        renderSummary();
+        setStatus(`Reactivated "${group.key}".`);
+      } catch (err) {
+        setStatus("Could not reactivate: " + err.message, true);
+        btn.disabled = false;
+      }
+    });
+    return row;
+  }
+
   // ── Buffered Orders tab (readiness is informational only) ───────────────
   function groupResolvedFor(type, key) {
     const list = state.groups[type];
     const upper = (key || "").trim().toUpperCase();
     const g = list.find((x) => x.key.trim().toUpperCase() === upper);
     return !!(g && g.resolved);
+  }
+
+  // Inactive SKUs are excluded from readiness entirely (not "resolved", just not
+  // counted) — an order whose only unresolved lines are inactive SKUs is ready.
+  function isSkuInactive(key) {
+    const upper = (key || "").trim().toUpperCase();
+    return (state.groups.sku_inactive || []).some((g) => g.key.trim().toUpperCase() === upper);
   }
 
   // Per-order resolution progress — mirrors _group_buffer's key derivation
@@ -541,7 +653,7 @@
       const sku = (l.customerSKUCode || "").trim();
       if (sku) return sku;
       return (l.customerSKUDesc || "").trim() || "(no SKU code, no description)";
-    }))];
+    }))].filter((s) => !isSkuInactive(s));
     const skuResolved = skuKeys.filter((s) => groupResolvedFor("sku", s)).length;
     const skuOk = skuKeys.length === 0 || skuResolved === skuKeys.length;
     return {
@@ -628,6 +740,7 @@
   function renderAll() {
     renderSummary();
     renderGroupsPanel("sku");
+    renderInactivePanel();
     renderGroupsPanel("branch");
     renderGroupsPanel("customer");
     renderOrdersPanel();
@@ -840,7 +953,7 @@
       setStatus("Fill in your details above first.", true);
       return;
     }
-    if (!confirm(`Trigger the reprocess-buffer retry for ${state.company}? This re-runs the normal buffer retry — it does not automatically apply the links saved above yet. You'll get an email at ${employeeFields.email.value.trim()} with the result.`)) {
+    if (!confirm(`Trigger the reprocess-buffer retry for ${state.company}? Any links saved above are applied first, ahead of automatic matching. You'll get an email at ${employeeFields.email.value.trim()} with the result.`)) {
       return;
     }
     reprocessBtn.disabled = true;

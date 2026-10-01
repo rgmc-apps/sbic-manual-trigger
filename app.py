@@ -155,17 +155,26 @@ def _proxy_json(resp: requests.Response):
     return body, resp.status_code
 
 
-def _group_buffer(orders: list, overrides: list) -> dict:
+def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = None) -> dict:
     """Group buffered orders by shared SKU code / customer branch name / customer name.
 
     Each group is resolvable once and applies to every buffered PO sharing that exact
     raw value — this is the "consolidate the POs with the same item codes / customer
     branch name / customer name" behavior. overrides is the flat list from
     GET /bc/custom/v2/so-buffer/overrides.
+
+    inactive_skus is the flat list from GET /bc/custom/v2/so-buffer/inactive-skus — any
+    SKU group whose key matches one is pulled out of "sku" and returned under
+    "sku_inactive" instead, so it's excluded from the Items (SKU) tab and its
+    resolved/total counts entirely rather than just displayed differently.
     """
     overrides_by_key: dict[str, dict] = {}
     for ov in overrides:
         overrides_by_key[f"{ov.get('type')}::{(ov.get('key') or '').strip().upper()}"] = ov
+
+    inactive_by_key: dict[str, dict] = {}
+    for row in (inactive_skus or []):
+        inactive_by_key[(row.get("key") or "").strip().upper()] = row
 
     sku_groups: dict[str, dict] = {}
     branch_groups: dict[str, dict] = {}
@@ -255,8 +264,20 @@ def _group_buffer(orders: list, overrides: list) -> dict:
         result.sort(key=lambda g: (-g["po_count"], g["key"]))
         return result
 
+    sku_active, sku_inactive = [], []
+    for g in _finalize(sku_groups, "sku"):
+        inactive_row = inactive_by_key.get(g["key"].strip().upper())
+        if inactive_row:
+            g["inactive_id"] = inactive_row.get("id")
+            g["inactive_marked_by"] = inactive_row.get("marked_by")
+            g["inactive_marked_at"] = inactive_row.get("marked_at")
+            sku_inactive.append(g)
+        else:
+            sku_active.append(g)
+
     return {
-        "sku": _finalize(sku_groups, "sku"),
+        "sku": sku_active,
+        "sku_inactive": sku_inactive,
         "branch": _finalize(branch_groups, "branch"),
         "customer": _finalize(customer_groups, "customer"),
     }
@@ -360,6 +381,10 @@ def _build_buffer_response(company: str, recover: bool):
     overrides_body, overrides_status = _proxy_json(overrides_resp)
     overrides = overrides_body.get("data", []) if overrides_status == 200 else []
 
+    inactive_resp = _bc_api("GET", "/bc/custom/v2/so-buffer/inactive-skus")
+    inactive_body, inactive_status = _proxy_json(inactive_resp)
+    inactive_skus = inactive_body.get("data", []) if inactive_status == 200 else []
+
     orders = orders_body.get("data", [])
     if recover:
         _recover_missing_lines(orders)
@@ -367,7 +392,7 @@ def _build_buffer_response(company: str, recover: bool):
         "company": company,
         "order_count": len(orders),
         "orders": orders,
-        "groups": _group_buffer(orders, overrides),
+        "groups": _group_buffer(orders, overrides, inactive_skus),
     }, 200
 
 
@@ -583,6 +608,39 @@ def api_delete_override(override_id):
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/inactive-skus", methods=["POST"])
+def api_mark_sku_inactive():
+    """Mark a raw SKU code (or description, for a blank-SKU group) inactive.
+
+    Pulls that SKU group out of the Items (SKU) tab and its resolved/total counts
+    entirely, into its own Inactive Items tab, until reactivated via DELETE below.
+    """
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    marked_by = (data.get("marked_by") or "").strip()
+    if not key:
+        return jsonify({"error": "key is required"}), 400
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/inactive-skus", json={"key": key, "marked_by": marked_by})
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/inactive-skus/<doc_id>", methods=["DELETE"])
+def api_unmark_sku_inactive(doc_id):
+    """Reactivate a SKU previously marked inactive (undo api_mark_sku_inactive)."""
+    try:
+        resp = _bc_api("DELETE", f"/bc/custom/v2/so-buffer/inactive-skus/{doc_id}")
+        if resp.status_code == 204:
+            return "", 204
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/reference")
 def api_reference():
     """Full resolution history for one SKU code / branch name / customer name — every
@@ -621,13 +679,12 @@ def _employee_notify_params(data: dict):
 def api_reprocess():
     """Trigger the existing POUL SO reprocess-buffer pass for one company.
 
-    NOTE: this re-runs the normal buffer retry (rgmc-gcp-api -> Pub/Sub ->
-    rgmc-worker-pool), unchanged by this feature. Manual links saved via
-    /api/overrides are persisted for reference but are not yet consulted by
-    rgmc-worker-pool's order-creation logic, so a PO whose broken SKU/branch/customer
-    caused the original failure will likely fail again the same way until that
-    follow-up ships. This still re-triggers correctly for orders that were buffered
-    for an unrelated, since-resolved reason.
+    This re-runs the normal buffer retry (rgmc-gcp-api -> Pub/Sub -> rgmc-worker-pool).
+    Manual links saved via /api/overrides are consulted: rgmc-bc-api's
+    apply_resolution_to_buffer patches the resolved link directly onto the affected
+    buffer doc(s) (header.resolvedShipTo/resolvedCustomer, line.resolvedItem), and
+    rgmc-worker-pool's _create_order/_resolve_valid_lines read those fields first,
+    ahead of their own automatic ship-to/item matching.
 
     employee_name/employee_company/employee_department/email identify who triggered
     this from the page (required client-side before the page is usable at all — see
