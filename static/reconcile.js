@@ -320,6 +320,35 @@
     return flagText + (group.description || "");
   }
 
+  // A group can be "Linked" and still not reach BC — orderReadiness (below) is
+  // per-order across all three link types, so linking this one group's key doesn't
+  // mean every PO referencing it is actually ready. Returns null when every one of
+  // this group's buffered orders is fully ready (nothing to warn about), otherwise
+  // how many are still blocked and by which other link type(s).
+  function groupBlockedSummary(group) {
+    if (!state.orders || !state.orders.length || !group.buffer_ids || !group.buffer_ids.length) return null;
+    const ids = new Set(group.buffer_ids);
+    const orders = state.orders.filter((o) => ids.has(o.id));
+    if (!orders.length) return null;
+
+    const needs = { branch: 0, customer: 0, sku: 0 };
+    let blockedCount = 0;
+    orders.forEach((o) => {
+      const r = orderReadiness(o);
+      if (r.ready) return;
+      blockedCount++;
+      if (!r.branchOk) needs.branch++;
+      if (!r.customerOk) needs.customer++;
+      if (!r.skuOk) needs.sku++;
+    });
+    if (!blockedCount) return null;
+
+    const labelFor = { branch: "Branch", customer: "Customer", sku: "Items" };
+    const labels = Object.keys(needs).filter((k) => needs[k]).map((k) => labelFor[k]);
+    if (!labels.length) return null;
+    return { blockedCount, total: orders.length, labels };
+  }
+
   // ── One group row ────────────────────────────────────────────────────────
   function buildGroupRow(type, group) {
     const node = rowTemplate.content.cloneNode(true);
@@ -363,6 +392,8 @@
 
           renderGroupsPanel("sku");
           renderInactivePanel();
+          renderGroupsPanel("branch"); // branch/customer blocked-notes may change — inactive SKUs no longer count against order readiness
+          renderGroupsPanel("customer");
           renderOrdersPanel(); // readiness may have changed
           renderSummary();
           setStatus(`Marked "${group.key}" inactive.`);
@@ -374,6 +405,8 @@
       });
     }
 
+    const blockedNote = row.querySelector(".group-blocked-note");
+
     function applyResolvedState(g) {
       if (g.resolved) {
         row.classList.add("is-resolved");
@@ -382,9 +415,20 @@
         resolvedBox.querySelector(".resolved-by").textContent =
           g.resolved_by ? `(by ${g.resolved_by}, ${g.resolved_at || ""})` : "";
         toggleBtn.textContent = "Change…";
+
+        const blocked = groupBlockedSummary(g);
+        if (blocked) {
+          blockedNote.textContent =
+            `${blocked.blockedCount} of ${blocked.total} PO${blocked.total === 1 ? "" : "s"} still need ` +
+            `${blocked.labels.join(", ")} linked before reaching BC.`;
+          blockedNote.classList.remove("hidden");
+        } else {
+          blockedNote.classList.add("hidden");
+        }
       } else {
         row.classList.remove("is-resolved");
         resolvedBox.classList.add("hidden");
+        blockedNote.classList.add("hidden");
         toggleBtn.textContent = "Link…";
       }
     }
@@ -401,6 +445,7 @@
         group.resolved_by = null;
         group.override_id = null;
         applyResolvedState(group);
+        refreshOtherGroupPanels(type); // other groups' blocked-notes may change now that this one is unresolved
         renderOrdersPanel();
         renderSummary();
       } catch (e) {
@@ -441,6 +486,7 @@
           }
         }
 
+        refreshOtherGroupPanels(type); // other groups' blocked-notes may change now that this one resolved
         renderOrdersPanel(); // readiness may have changed
         renderSummary();
       } catch (e) {
@@ -549,6 +595,16 @@
     return row;
   }
 
+  // A link saved/removed under one type can change whether OTHER types' groups are
+  // still "blocked" (groupBlockedSummary) — e.g. linking a branch can resolve orders
+  // that a SKU group's blocked-note was counting as unready. Refresh the two panels
+  // the caller didn't just rebuild itself so their blocked notes stay in sync.
+  function refreshOtherGroupPanels(exceptType) {
+    ["sku", "branch", "customer"].forEach((t) => {
+      if (t !== exceptType) renderGroupsPanel(t);
+    });
+  }
+
   function renderGroupsPanel(type) {
     const panel = document.getElementById(`panel-${type}`);
     panel.innerHTML = "";
@@ -616,6 +672,8 @@
 
         renderGroupsPanel("sku");
         renderInactivePanel();
+        renderGroupsPanel("branch"); // branch/customer blocked-notes may change — this SKU counts against order readiness again
+        renderGroupsPanel("customer");
         renderOrdersPanel(); // readiness may have changed
         renderSummary();
         setStatus(`Reactivated "${group.key}".`);
