@@ -439,22 +439,44 @@
     const orders = state.orders.filter((o) => ids.has(o.id));
     if (!orders.length) return null;
 
+    const labelFor = { branch: "Branch", customer: "Customer", sku: "Items" };
     const needs = { branch: 0, customer: 0, sku: 0 };
-    let blockedCount = 0;
+    const blocked = []; // { poRef, labels } — which specific PO(s), and what each still needs
     orders.forEach((o) => {
       const r = orderReadiness(o);
       if (r.ready) return;
-      blockedCount++;
-      if (!r.branchOk) needs.branch++;
-      if (!r.customerOk) needs.customer++;
-      if (!r.skuOk) needs.sku++;
+      const missing = [];
+      if (!r.branchOk) { needs.branch++; missing.push(labelFor.branch); }
+      if (!r.customerOk) { needs.customer++; missing.push(labelFor.customer); }
+      if (!r.skuOk) { needs.sku++; missing.push(labelFor.sku); }
+      if (missing.length) blocked.push({ poRef: (o.header || {}).poRefNumber || o.id, labels: missing });
     });
-    if (!blockedCount) return null;
+    if (!blocked.length) return null;
 
-    const labelFor = { branch: "Branch", customer: "Customer", sku: "Items" };
     const labels = Object.keys(needs).filter((k) => needs[k]).map((k) => labelFor[k]);
     if (!labels.length) return null;
-    return { blockedCount, total: orders.length, labels };
+    return { blockedCount: blocked.length, total: orders.length, labels, blocked };
+  }
+
+  // Renders groupBlockedSummary()'s per-PO detail onto its one-line message, e.g.
+  // "1 of 1 PO still need Items linked before reaching BC: 21560265." — or, when
+  // different POs in the same group are blocked for different reasons, each PO gets
+  // its own reason: "PO123 (Items), PO456 (Branch, Customer)". Capped so one group
+  // referencing dozens of POs doesn't turn into a wall of text.
+  const BLOCKED_DETAIL_MAX = 5;
+  function blockedSummaryText(blocked) {
+    const sameEverywhere = blocked.blocked.every(
+      (b) => b.labels.length === blocked.labels.length && b.labels.every((l) => blocked.labels.includes(l))
+    );
+    const shown = blocked.blocked.slice(0, BLOCKED_DETAIL_MAX);
+    const parts = shown.map((b) => (sameEverywhere ? b.poRef : `${b.poRef} (${b.labels.join(", ")})`));
+    if (blocked.blocked.length > BLOCKED_DETAIL_MAX) {
+      parts.push(`+${blocked.blocked.length - BLOCKED_DETAIL_MAX} more`);
+    }
+    return (
+      `${blocked.blockedCount} of ${blocked.total} PO${blocked.total === 1 ? "" : "s"} still need ` +
+      `${blocked.labels.join(", ")} linked before reaching BC: ${parts.join(", ")}.`
+    );
   }
 
   // ── One group row ────────────────────────────────────────────────────────
@@ -526,9 +548,7 @@
 
         const blocked = groupBlockedSummary(g);
         if (blocked) {
-          blockedNote.textContent =
-            `${blocked.blockedCount} of ${blocked.total} PO${blocked.total === 1 ? "" : "s"} still need ` +
-            `${blocked.labels.join(", ")} linked before reaching BC.`;
+          blockedNote.textContent = blockedSummaryText(blocked);
           blockedNote.classList.remove("hidden");
         } else {
           blockedNote.classList.add("hidden");
@@ -687,9 +707,33 @@
     });
   }
 
+  // One-time "how do I resolve this" hint shown above the Items (SKU) list — the
+  // tab most likely to need explaining, since it offers three different ways to
+  // resolve a group (auto-link, pick a suggestion, or search) plus a fourth escape
+  // hatch (Mark Inactive) that doesn't resolve it at all.
+  function buildSkuResolveHint() {
+    const hint = document.createElement("div");
+    hint.className = "tab-resolve-hint";
+    hint.innerHTML =
+      `How to resolve a SKU ` +
+      `<span class="info-tip" tabindex="0" data-tooltip="` +
+      escapeHtml(
+        `Each row is one raw SKU code (or description, if the code is blank) shared by one or more buffered POs. ` +
+        `To resolve it: click "Show suggested matches" for BC's best fuzzy-matched items, ranked by confidence — ` +
+        `picking one links it instantly. Matches of 90% confidence or higher are already auto-linked for you when ` +
+        `the buffer loads, so most rows here either need a lower-confidence pick or don't have a good match yet. ` +
+        `If none of the suggestions are right, type in the search box below them to find the exact BC item instead. ` +
+        `If this SKU is discontinued or should never be ordered, use "Mark Inactive" to exclude it from ` +
+        `reconciliation entirely — that's different from linking it, so it won't count toward any PO's readiness.`
+      ) +
+      `">ⓘ</span>`;
+    return hint;
+  }
+
   function renderGroupsPanel(type) {
     const panel = document.getElementById(`panel-${type}`);
     panel.innerHTML = "";
+    if (type === "sku") panel.appendChild(buildSkuResolveHint());
     const groups = state.groups[type];
     if (!groups.length) {
       const empty = document.createElement("div");

@@ -355,6 +355,15 @@
 .tab-panel.tab-panel-exit { opacity: 0; transform: translateY(-4px); }
 .tab-empty { color: var(--text-muted); font-size: .875rem; padding: 24px 0; text-align: center; }
 
+.tab-resolve-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: .8125rem;
+  color: var(--text-muted);
+  margin-bottom: -4px; /* .tab-panel already adds a 12px gap before the first group row */
+}
+
 /* ── Group rows ── */
 .group-row {
   border: 1px solid var(--border);
