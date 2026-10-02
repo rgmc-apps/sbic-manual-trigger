@@ -334,27 +334,55 @@
   // save — the worker pool processes one Pub/Sub message at a time, so a dozen
   // queued runs would just make every one of them land later, not faster.
   const AUTO_REPROCESS_DEBOUNCE_MS = 3000;
+  // rgmc-gcp-api's rate_limit allows only one call per route per 30s (shared with the
+  // manual "Reprocess Buffer" button and every other trigger hitting this same
+  // endpoint) and answers 429 with "Endpoint called too recently. Retry after N
+  // seconds." — fallen back to if that wording ever changes or the response body
+  // doesn't parse. The Flask proxy only forwards the JSON body, not the Retry-After
+  // header, so the message text is the only signal available for N.
+  const AUTO_REPROCESS_DEFAULT_RETRY_MS = 30000;
+  const AUTO_REPROCESS_MAX_RETRIES = 3;
   let autoReprocessTimer = null;
 
   function scheduleAutoReprocess() {
     if (!state || !employeeDetailsValid()) return; // no company loaded, or no one to notify
     clearTimeout(autoReprocessTimer);
-    autoReprocessTimer = setTimeout(async () => {
-      const company = state.company;
-      try {
-        const res = await fetch("/api/reprocess", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ company, ...getEmployeeDetails() }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || data.detail || "Reprocess trigger failed");
-        setStatus(`Auto-triggered a reprocess for ${company} after your link(s).`);
-        if (!watcher) startWatching(data.run_id || null, state.order_count);
-      } catch (e) {
-        setStatus("Auto-reprocess after linking failed (link is still saved — use Reprocess Buffer manually): " + e.message, true);
+    autoReprocessTimer = setTimeout(() => attemptAutoReprocess(state.company, 0), AUTO_REPROCESS_DEBOUNCE_MS);
+  }
+
+  function _parseRetryAfterMs(message) {
+    const m = /retry after (\d+)\s*seconds?/i.exec(message || "");
+    return m ? (parseInt(m[1], 10) + 1) * 1000 : AUTO_REPROCESS_DEFAULT_RETRY_MS;
+  }
+
+  async function attemptAutoReprocess(company, retryCount) {
+    try {
+      const res = await fetch("/api/reprocess", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company, ...getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (res.status === 429) {
+        if (retryCount >= AUTO_REPROCESS_MAX_RETRIES) {
+          setStatus(
+            `Auto-reprocess for ${company} is still rate-limited after ${AUTO_REPROCESS_MAX_RETRIES} ` +
+            `tries — your link is saved; use Reprocess Buffer manually once it clears.`,
+            true
+          );
+          return;
+        }
+        const waitMs = _parseRetryAfterMs(data.error || data.detail);
+        setStatus(`Reprocess endpoint is rate-limited — retrying for ${company} in ${Math.round(waitMs / 1000)}s…`);
+        setTimeout(() => attemptAutoReprocess(company, retryCount + 1), waitMs);
+        return;
       }
-    }, AUTO_REPROCESS_DEBOUNCE_MS);
+      if (!res.ok) throw new Error(data.error || data.detail || "Reprocess trigger failed");
+      setStatus(`Auto-triggered a reprocess for ${company} after your link(s).`);
+      if (!watcher) startWatching(data.run_id || null, state.order_count);
+    } catch (e) {
+      setStatus("Auto-reprocess after linking failed (link is still saved — use Reprocess Buffer manually): " + e.message, true);
+    }
   }
 
   // ── Auto-resolve high-confidence suggestions ─────────────────────────────
