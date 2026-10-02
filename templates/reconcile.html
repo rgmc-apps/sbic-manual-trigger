@@ -66,9 +66,12 @@
 
       <!-- Notice: overrides are now consumed by reprocessing/sync -->
       <section class="card notice-card">
-        <strong>Note:</strong> resolving a link below is applied the next time this PO is
-        reprocessed or synced — a saved branch/customer link takes priority over automatic
+        <strong>Note:</strong> a saved branch/customer link takes priority over automatic
         ship-to matching, and a saved SKU link takes priority over automatic item matching.
+        Saving a link automatically triggers a reprocess shortly after — whatever's linked
+        gets inserted into BC even if other items on the same PO are still unresolved; you
+        don't need to click <strong>Reprocess Buffer</strong> yourself unless you want to
+        retry sooner.
       </section>
 
       <!-- Company picker + summary -->

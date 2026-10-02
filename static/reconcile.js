@@ -314,7 +314,47 @@
         customerLinkError = e.message;
       }
     }
+    scheduleAutoReprocess();
     return { customerLinkError };
+  }
+
+  // ── Auto-reprocess after a link is saved ─────────────────────────────────
+  // Saving an override only ever updates Firestore (so_buffer_overrides_{env} plus a
+  // denormalized patch onto the affected buffer doc(s)) — nothing reaches BC until a
+  // reprocess-buffer run actually picks it up, same as clicking "Reprocess Buffer"
+  // above. Firing that automatically means a linked item/branch/customer gets
+  // inserted right away instead of waiting on a human to separately trigger it, and
+  // (per _resolve_valid_lines/_create_order) each line resolves independently, so an
+  // order with some items still unlinked still gets everything that IS linked
+  // inserted now rather than waiting for every sibling item on the same PO too.
+  //
+  // Debounced rather than fired per save: a burst of saves (auto-resolve linking
+  // several groups in one pass, or a human clicking through several candidates
+  // quickly) collapses into one trigger instead of queueing one company-wide run per
+  // save — the worker pool processes one Pub/Sub message at a time, so a dozen
+  // queued runs would just make every one of them land later, not faster.
+  const AUTO_REPROCESS_DEBOUNCE_MS = 3000;
+  let autoReprocessTimer = null;
+
+  function scheduleAutoReprocess() {
+    if (!state || !employeeDetailsValid()) return; // no company loaded, or no one to notify
+    clearTimeout(autoReprocessTimer);
+    autoReprocessTimer = setTimeout(async () => {
+      const company = state.company;
+      try {
+        const res = await fetch("/api/reprocess", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ company, ...getEmployeeDetails() }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.detail || "Reprocess trigger failed");
+        setStatus(`Auto-triggered a reprocess for ${company} after your link(s).`);
+        if (!watcher) startWatching(data.run_id || null, state.order_count);
+      } catch (e) {
+        setStatus("Auto-reprocess after linking failed (link is still saved — use Reprocess Buffer manually): " + e.message, true);
+      }
+    }, AUTO_REPROCESS_DEBOUNCE_MS);
   }
 
   // ── Auto-resolve high-confidence suggestions ─────────────────────────────
