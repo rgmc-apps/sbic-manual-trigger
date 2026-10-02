@@ -774,7 +774,9 @@ def api_sync_inserted_orders():
 @app.route("/api/backfill-from-cloudsql", methods=["POST"])
 def api_backfill_from_cloudsql():
     """Create missing BC sales orders (header + lines) from Cloud SQL CustomerPOUL/
-    CustomerPOULDetail for a given createBy (default 'trigger') and poDate range.
+    CustomerPOULDetail for a given createBy (default 'trigger') and createDate range
+    (when the row was inserted into CustomerPOUL, not poDate, the original PO date
+    from the source ERP).
 
     Opposite skip condition from /api/sync-inserted-orders: a PO whose
     externalDocumentNo already matches an existing BC sales order is skipped

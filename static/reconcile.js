@@ -266,6 +266,110 @@
     return JSON.stringify(resolved);
   }
 
+  // ── Suggestion fetch + link-apply (shared by the manual "Suggest" button and
+  // the auto-resolve pass below) ───────────────────────────────────────────
+  // BC fuzzy match via rgmc-gcp-api — sku/branch only, "customer" has no suggest
+  // endpoint (a customer is always inferred via its branch's link instead).
+  async function fetchSuggestionCandidates(type, group) {
+    const poRef = group.po_refs[0];
+    const path = type === "sku" ? `/api/suggest/item/${encodeURIComponent(poRef)}`
+                                 : `/api/suggest/shipto/${encodeURIComponent(poRef)}`;
+    const res = await fetch(`${path}?company=${encodeURIComponent(state.company)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
+
+    let raw = [];
+    if (type === "sku") {
+      const line = (data.lines || []).find((l) => (l.customerSKUCode || "").toUpperCase() === group.key.toUpperCase());
+      raw = line ? line.fuzzyMatches : (data.lines[0] || {}).fuzzyMatches || [];
+    } else {
+      raw = data.fuzzyMatches || [];
+    }
+    return normalizeCandidates(type, raw);
+  }
+
+  // Saves `candidate` as the resolved link for `group` and mutates `group` in place
+  // (resolved/resolved_by/resolved_at/override_id) — no DOM access, so this is usable
+  // both from a row's own "pick a candidate" handler and from a background pass with
+  // no row rendered yet. A ship-to address belongs to a specific BC customer —
+  // selecting one tells us that customer too, so the matching "customer" group is
+  // auto-linked alongside it instead of making the user resolve the same information
+  // twice. Returns { customerLinkError } rather than throwing on that secondary save,
+  // since the branch link itself still succeeded.
+  async function applyLinkToGroup(type, group, candidate, resolvedBy) {
+    const resolved = resolvedPayload(type, candidate);
+    const data = await saveOverride(type, group.key, resolved, resolvedBy, group.buffer_ids);
+    applyResolvedFields(group, resolved, data);
+
+    let customerLinkError = null;
+    if (type === "branch" && group.customer_name && candidate.extra) {
+      const custResolved = { customerNo: candidate.extra, displayName: candidate.customerName || candidate.extra };
+      try {
+        const custGroup = findGroup("customer", group.customer_name);
+        const custData = await saveOverride(
+          "customer", group.customer_name, custResolved, resolvedBy, custGroup ? custGroup.buffer_ids : []
+        );
+        if (custGroup) applyResolvedFields(custGroup, custResolved, custData);
+      } catch (e) {
+        customerLinkError = e.message;
+      }
+    }
+    return { customerLinkError };
+  }
+
+  // ── Auto-resolve high-confidence suggestions ─────────────────────────────
+  // fuzzy_match.py scores a containment match (one string fully inside the other)
+  // at 0.9 — a fuzzy match at or above that is overwhelmingly a real match, not a
+  // coincidence, so it's linked automatically instead of waiting for someone to
+  // click "Suggest" on every near-identical spelling variant. This only ever SAVES
+  // a link — it never removes a group from the list, so every auto-resolved group
+  // still shows up exactly like a manually-resolved one (Unlink / Mark Inactive both
+  // still work on it) for review or correction.
+  const AUTO_RESOLVE_THRESHOLD = 0.9;
+
+  async function autoResolveHighConfidence() {
+    if (!state) return;
+    const resolvedBy = getEmployeeDetails().employee_name;
+    const pending = [];
+    ["sku", "branch"].forEach((type) => {
+      state.groups[type].forEach((group) => {
+        if (!group.resolved) pending.push({ type, group });
+      });
+    });
+    if (!pending.length) return;
+
+    let autoCount = 0;
+    // Sequential, not parallel — each lookup re-fetches a full BC catalog (every
+    // item, or every ship-to address) server-side, so firing all of them at once
+    // would hit BC with one heavy request per unresolved group simultaneously.
+    for (const { type, group } of pending) {
+      if (group.resolved) continue; // a branch's cascaded customer link may have resolved this one already
+      let ranked;
+      try {
+        ranked = await fetchSuggestionCandidates(type, group);
+      } catch (e) {
+        continue; // best-effort — leave it for the manual "Suggest" button instead
+      }
+      const top = ranked[0];
+      if (!top || typeof top.score !== "number" || top.score < AUTO_RESOLVE_THRESHOLD) continue;
+      try {
+        await applyLinkToGroup(type, group, top, `${resolvedBy} (auto ${Math.round(top.score * 100)}% match)`);
+        autoCount++;
+      } catch (e) {
+        // best-effort — leave unresolved for manual reconciliation
+      }
+    }
+
+    if (autoCount) {
+      renderAll();
+      setStatus(
+        `Loaded ${state.order_count} buffered order(s) for ${state.company}. ` +
+        `Auto-resolved ${autoCount} high-confidence match(es) (≥90%) — ` +
+        `review under each tab; Unlink or Mark Inactive if one's wrong.`
+      );
+    }
+  }
+
   // ── Candidate list rendering ─────────────────────────────────────────────
   function renderCandidateList(container, type, candidates, onPick) {
     container.innerHTML = "";
@@ -460,37 +564,19 @@
     });
 
     async function saveLink(candidate) {
-      const resolved = resolvedPayload(type, candidate);
       linkPanel.classList.add("is-saving");
       try {
         const resolvedBy = getEmployeeDetails().employee_name;
-        const data = await saveOverride(type, group.key, resolved, resolvedBy, group.buffer_ids);
-        applyResolvedFields(group, resolved, data);
+        const { customerLinkError } = await applyLinkToGroup(type, group, candidate, resolvedBy);
         applyResolvedState(group);
         resolvedBox.classList.add("pop-in");
         resolvedBox.addEventListener("animationend", () => resolvedBox.classList.remove("pop-in"), { once: true });
         linkPanel.classList.remove("is-open");
-
-        // A ship-to address belongs to a specific BC customer — selecting one tells
-        // us that customer too, so auto-apply it instead of making the user search
-        // the Customers tab separately for the same information.
-        if (type === "branch" && group.customer_name && candidate.extra) {
-          const custResolved = { customerNo: candidate.extra, displayName: candidate.customerName || candidate.extra };
-          try {
-            const custGroup = findGroup("customer", group.customer_name);
-            const custData = await saveOverride(
-              "customer", group.customer_name, custResolved, resolvedBy, custGroup ? custGroup.buffer_ids : []
-            );
-            if (custGroup) {
-              applyResolvedFields(custGroup, custResolved, custData);
-              renderGroupsPanel("customer");
-            }
-          } catch (e) {
-            setStatus("Branch linked, but auto-linking the customer failed: " + e.message, true);
-          }
+        if (customerLinkError) {
+          setStatus("Branch linked, but auto-linking the customer failed: " + customerLinkError, true);
         }
 
-        refreshOtherGroupPanels(type); // other groups' blocked-notes may change now that this one resolved
+        refreshOtherGroupPanels(type); // other groups' blocked-notes may change now that this one resolved (also covers the auto-linked customer group, if any)
         renderOrdersPanel(); // readiness may have changed
         renderSummary();
       } catch (e) {
@@ -512,22 +598,9 @@
         suggestStatus.innerHTML = `<span class="btn-spinner"></span> Looking up BC…`;
         suggestResults.innerHTML = "";
         try {
-          const poRef = group.po_refs[0];
-          const path = type === "sku" ? `/api/suggest/item/${encodeURIComponent(poRef)}`
-                                       : `/api/suggest/shipto/${encodeURIComponent(poRef)}`;
-          const res = await fetch(`${path}?company=${encodeURIComponent(state.company)}`);
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
-
-          let raw = [];
-          if (type === "sku") {
-            const line = (data.lines || []).find((l) => (l.customerSKUCode || "").toUpperCase() === group.key.toUpperCase());
-            raw = line ? line.fuzzyMatches : (data.lines[0] || {}).fuzzyMatches || [];
-          } else {
-            raw = data.fuzzyMatches || [];
-          }
-          suggestStatus.textContent = raw.length ? `${raw.length} suggestion(s)` : "No suggestions found.";
-          renderCandidateList(suggestResults, type, normalizeCandidates(type, raw), saveLink);
+          const candidates = await fetchSuggestionCandidates(type, group);
+          suggestStatus.textContent = candidates.length ? `${candidates.length} suggestion(s)` : "No suggestions found.";
+          renderCandidateList(suggestResults, type, candidates, saveLink);
         } catch (e) {
           suggestStatus.textContent = "";
           setStatus("Suggestion lookup failed: " + e.message, true);
@@ -881,6 +954,11 @@
           })
           .catch(() => { /* best-effort — page already works with what it has */ });
       }
+
+      // Background pass — auto-links any SKU/branch group whose top BC fuzzy match is
+      // ≥90% confident, so near-identical spelling variants don't need a manual
+      // "Suggest" click. Not awaited, same as the lines-recovery pass above.
+      autoResolveHighConfidence();
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {
