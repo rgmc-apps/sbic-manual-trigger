@@ -929,8 +929,20 @@
 
   function summarizeRun(summary) {
     if (!summary) return "";
-    const parts = [`${summary.orders_created || 0} order(s) created`];
-    if (summary.orders_failed) parts.push(`${summary.orders_failed} still failed`);
+    // Reprocess-buffer/Backfill report "orders_created"/"orders_failed"; Sync reports
+    // "orders_synced"/"orders_not_found"/"orders_errored" instead — reading the wrong
+    // shape silently showed "0 order(s) created" for every Sync run. Render whichever
+    // shape this summary actually has.
+    const parts = [];
+    if ("orders_synced" in summary || "orders_not_found" in summary || "orders_errored" in summary) {
+      parts.push(`${summary.orders_synced || 0} order(s) checked`);
+      if (summary.orders_not_found) parts.push(`${summary.orders_not_found} not found in BC`);
+      if (summary.orders_errored) parts.push(`${summary.orders_errored} errored (not necessarily missing — retry)`);
+    } else {
+      parts.push(`${summary.orders_created || 0} order(s) created`);
+      if (summary.orders_failed) parts.push(`${summary.orders_failed} still failed`);
+      if (summary.orders_skipped_existing) parts.push(`${summary.orders_skipped_existing} skipped (already in BC)`);
+    }
     parts.push(`${summary.lines_created || 0} line(s) created`);
     if (summary.lines_skipped) parts.push(`${summary.lines_skipped} line(s) skipped`);
     if (summary.unmatched_items) parts.push(`${summary.unmatched_items} item(s) with no BC match`);
