@@ -588,6 +588,20 @@
 .link-chip.ok { background: var(--success-bg); color: var(--success); border-color: var(--success-border); }
 .link-chip.pending { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
 
+/* ── Buffer-reconciliation history tab ── */
+.order-badge.failed { background: var(--error-bg); color: var(--error); border: 1px solid var(--error-border); }
+.history-list { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+.history-meta { margin-top: 6px; font-size: .76rem; color: var(--text-muted); }
+.history-row .btn-history-toggle { margin-top: 10px; display: inline-block; }
+.history-details { margin-top: 10px; }
+.history-lines-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.history-lines-table th, .history-lines-table td {
+  text-align: left;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.history-lines-table th { color: var(--text-muted); font-weight: 600; }
+
 @media (max-width: 640px) {
   .summary-row { grid-template-columns: repeat(2, 1fr); }
   .toolbar { flex-direction: column; align-items: stretch; }

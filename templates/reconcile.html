@@ -79,6 +79,7 @@
         <div class="action-tabs">
           <button class="action-tab-btn active" data-action-tab="buffer" type="button">Buffer</button>
           <button class="action-tab-btn" data-action-tab="cloudsql" type="button">Cloud SQL</button>
+          <button class="action-tab-btn" data-action-tab="history" type="button">History</button>
         </div>
 
         <div class="action-tab-panel" id="action-panel-buffer">
@@ -144,6 +145,46 @@
           <p class="details-hint sync-hint">
             "Backfill from Cloud SQL" creates BC sales orders (header + lines) straight from SBIC's SQL Server (CustomerPOUL where createBy='trigger', joined to CustomerPOULDetail) for POs never inserted into BC at all — the opposite of Sync from Cloud SQL above. A PO whose external document number already exists in BC is skipped untouched. From/To are optional and filter by the PO's own date; leave both blank to consider every createBy='trigger' row. Anything that can't be fully resolved is buffered below for reconciliation, same as every other import path.
           </p>
+        </div>
+
+        <div class="action-tab-panel hidden" id="action-panel-history">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="history-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="history-company-select">
+                  <option value="">— All companies —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="history-outcome-select">Outcome</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="history-outcome-select">
+                  <option value="">— All outcomes —</option>
+                  <option value="resolved">Resolved</option>
+                  <option value="still_buffered">Still buffered</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="history-po-ref-input">PO Ref</label>
+              <input class="form-input" type="text" id="history-po-ref-input" placeholder="Exact PO ref (optional)" />
+            </div>
+            <button class="btn-reprocess" id="history-load-btn" type="button">
+              <span class="btn-spinner hidden" id="history-load-spinner"></span>
+              <span id="history-load-btn-label">Load History</span>
+            </button>
+          </div>
+          <p class="details-hint sync-hint">
+            Every PO a <strong>Reprocess Buffer</strong> run has touched — its header/lines at that attempt, the outcome, and who triggered it. A PO can appear more than once if it was reprocessed more than once; most recent first.
+          </p>
+          <p class="status-line" id="history-status-line"></p>
+          <div class="history-list" id="history-list"></div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->

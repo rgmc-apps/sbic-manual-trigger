@@ -690,6 +690,26 @@ def api_reference():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/history")
+def api_history():
+    """Buffer-reconciliation history — every PO a manual reprocess-buffer run touched,
+    with its header/lines snapshot at that attempt, the outcome, and who triggered it.
+
+    All filters are optional; omit everything to list the whole log (most recent first).
+    """
+    params = {}
+    for key in ("company", "po_ref", "outcome", "run_id"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/history", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 def _employee_notify_params(data: dict):
     """Validate the 4 required employee fields and return them as rgmc-gcp-api's
     notify_* query params, or (None, error_response) if any are missing."""
