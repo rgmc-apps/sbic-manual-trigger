@@ -442,12 +442,15 @@ def _multi_field_contains_search(path: str, company: str, search: str, fields: l
     already searches name/code/lookupCode together; this generalizes that pattern so a
     search matches ANY of `fields` containing the term, not just the first one checked.
     """
-    esc = search.replace("'", "''")
+    # tolower() on both sides — Business Central's OData contains() is case-sensitive,
+    # so an otherwise-matching substring (e.g. typing "mcd" against a customer name
+    # stored as "MCDONALD'S") would silently return zero results without this.
+    esc = search.replace("'", "''").lower()
     errors: list = []
 
     def _one(field: str) -> list:
         try:
-            resp = _bc_api("GET", path, params={"company": company, "filter": f"contains({field},'{esc}')"})
+            resp = _bc_api("GET", path, params={"company": company, "filter": f"contains(tolower({field}),'{esc}')"})
             body, status_code = _proxy_json(resp)
             if status_code == 200:
                 return body.get("data", [])
