@@ -69,12 +69,12 @@ def _html_table(rows: list[tuple]) -> str:
     return f"<table style='border-collapse:collapse;font-family:sans-serif'>{cells}</table>"
 
 
-def send_email(subject: str, html_body: str) -> bool:
+def send_email(subject: str, html_body: str, to_addr: str | None = None) -> bool:
     if not EMAIL_CONFIG["smtp_user"] or not EMAIL_CONFIG["smtp_password"]:
         app.logger.warning("Email credentials not set — skipping send")
         return False
 
-    to_addr = EMAIL_CONFIG["notification_email"]
+    to_addr = to_addr or EMAIL_CONFIG["notification_email"]
     from_addr = EMAIL_CONFIG["sender_email"] or EMAIL_CONFIG["smtp_user"]
 
     msg = MIMEMultipart("alternative")
@@ -599,6 +599,22 @@ def api_lookup_ship_to():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/overrides", methods=["GET"])
+def api_list_overrides():
+    """List every saved SKU/branch/customer link — the Overrides tab's full registry,
+    independent of any one company's currently-loaded buffer."""
+    params = {}
+    override_type = (request.args.get("type") or "").strip()
+    if override_type:
+        params["type"] = override_type
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/overrides", methods=["POST"])
 def api_save_override():
     """Save the user's chosen BC link for one SKU code / branch name / customer name."""
@@ -711,6 +727,167 @@ def api_history():
         return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+# Sales Orders eligible for the Overrides tab's "Find previous orders"/"Update these
+# orders" actions are restricted to this exact value — this app's own automated
+# SO-import pipeline stamps every order it creates with submittedBy="SBIC AI Uploading"
+# (rgmc-worker-pool's so_import_worker.py, _SUBMITTED_BY). Hardcoded as a server-side
+# OData filter condition, not a UI toggle, so a human-created BC order that happens to
+# share the same (wrong) customer number can never be matched or touched by this feature.
+_SBIC_AI_SUBMITTED_BY = "SBIC AI Uploading"
+
+
+def _find_orders_by_customer(company: str, customer_no: str) -> list:
+    """Sales Orders under `customer_no`, restricted to submittedBy == _SBIC_AI_SUBMITTED_BY.
+
+    Queries the RGMC custom v2 Sales Order API (the same entity set rgmc-worker-pool
+    creates SO-import orders against) rather than the older /bc/sales-orders — that's
+    the one confirmed to actually carry the submittedBy field.
+    """
+    safe_customer = customer_no.replace("'", "''")
+    odata_filter = f"sellToCustomerNo eq '{safe_customer}' and submittedBy eq '{_SBIC_AI_SUBMITTED_BY}'"
+    resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={"company": company, "filter": odata_filter})
+    body, status_code = _proxy_json(resp)
+    if status_code != 200:
+        raise RuntimeError(body.get("detail") or body.get("error") or f"BC returned {status_code}")
+    return body.get("data") or []
+
+
+@app.route("/api/sales-orders")
+def api_sales_orders():
+    """Look up existing BC Sales Orders by customer number — used by the Overrides
+    tab's "Find previous orders" action to surface orders already created under a
+    branch/customer link's OLD value, for manual review/correction in BC. Read-only:
+    nothing here ever changes an existing Sales Order. Restricted to
+    submittedBy == "SBIC AI Uploading" — see _find_orders_by_customer."""
+    company = (request.args.get("company") or "").strip()
+    customer_no = (request.args.get("customer_no") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    if not customer_no:
+        return jsonify({"error": "customer_no is required"}), 400
+    try:
+        orders = _find_orders_by_customer(company, customer_no)
+        return jsonify({"data": orders, "total": len(orders)})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+def _sales_order_correction_email_body(company: str, old_customer_no: str, new_resolved: dict,
+                                        results: list, requested_by: str) -> str:
+    new_customer_desc = new_resolved.get("customerNo", "—")
+    if new_resolved.get("shipToCode"):
+        new_customer_desc += f" (ship-to {new_resolved['shipToCode']})"
+    rows = [
+        (r["number"] or "—", ("✅ Updated" if r["ok"] else f"❌ Failed — {r['detail']}"))
+        for r in results
+    ]
+    table = _html_table(rows) if rows else "<p>No matching Sales Orders were found.</p>"
+    ok_count = sum(1 for r in results if r["ok"])
+    return f"""
+    <html><body style='font-family:sans-serif;color:#1a1a2e'>
+      <h2 style='color:#16213e'>🔁 Sales Order Customer Correction</h2>
+      {_html_table([
+          ("Company", company),
+          ("Old customer", old_customer_no),
+          ("New customer", new_customer_desc),
+          ("Requested by", requested_by or "—"),
+          ("Result", f"{ok_count} of {len(results)} order(s) updated"),
+      ])}
+      <h3 style='color:#16213e;margin-top:20px'>Per-order result</h3>
+      {table}
+      <p style='color:#888;font-size:12px;margin-top:24px'>
+        Only the header (Sell-to Customer No. / Ship-to Code) was changed — line pricing and
+        discounts were NOT recalculated and may still reflect the old customer. Review pricing
+        on updated orders directly in Business Central. A Sales Order already Released is
+        reported as a failure above; reopen it in BC before retrying.
+      </p>
+      <p style='color:#888;font-size:12px'>SBIC Buffer Reconciliation</p>
+    </body></html>
+    """
+
+
+@app.route("/api/sales-orders/update-customer", methods=["POST"])
+def api_update_sales_orders_customer():
+    """Correct a user-picked subset of already-created BC Sales Orders still under a
+    branch/customer override's OLD value — PATCHes only each selected order's header
+    (Sell-to Customer No. / Ship-to Code), never line pricing/discounts (BC's own
+    "update prices?" confirmation can't be answered over a headless API call, so
+    existing line pricing is left as-is and flagged for manual review in the result
+    email instead).
+
+    Re-queries Business Central fresh server-side via _find_orders_by_customer rather
+    than trusting the client-supplied order list for anything but WHICH of those
+    results to act on — so the submittedBy=="SBIC AI Uploading" safety filter is always
+    authoritative (an id that didn't come back from that fresh query is silently
+    dropped, never PATCHed) even though the browser's confirmation modal is what
+    actually picks the subset via its per-row checkboxes.
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip()
+    old_customer_no = (data.get("old_customer_no") or "").strip()
+    new_resolved = data.get("new_resolved") or {}
+    new_customer_no = (new_resolved.get("customerNo") or "").strip()
+    requested_by_email = (data.get("requested_by_email") or "").strip()
+    requested_by_name = (data.get("requested_by_name") or "").strip()
+    selected_ids = [s for s in (data.get("selected_ids") or []) if s]
+
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    if not old_customer_no:
+        return jsonify({"error": "old_customer_no is required"}), 400
+    if not new_customer_no:
+        return jsonify({"error": "new_resolved.customerNo is required"}), 400
+    if not selected_ids:
+        return jsonify({"error": "selected_ids is required — select at least one order to update"}), 400
+
+    try:
+        orders = _find_orders_by_customer(company, old_customer_no)
+    except (requests.RequestException, RuntimeError) as exc:
+        return jsonify({"error": f"Could not search Business Central: {exc}"}), 502
+
+    selected_id_set = set(selected_ids)
+    orders = [o for o in orders if o.get("id") in selected_id_set]
+    if not orders:
+        return jsonify({
+            "error": "None of the selected orders matched Business Central on re-check "
+                     "(they may have changed since the lookup ran) — try the lookup again."
+        }), 409
+
+    patch_body = {"sellToCustomerNo": new_customer_no}
+    if new_resolved.get("shipToCode"):
+        patch_body["shipToCode"] = new_resolved["shipToCode"]
+
+    results = []
+    for order in orders:
+        order_id = order.get("id")
+        number = order.get("number") or order.get("externalDocumentNo") or order_id
+        try:
+            resp = _bc_api(
+                "PATCH", f"/bc/custom/v2/sales-orders/{order_id}",
+                params={"company": company}, json=patch_body,
+            )
+            body, status_code = _proxy_json(resp)
+            if status_code in (200, 201):
+                results.append({"ok": True, "number": number, "detail": "Updated"})
+            else:
+                detail = body.get("detail") or body.get("error") or f"BC returned {status_code}"
+                results.append({"ok": False, "number": number, "detail": str(detail)[:300]})
+        except requests.RequestException as exc:
+            results.append({"ok": False, "number": number, "detail": f"Request failed: {exc}"})
+
+    if requested_by_email:
+        updated = sum(1 for r in results if r["ok"])
+        subject = f"Sales Order customer correction — {company} ({updated}/{len(results)} updated)"
+        html_body = _sales_order_correction_email_body(
+            company, old_customer_no, new_resolved, results, requested_by_name or requested_by_email
+        )
+        send_email(subject, html_body, to_addr=requested_by_email)
+
+    return jsonify({"data": results, "total": len(results), "updated": sum(1 for r in results if r["ok"])})
 
 
 def _employee_notify_params(data: dict):

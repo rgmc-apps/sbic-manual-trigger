@@ -9,6 +9,20 @@
   const historyLoadBtn       = document.getElementById("history-load-btn");
   const historyStatusLine    = document.getElementById("history-status-line");
   const historyListEl        = document.getElementById("history-list");
+  const overridesTypeSelect    = document.getElementById("overrides-type-select");
+  const overridesKeyInput      = document.getElementById("overrides-key-input");
+  const overridesCompanySelect = document.getElementById("overrides-company-select");
+  const overridesLoadBtn       = document.getElementById("overrides-load-btn");
+  const overridesStatusLine    = document.getElementById("overrides-status-line");
+  const overridesListEl        = document.getElementById("overrides-list");
+  const overrideRowTemplate    = document.getElementById("override-row-template");
+  const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
+  const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
+  const soUpdateModalTbody     = document.getElementById("so-update-modal-tbody");
+  const soUpdateSelectAll      = document.getElementById("so-update-select-all");
+  const soUpdateModalClose     = document.getElementById("so-update-modal-close");
+  const soUpdateModalCancel    = document.getElementById("so-update-modal-cancel");
+  const soUpdateModalConfirm   = document.getElementById("so-update-modal-confirm");
   const loadBtn       = document.getElementById("load-btn");
   const reprocessBtn  = document.getElementById("reprocess-btn");
   const syncBtn       = document.getElementById("sync-btn");
@@ -320,90 +334,22 @@
         customerLinkError = e.message;
       }
     }
-    scheduleAutoReprocess();
     return { customerLinkError };
   }
 
-  // ── Auto-reprocess after a link is saved ─────────────────────────────────
-  // Saving an override only ever updates Firestore (so_buffer_overrides_{env} plus a
-  // denormalized patch onto the affected buffer doc(s)) — nothing reaches BC until a
-  // reprocess-buffer run actually picks it up, same as clicking "Reprocess Buffer"
-  // above. Firing that automatically means a linked item/branch/customer gets
-  // inserted right away instead of waiting on a human to separately trigger it, and
-  // (per _resolve_valid_lines/_create_order) each line resolves independently, so an
-  // order with some items still unlinked still gets everything that IS linked
-  // inserted now rather than waiting for every sibling item on the same PO too.
-  //
-  // Debounced rather than fired per save: a burst of saves (auto-resolve linking
-  // several groups in one pass, or a human clicking through several candidates
-  // quickly) collapses into one trigger instead of queueing one company-wide run per
-  // save — the worker pool processes one Pub/Sub message at a time, so a dozen
-  // queued runs would just make every one of them land later, not faster.
-  const AUTO_REPROCESS_DEBOUNCE_MS = 3000;
-  // rgmc-gcp-api's rate_limit allows only one call per route per 30s (shared with the
-  // manual "Reprocess Buffer" button and every other trigger hitting this same
-  // endpoint) and answers 429 with "Endpoint called too recently. Retry after N
-  // seconds." — fallen back to if that wording ever changes or the response body
-  // doesn't parse. The Flask proxy only forwards the JSON body, not the Retry-After
-  // header, so the message text is the only signal available for N.
-  const AUTO_REPROCESS_DEFAULT_RETRY_MS = 30000;
-  const AUTO_REPROCESS_MAX_RETRIES = 3;
-  let autoReprocessTimer = null;
+  // ── Highlight high-confidence suggestions ─────────────────────────────────
+  // fuzzy_match.py scores a containment match (one string fully inside the other) at
+  // 0.9 — a fuzzy match at or above that is overwhelmingly a real match, not a
+  // coincidence. This used to be auto-linked (and the link auto-triggered a
+  // reprocess-buffer run) without any human in the loop; both of those were removed
+  // because users found links appearing — and reprocess runs firing — with no action
+  // of their own confusing. Now this only flags the group (group.highConfidenceMatch)
+  // so buildGroupRow can badge it; a human still has to click "Link…" to apply it,
+  // and still has to click "Reprocess Buffer" to send it to BC.
+  const HIGH_CONFIDENCE_THRESHOLD = 0.9;
 
-  function scheduleAutoReprocess() {
-    if (!state || !employeeDetailsValid()) return; // no company loaded, or no one to notify
-    clearTimeout(autoReprocessTimer);
-    autoReprocessTimer = setTimeout(() => attemptAutoReprocess(state.company, 0), AUTO_REPROCESS_DEBOUNCE_MS);
-  }
-
-  function _parseRetryAfterMs(message) {
-    const m = /retry after (\d+)\s*seconds?/i.exec(message || "");
-    return m ? (parseInt(m[1], 10) + 1) * 1000 : AUTO_REPROCESS_DEFAULT_RETRY_MS;
-  }
-
-  async function attemptAutoReprocess(company, retryCount) {
-    try {
-      const res = await fetch("/api/reprocess", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ company, ...getEmployeeDetails() }),
-      });
-      const data = await res.json();
-      if (res.status === 429) {
-        if (retryCount >= AUTO_REPROCESS_MAX_RETRIES) {
-          setStatus(
-            `Auto-reprocess for ${company} is still rate-limited after ${AUTO_REPROCESS_MAX_RETRIES} ` +
-            `tries — your link is saved; use Reprocess Buffer manually once it clears.`,
-            true
-          );
-          return;
-        }
-        const waitMs = _parseRetryAfterMs(data.error || data.detail);
-        setStatus(`Reprocess endpoint is rate-limited — retrying for ${company} in ${Math.round(waitMs / 1000)}s…`);
-        setTimeout(() => attemptAutoReprocess(company, retryCount + 1), waitMs);
-        return;
-      }
-      if (!res.ok) throw new Error(data.error || data.detail || "Reprocess trigger failed");
-      setStatus(`Auto-triggered a reprocess for ${company} after your link(s).`);
-      if (!watcher) startWatching(data.run_id || null, state.order_count);
-    } catch (e) {
-      setStatus("Auto-reprocess after linking failed (link is still saved — use Reprocess Buffer manually): " + e.message, true);
-    }
-  }
-
-  // ── Auto-resolve high-confidence suggestions ─────────────────────────────
-  // fuzzy_match.py scores a containment match (one string fully inside the other)
-  // at 0.9 — a fuzzy match at or above that is overwhelmingly a real match, not a
-  // coincidence, so it's linked automatically instead of waiting for someone to
-  // click "Suggest" on every near-identical spelling variant. This only ever SAVES
-  // a link — it never removes a group from the list, so every auto-resolved group
-  // still shows up exactly like a manually-resolved one (Unlink / Mark Inactive both
-  // still work on it) for review or correction.
-  const AUTO_RESOLVE_THRESHOLD = 0.9;
-
-  async function autoResolveHighConfidence() {
+  async function highlightHighConfidenceMatches() {
     if (!state) return;
-    const resolvedBy = getEmployeeDetails().employee_name;
     const pending = [];
     ["sku", "branch"].forEach((type) => {
       state.groups[type].forEach((group) => {
@@ -412,12 +358,12 @@
     });
     if (!pending.length) return;
 
-    let autoCount = 0;
+    let flaggedCount = 0;
     // Sequential, not parallel — each lookup re-fetches a full BC catalog (every
     // item, or every ship-to address) server-side, so firing all of them at once
     // would hit BC with one heavy request per unresolved group simultaneously.
     for (const { type, group } of pending) {
-      if (group.resolved) continue; // a branch's cascaded customer link may have resolved this one already
+      if (group.resolved) continue;
       let ranked;
       try {
         ranked = await fetchSuggestionCandidates(type, group);
@@ -425,21 +371,18 @@
         continue; // best-effort — leave it for the manual "Suggest" button instead
       }
       const top = ranked[0];
-      if (!top || typeof top.score !== "number" || top.score < AUTO_RESOLVE_THRESHOLD) continue;
-      try {
-        await applyLinkToGroup(type, group, top, `${resolvedBy} (auto ${Math.round(top.score * 100)}% match)`);
-        autoCount++;
-      } catch (e) {
-        // best-effort — leave unresolved for manual reconciliation
-      }
+      if (!top || typeof top.score !== "number" || top.score < HIGH_CONFIDENCE_THRESHOLD) continue;
+      group.highConfidenceMatch = top;
+      flaggedCount++;
     }
 
-    if (autoCount) {
-      renderAll();
+    if (flaggedCount) {
+      renderGroupsPanel("sku");
+      renderGroupsPanel("branch");
       setStatus(
         `Loaded ${state.order_count} buffered order(s) for ${state.company}. ` +
-        `Auto-resolved ${autoCount} high-confidence match(es) (≥90%) — ` +
-        `review under each tab; Unlink or Mark Inactive if one's wrong.`
+        `${flaggedCount} group(s) have a high-confidence match (≥90%, highlighted below) — ` +
+        `link them yourself, then trigger Reprocess Buffer when you're ready.`
       );
     }
   }
@@ -610,9 +553,12 @@
     }
 
     const blockedNote = row.querySelector(".group-blocked-note");
+    const confidenceBadge = row.querySelector(".group-confidence-badge");
 
     function applyResolvedState(g) {
       if (g.resolved) {
+        row.classList.remove("has-high-confidence-match");
+        confidenceBadge.classList.add("hidden");
         row.classList.add("is-resolved");
         resolvedBox.classList.remove("hidden");
         resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(g.resolved);
@@ -632,6 +578,15 @@
         resolvedBox.classList.add("hidden");
         blockedNote.classList.add("hidden");
         toggleBtn.textContent = "Link…";
+
+        if (g.highConfidenceMatch) {
+          row.classList.add("has-high-confidence-match");
+          confidenceBadge.textContent = `✓ ${Math.round(g.highConfidenceMatch.score * 100)}% match found — link it, then Reprocess Buffer`;
+          confidenceBadge.classList.remove("hidden");
+        } else {
+          row.classList.remove("has-high-confidence-match");
+          confidenceBadge.classList.add("hidden");
+        }
       }
     }
     applyResolvedState(group);
@@ -794,8 +749,8 @@
       escapeHtml(
         `Each row is one raw SKU code (or description, if the code is blank) shared by one or more buffered POs. ` +
         `To resolve it: click "Show suggested matches" for BC's best fuzzy-matched items, ranked by confidence — ` +
-        `picking one links it instantly. Matches of 90% confidence or higher are already auto-linked for you when ` +
-        `the buffer loads, so most rows here either need a lower-confidence pick or don't have a good match yet. ` +
+        `picking one links it instantly. Rows badged "match found" have a 90%+ confidence match already — click ` +
+        `"Link…" to apply it, since nothing is linked automatically. ` +
         `If none of the suggestions are right, type in the search box below them to find the exact BC item instead. ` +
         `If this SKU is discontinued or should never be ordered, use "Mark Inactive" to exclude it from ` +
         `reconciliation entirely — that's different from linking it, so it won't count toward any PO's readiness.`
@@ -1073,10 +1028,11 @@
           .catch(() => { /* best-effort — page already works with what it has */ });
       }
 
-      // Background pass — auto-links any SKU/branch group whose top BC fuzzy match is
-      // ≥90% confident, so near-identical spelling variants don't need a manual
-      // "Suggest" click. Not awaited, same as the lines-recovery pass above.
-      autoResolveHighConfidence();
+      // Background pass — flags any SKU/branch group whose top BC fuzzy match is ≥90%
+      // confident, so a human can spot near-identical spelling variants at a glance
+      // instead of clicking "Suggest" on every row. Not awaited, same as the
+      // lines-recovery pass above.
+      highlightHighConfidenceMatches();
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {
@@ -1476,5 +1432,351 @@
   historyLoadBtn.addEventListener("click", loadHistory);
   historyPoRefInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") loadHistory();
+  });
+
+  // ── Overrides tab (full link registry, independent of any one loaded buffer) ────
+  // Lists every so_buffer_overrides_{env} doc regardless of whether its key still has
+  // anything buffered — the Buffer tab above only shows a link next to a group that's
+  // currently unresolved, so a key that's since been fully reprocessed (no buffer docs
+  // left referencing it) would otherwise be invisible. Editing here is the same upsert
+  // POST /api/overrides every group row already uses (same (type,key) → overwrite).
+  //
+  // "Find previous orders" is read-only: it searches BC directly (GET /bc/sales-orders
+  // ?customer_no=) for Sales Orders already created under a given customer — it never
+  // changes an existing order. There's no code path anywhere in this system that edits
+  // Sell-to Customer No. on an already-created order; that's deliberately left to a
+  // human doing it in BC itself, since BC's own behavior once a header has lines isn't
+  // something this page has ever exercised.
+  const OVERRIDE_TYPE_LABEL = { sku: "SKU", branch: "Branch", customer: "Customer" };
+
+  function setOverridesStatus(msg, isError) {
+    overridesStatusLine.textContent = msg || "";
+    overridesStatusLine.classList.toggle("error", !!isError);
+  }
+
+  // Restricted server-side to submittedBy=="SBIC AI Uploading" (rgmc-worker-pool's own
+  // automated SO-import orders) — see _find_orders_by_customer in app.py. A human-created
+  // BC order sharing the same (wrong) customer number is never matched or touched.
+  async function findPreviousOrders(customerNo, statusEl, resultsEl, ov) {
+    const company = overridesCompanySelect.value;
+    resultsEl.classList.add("hidden");
+    resultsEl.innerHTML = "";
+    if (!company) {
+      statusEl.textContent = "Select a company above first, then try again.";
+      statusEl.classList.add("error");
+      statusEl.classList.remove("hidden");
+      return;
+    }
+    statusEl.textContent = `Searching ${company} for Sales Orders under customer ${customerNo} (submittedBy = "SBIC AI Uploading" only)…`;
+    statusEl.classList.remove("hidden", "error");
+    try {
+      const res = await fetch(`/api/sales-orders?company=${encodeURIComponent(company)}&customer_no=${encodeURIComponent(customerNo)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Lookup failed");
+      const orders = data.data || [];
+      if (!orders.length) {
+        statusEl.textContent = `No existing Sales Orders found under customer ${customerNo} in ${company} (submittedBy = "SBIC AI Uploading").`;
+        return;
+      }
+      statusEl.textContent =
+        `${orders.length} existing Sales Order(s) in ${company} are still under customer ${customerNo} — ` +
+        `not yet changed.`;
+      const newCustomerNo = ov && ov.type !== "sku" ? (ov.resolved || {}).customerNo : null;
+      resultsEl.innerHTML = orders.map((o) => `
+        <div class="order-row">
+          <div class="order-row-head">
+            <span class="order-ref">${escapeHtml(o.number || "—")}</span>
+            <span class="order-badge pending">${escapeHtml(o.sellToCustomerNo || customerNo)}</span>
+          </div>
+          <div class="order-detail">
+            PO ref: ${escapeHtml(o.externalDocumentNo || "—")} &middot;
+            Order date: ${escapeHtml(o.orderDate || "—")}
+          </div>
+        </div>
+      `).join("");
+      if (newCustomerNo && newCustomerNo !== customerNo) {
+        const actionBox = document.createElement("div");
+        actionBox.className = "override-update-action";
+        const newLabel = ov.resolved.shipToCode ? `${newCustomerNo} (ship-to ${ov.resolved.shipToCode})` : newCustomerNo;
+        actionBox.innerHTML = `
+          <button class="btn-reprocess btn-update-orders" type="button">Review &amp; update to ${escapeHtml(newLabel)}…</button>
+          <div class="override-update-hint">Opens a confirmation listing every order below — pick which ones to update.</div>
+        `;
+        resultsEl.appendChild(actionBox);
+        actionBox.querySelector(".btn-update-orders").addEventListener("click", () => {
+          openSalesOrderUpdateModal({ orders, company, oldCustomerNo: customerNo, ov, resultsEl });
+        });
+      }
+      resultsEl.classList.remove("hidden");
+    } catch (e) {
+      statusEl.textContent = "Could not search Business Central: " + e.message;
+      statusEl.classList.add("error");
+    }
+  }
+
+  // ── Sales Order update confirmation modal ────────────────────────────────────
+  // Lets the user see exactly which orders a correction would touch — and uncheck any
+  // they don't want — before anything is PATCHed. One shared modal instance, populated
+  // fresh each time "Review & update…" is clicked on any override row.
+  let soUpdateContext = null; // { company, oldCustomerNo, ov, resultsEl }
+
+  function soUpdateCheckboxes() {
+    return [...soUpdateModalTbody.querySelectorAll(".so-update-row-check")];
+  }
+
+  function refreshSoUpdateConfirmState() {
+    const checks = soUpdateCheckboxes();
+    const checkedCount = checks.filter((c) => c.checked).length;
+    soUpdateModalConfirm.disabled = checkedCount === 0;
+    soUpdateModalConfirm.textContent = `Update Selected (${checkedCount})`;
+    soUpdateSelectAll.checked = checks.length > 0 && checkedCount === checks.length;
+    soUpdateSelectAll.indeterminate = checkedCount > 0 && checkedCount < checks.length;
+  }
+
+  function openSalesOrderUpdateModal({ orders, company, oldCustomerNo, ov, resultsEl }) {
+    soUpdateContext = { company, oldCustomerNo, ov, resultsEl };
+    const newCustomerNo = ov.resolved.customerNo;
+    const newLabel = ov.resolved.shipToCode ? `${newCustomerNo} (ship-to ${ov.resolved.shipToCode})` : newCustomerNo;
+    soUpdateModalSubtitle.textContent =
+      `${company} — ${orders.length} order(s) currently under customer ${oldCustomerNo}. ` +
+      `Orders left checked below will be changed to ${newLabel}.`;
+    soUpdateModalTbody.innerHTML = orders.map((o) => `
+      <tr>
+        <td class="modal-check-col"><input type="checkbox" class="so-update-row-check" data-order-id="${escapeHtml(o.id || "")}" checked /></td>
+        <td>${escapeHtml(o.number || "—")}</td>
+        <td>${escapeHtml(o.sellToCustomerNo || oldCustomerNo)}</td>
+        <td>${escapeHtml(o.externalDocumentNo || "—")}</td>
+        <td>${escapeHtml(o.orderDate || "—")}</td>
+      </tr>
+    `).join("");
+    refreshSoUpdateConfirmState();
+    soUpdateModalOverlay.classList.remove("hidden");
+  }
+
+  function closeSalesOrderUpdateModal() {
+    soUpdateModalOverlay.classList.add("hidden");
+    soUpdateContext = null;
+  }
+
+  soUpdateModalClose.addEventListener("click", closeSalesOrderUpdateModal);
+  soUpdateModalCancel.addEventListener("click", closeSalesOrderUpdateModal);
+  soUpdateModalOverlay.addEventListener("click", (e) => {
+    if (e.target === soUpdateModalOverlay) closeSalesOrderUpdateModal();
+  });
+  soUpdateModalTbody.addEventListener("change", (e) => {
+    if (e.target.classList.contains("so-update-row-check")) refreshSoUpdateConfirmState();
+  });
+  soUpdateSelectAll.addEventListener("change", () => {
+    soUpdateCheckboxes().forEach((c) => { c.checked = soUpdateSelectAll.checked; });
+    refreshSoUpdateConfirmState();
+  });
+
+  soUpdateModalConfirm.addEventListener("click", async () => {
+    if (!soUpdateContext) return;
+    const { company, oldCustomerNo, ov, resultsEl } = soUpdateContext;
+    if (!refreshGate() || !employeeDetailsValid()) {
+      setOverridesStatus("Fill in valid details (including email) above first — the result gets emailed there.", true);
+      return;
+    }
+    const selectedIds = soUpdateCheckboxes().filter((c) => c.checked).map((c) => c.dataset.orderId).filter(Boolean);
+    if (!selectedIds.length) return;
+
+    soUpdateModalConfirm.disabled = true;
+    const origLabel = soUpdateModalConfirm.textContent;
+    soUpdateModalConfirm.textContent = "Updating…";
+    try {
+      const employee = getEmployeeDetails();
+      const res = await fetch("/api/sales-orders/update-customer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          company,
+          old_customer_no: oldCustomerNo,
+          new_resolved: ov.resolved,
+          selected_ids: selectedIds,
+          requested_by_email: employee.email,
+          requested_by_name: employee.employee_name,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Update failed");
+      const results = data.data || [];
+      let updateResultsEl = resultsEl.querySelector(".override-update-results");
+      if (!updateResultsEl) {
+        updateResultsEl = document.createElement("div");
+        updateResultsEl.className = "override-update-results";
+        resultsEl.appendChild(updateResultsEl);
+      }
+      updateResultsEl.innerHTML = results.map((r) => `
+        <div class="update-result-row ${r.ok ? "ok" : "fail"}">
+          <span class="order-ref">${escapeHtml(r.number || "—")}</span>
+          <span>${r.ok ? "✅ Updated" : "❌ " + escapeHtml(r.detail || "Failed")}</span>
+        </div>
+      `).join("");
+      updateResultsEl.classList.remove("hidden");
+      setOverridesStatus(
+        `Updated ${data.updated}/${data.total} Sales Order(s) in ${company}. ` +
+        `An email with the full result was sent to ${employee.email}.`
+      );
+      closeSalesOrderUpdateModal();
+    } catch (e) {
+      setOverridesStatus("Could not update Sales Orders: " + e.message, true);
+    } finally {
+      soUpdateModalConfirm.disabled = false;
+      soUpdateModalConfirm.textContent = origLabel;
+    }
+  });
+
+  function buildOverrideRow(ov) {
+    const node = overrideRowTemplate.content.cloneNode(true);
+    const row = node.querySelector(".override-row");
+    const findBtn = row.querySelector(".btn-find-orders");
+    const unlinkBtn = row.querySelector(".btn-unlink");
+    const toggleBtn = row.querySelector(".btn-link-toggle");
+    const linkPanel = row.querySelector(".group-link-panel");
+    const resolvedBox = row.querySelector(".group-resolved");
+    const findStatusEl = row.querySelector(".override-find-orders-status");
+    const findResultsEl = row.querySelector(".override-find-orders-results");
+
+    row.querySelector(".override-type-badge").textContent = OVERRIDE_TYPE_LABEL[ov.type] || ov.type;
+    row.querySelector(".group-key").textContent = ov.key;
+    resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(ov.resolved);
+    resolvedBox.querySelector(".resolved-by").textContent =
+      ov.resolved_by ? `(by ${ov.resolved_by}, ${ov.resolved_at || ""})` : "";
+
+    // Mutable, not a const snapshot — an edit below updates this so the button and the
+    // auto-triggered post-edit search always act on the CURRENT vs. the just-replaced
+    // customer number, not whatever was true when the row was first built.
+    let currentCustomerNo = ov.type === "sku" ? null : (ov.resolved || {}).customerNo;
+    if (currentCustomerNo) findBtn.classList.remove("hidden");
+    findBtn.addEventListener("click", () => findPreviousOrders(currentCustomerNo, findStatusEl, findResultsEl, ov));
+
+    unlinkBtn.addEventListener("click", async () => {
+      if (!ov.id) return;
+      unlinkBtn.disabled = true;
+      try {
+        await fetch(`/api/overrides/${encodeURIComponent(ov.id)}`, { method: "DELETE" });
+        row.remove();
+        setOverridesStatus(`Removed the link for "${ov.key}".`);
+      } catch (e) {
+        setOverridesStatus("Could not remove link: " + e.message, true);
+      } finally {
+        unlinkBtn.disabled = false;
+      }
+    });
+
+    toggleBtn.addEventListener("click", () => linkPanel.classList.toggle("is-open"));
+
+    const searchInput = row.querySelector(".search-input");
+    const searchResults = row.querySelector(".search-results");
+    if (ov.type === "branch") searchInput.placeholder = "Search by ship-to name, code, or lookup code…";
+    let searchTimer = null;
+    searchInput.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      const term = searchInput.value.trim();
+      if (term.length < 2) {
+        searchResults.innerHTML = "";
+        return;
+      }
+      searchTimer = setTimeout(async () => {
+        const company = overridesCompanySelect.value;
+        if (!company) {
+          searchResults.innerHTML = `<div class="search-hint">Select a company above first.</div>`;
+          return;
+        }
+        searchResults.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
+        try {
+          const url = `/api/lookup/${LOOKUP_PATH[ov.type]}?search=${encodeURIComponent(term)}&company=${encodeURIComponent(company)}`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
+          if (searchInput.value.trim() !== term) return; // stale response guard
+          renderCandidateList(searchResults, ov.type, normalizeCandidates(ov.type, data.data), async (candidate) => {
+            const oldCustomerNo = currentCustomerNo;
+            linkPanel.classList.add("is-saving");
+            try {
+              const resolvedBy = getEmployeeDetails().employee_name;
+              const resolved = resolvedPayload(ov.type, candidate);
+              const data = await saveOverride(ov.type, ov.key, resolved, resolvedBy, []);
+              ov.resolved = resolved;
+              ov.resolved_by = data.resolved_by || "";
+              ov.resolved_at = data.resolved_at || "";
+              ov.id = data.id;
+              resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(ov.resolved);
+              resolvedBox.querySelector(".resolved-by").textContent =
+                ov.resolved_by ? `(by ${ov.resolved_by}, ${ov.resolved_at || ""})` : "";
+              linkPanel.classList.remove("is-open");
+              setOverridesStatus(`Updated the link for "${ov.key}".`);
+
+              currentCustomerNo = ov.type === "sku" ? null : resolved.customerNo;
+              if (currentCustomerNo) findBtn.classList.remove("hidden");
+              if (oldCustomerNo && currentCustomerNo && oldCustomerNo !== currentCustomerNo) {
+                // The link just changed — show what's now stale under the OLD value
+                // first, since that's the actionable list (the current value's own
+                // orders, if any, are presumably already correct).
+                await findPreviousOrders(oldCustomerNo, findStatusEl, findResultsEl, ov);
+              }
+            } catch (e) {
+              setOverridesStatus("Could not save link: " + e.message, true);
+            } finally {
+              linkPanel.classList.remove("is-saving");
+            }
+          });
+        } catch (e) {
+          if (searchInput.value.trim() !== term) return;
+          searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+        }
+      }, 350);
+    });
+
+    return row;
+  }
+
+  function renderOverrides(overrides) {
+    overridesListEl.innerHTML = "";
+    if (!overrides.length) {
+      const empty = document.createElement("div");
+      empty.className = "tab-empty";
+      empty.textContent = "No saved links found for these filters.";
+      overridesListEl.appendChild(empty);
+      return;
+    }
+    const sorted = [...overrides].sort((a, b) =>
+      a.type === b.type ? a.key.localeCompare(b.key) : a.type.localeCompare(b.type)
+    );
+    sorted.forEach((ov) => overridesListEl.appendChild(buildOverrideRow(ov)));
+  }
+
+  async function loadOverrides() {
+    if (!refreshGate()) {
+      setOverridesStatus("Fill in your details above first.", true);
+      return;
+    }
+    const params = new URLSearchParams();
+    if (overridesTypeSelect.value) params.set("type", overridesTypeSelect.value);
+
+    overridesLoadBtn.disabled = true;
+    setBtnLoading("overrides-load-spinner", "overrides-load-btn-label", true, "Loading…");
+    setOverridesStatus("Loading overrides…");
+    try {
+      const res = await fetch(`/api/overrides?${params.toString()}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Failed to load overrides");
+      let overrides = data.data || [];
+      const keyFilter = overridesKeyInput.value.trim().toUpperCase();
+      if (keyFilter) overrides = overrides.filter((ov) => (ov.key || "").toUpperCase().includes(keyFilter));
+      renderOverrides(overrides);
+      setOverridesStatus(`Loaded ${overrides.length} saved link(s).`);
+    } catch (e) {
+      setOverridesStatus("Error: " + e.message, true);
+    } finally {
+      overridesLoadBtn.disabled = false;
+      setBtnLoading("overrides-load-spinner", "overrides-load-btn-label", false);
+    }
+  }
+
+  overridesLoadBtn.addEventListener("click", loadOverrides);
+  overridesKeyInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadOverrides();
   });
 })();

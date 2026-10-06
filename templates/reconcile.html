@@ -68,10 +68,8 @@
       <section class="card notice-card">
         <strong>Note:</strong> a saved branch/customer link takes priority over automatic
         ship-to matching, and a saved SKU link takes priority over automatic item matching.
-        Saving a link automatically triggers a reprocess shortly after — whatever's linked
-        gets inserted into BC even if other items on the same PO are still unresolved; you
-        don't need to click <strong>Reprocess Buffer</strong> yourself unless you want to
-        retry sooner.
+        Nothing is applied to Business Central automatically — once you've linked what you
+        need, click <strong>Reprocess Buffer</strong> yourself to send it.
       </section>
 
       <!-- Company picker + summary -->
@@ -80,6 +78,7 @@
           <button class="action-tab-btn active" data-action-tab="buffer" type="button">Buffer</button>
           <button class="action-tab-btn" data-action-tab="cloudsql" type="button">Cloud SQL</button>
           <button class="action-tab-btn" data-action-tab="history" type="button">History</button>
+          <button class="action-tab-btn" data-action-tab="overrides" type="button">Overrides</button>
         </div>
 
         <div class="action-tab-panel" id="action-panel-buffer">
@@ -187,6 +186,55 @@
           <div class="history-list" id="history-list"></div>
         </div>
 
+        <div class="action-tab-panel hidden" id="action-panel-overrides">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="overrides-type-select">Type</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="overrides-type-select">
+                  <option value="">— All types —</option>
+                  <option value="sku">SKU</option>
+                  <option value="branch">Branch (Ship-To)</option>
+                  <option value="customer">Customer</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="overrides-key-input">Key</label>
+              <input class="form-input" type="text" id="overrides-key-input" placeholder="Exact key (optional)" />
+            </div>
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="overrides-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="overrides-company-select">
+                  <option value="">— Select a company —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <button class="btn-reprocess" id="overrides-load-btn" type="button">
+              <span class="btn-spinner hidden" id="overrides-load-spinner"></span>
+              <span id="overrides-load-btn-label">Load Overrides</span>
+            </button>
+          </div>
+          <p class="details-hint sync-hint">
+            Every manually-saved SKU / branch / customer link to a BC record — the links <strong>Reprocess Buffer</strong>
+            and syncing consult ahead of automatic matching. Editing a link here only affects POs still sitting in the
+            buffer (they pick it up automatically on the next Reprocess Buffer) or new inbound POs. For a branch or
+            customer link, "Find previous orders" also searches Business Central for Sales Orders <strong>already
+            created</strong> under the old value — restricted to orders this app's own automated upload created
+            (submittedBy = "SBIC AI Uploading" only, never a human-entered BC order) — and lets you update just those
+            orders' header (Sell-to Customer No. / Ship-to Code) to the corrected value. Line pricing/discounts are
+            <strong>not</strong> recalculated by that update and should be reviewed in BC afterward; you'll get an
+            email with the full per-order result either way. Company above is only used to search/update BC when
+            editing a link or finding previous orders — the overrides list itself covers every company.
+          </p>
+          <p class="status-line" id="overrides-status-line"></p>
+          <div class="overrides-list" id="overrides-list"></div>
+        </div>
+
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->
         <div class="skeleton-block hidden" id="skeleton-block" aria-hidden="true">
           <div class="skeleton-row skeleton-summary">
@@ -262,6 +310,38 @@
     SBIC &mdash; AI Upload Services &mdash; RGMC IT/MIS Department
   </footer>
 
+  <!-- Sales Order update confirmation modal (Overrides tab "Find previous orders") -->
+  <div class="modal-overlay hidden" id="so-update-modal-overlay">
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="so-update-modal-title">
+      <div class="modal-header">
+        <h3 id="so-update-modal-title">Confirm Sales Order Update</h3>
+        <button class="modal-close-btn" id="so-update-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-subtitle" id="so-update-modal-subtitle"></p>
+        <div class="modal-table-wrap">
+          <table class="modal-so-table">
+            <thead>
+              <tr>
+                <th class="modal-check-col"><input type="checkbox" id="so-update-select-all" checked /></th>
+                <th>Sales Order No.</th>
+                <th>Customer</th>
+                <th>External Document No.</th>
+                <th>Document Date</th>
+              </tr>
+            </thead>
+            <tbody id="so-update-modal-tbody"></tbody>
+          </table>
+        </div>
+        <p class="modal-hint">Header only (Sell-to Customer No. / Ship-to Code) will change on the orders you leave checked — line pricing/discounts are NOT recalculated.</p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-modal-cancel" id="so-update-modal-cancel" type="button">Cancel</button>
+        <button class="btn-reprocess btn-update-orders" id="so-update-modal-confirm" type="button" disabled>Update Selected (0)</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Group row template -->
   <template id="group-row-template">
     <div class="group-row">
@@ -269,6 +349,7 @@
         <div class="group-key-wrap">
           <span class="group-key"></span>
           <span class="group-desc"></span>
+          <span class="group-confidence-badge hidden"></span>
         </div>
         <div class="group-meta">
           <span class="group-po-count"></span>
@@ -298,6 +379,38 @@
             <button class="btn-history-toggle" type="button">Past resolutions for this…</button>
             <div class="history-results hidden"></div>
           </div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- Override row template (Overrides tab) -->
+  <template id="override-row-template">
+    <div class="group-row override-row">
+      <div class="group-head">
+        <div class="group-key-wrap">
+          <span class="override-type-badge"></span>
+          <span class="group-key"></span>
+          <span class="group-desc"></span>
+        </div>
+        <div class="group-meta">
+          <button class="btn-find-orders hidden" type="button">Find previous orders…</button>
+          <button class="btn-unlink" type="button">Remove link</button>
+          <button class="btn-link-toggle" type="button">Edit…</button>
+        </div>
+      </div>
+      <div class="group-resolved">
+        Linked to <strong class="resolved-text"></strong>
+        <span class="resolved-by"></span>
+      </div>
+      <div class="override-find-orders-status hidden"></div>
+      <div class="override-find-orders-results hidden"></div>
+      <div class="group-link-panel">
+        <div class="group-link-panel-inner">
+          <div class="search-row">
+            <input type="text" class="search-input" placeholder="Search existing BC records…" />
+          </div>
+          <div class="search-results"></div>
         </div>
       </div>
     </div>
