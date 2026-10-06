@@ -442,15 +442,22 @@ def _multi_field_contains_search(path: str, company: str, search: str, fields: l
     already searches name/code/lookupCode together; this generalizes that pattern so a
     search matches ANY of `fields` containing the term, not just the first one checked.
     """
-    # tolower() on both sides — Business Central's OData contains() is case-sensitive,
-    # so an otherwise-matching substring (e.g. typing "mcd" against a customer name
-    # stored as "MCDONALD'S") would silently return zero results without this.
-    esc = search.replace("'", "''").lower()
+    # NOT tolower() — confirmed live (2026-10-06) that wrapping the field in tolower()
+    # makes BC's contains() always return zero rows on these custom API pages,
+    # regardless of search term (e.g. contains(tolower(name),'abby') -> 0 even though
+    # contains(name,'ABBY') -> 1 for the exact same row). tolower() is simply
+    # non-functional on this BC environment's custom pages, not just unexpectedly
+    # case-sensitive. RGMC/SBIC's own data entry convention stores these fields in ALL
+    # CAPS, so uppercasing the search term and comparing against the raw field
+    # reliably reproduces case-insensitive matching without relying on the broken
+    # BC function — this is what was silently making every non-exact-case search
+    # (i.e. almost every real search) return no results.
+    esc = search.replace("'", "''").upper()
     errors: list = []
 
     def _one(field: str) -> list:
         try:
-            resp = _bc_api("GET", path, params={"company": company, "filter": f"contains(tolower({field}),'{esc}')"})
+            resp = _bc_api("GET", path, params={"company": company, "filter": f"contains({field},'{esc}')"})
             body, status_code = _proxy_json(resp)
             if status_code == 200:
                 return body.get("data", [])

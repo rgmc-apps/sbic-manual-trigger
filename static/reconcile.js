@@ -244,8 +244,8 @@
           raw: c,
         };
       }
-      // customer — RGMC's custom customers page uses customerNo/name
-      return { code: c.customerNo, name: c.name || "", score: c.score, extra: null, raw: c };
+      // customer — RGMC's custom customers page uses customerNo/name/address
+      return { code: c.customerNo, name: c.name || "", address: c.address || "", score: c.score, extra: null, raw: c };
     });
   }
 
@@ -404,10 +404,16 @@
       item.className = "candidate-item";
       const main = document.createElement("div");
       main.className = "candidate-main";
+      // Customer candidates show address inline ("name (address)") to help tell apart
+      // same-named customers at different branches — everything else keeps the
+      // existing "name · extraLabel" format (extraLabel/extra is branch/SKU-specific).
       const extraLabel = c.extraLabel || c.extra;
+      const nameLine = c.address
+        ? `${escapeHtml(c.name || "")} (${escapeHtml(c.address)})`
+        : `${escapeHtml(c.name || "")}${extraLabel ? " · " + escapeHtml(extraLabel) : ""}`;
       main.innerHTML =
         `<div class="candidate-code">${escapeHtml(c.code || "")}</div>` +
-        `<div class="candidate-name">${escapeHtml(c.name || "")}${extraLabel ? " · " + escapeHtml(extraLabel) : ""}</div>`;
+        `<div class="candidate-name">${nameLine}</div>`;
       item.appendChild(main);
       if (typeof c.score === "number") {
         const score = document.createElement("span");
