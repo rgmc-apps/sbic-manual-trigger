@@ -442,6 +442,7 @@
 }
 .update-result-row.ok { color: var(--success); }
 .update-result-row.fail { color: var(--error); background: var(--error-bg); }
+.update-result-row.blocked { color: var(--warn-text); background: var(--warn-bg); }
 
 .btn-link-toggle, .btn-unlink, .btn-suggest, .btn-find-orders {
   padding: 6px 14px;

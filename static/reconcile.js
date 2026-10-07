@@ -1978,19 +1978,23 @@
       const res = await fetch("/api/bigquery/insert-and-buffer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ headers, details, created_by: getEmployeeDetails().employee_name }),
+        body: JSON.stringify({ headers, details, employee: getEmployeeDetails() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Insert failed");
       const results = data.data || [];
+      const statusIcon = { inserted: "✅", blocked: "⛔", failed: "❌" };
       bqInsertResults.innerHTML = results.map((r) => `
-        <div class="update-result-row ${r.ok ? "ok" : "fail"}">
+        <div class="update-result-row ${r.status === "inserted" ? "ok" : r.status === "blocked" ? "blocked" : "fail"}">
           <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-          <span>${r.ok ? "✅ " + escapeHtml(r.detail) : "❌ " + escapeHtml(r.detail)}</span>
+          <span>${statusIcon[r.status] || "?"} ${escapeHtml(r.detail)}</span>
         </div>
       `).join("");
       bqInsertResults.classList.remove("hidden");
-      setBqStatus(`Inserted ${data.ok_count}/${data.total} PO(s) into MSSQL + buffer. Re-run the search to refresh MSSQL/BC status.`);
+      setBqStatus(
+        `${data.ok_count} inserted, ${data.blocked_count} already in BC (blocked, recorded to history), ` +
+        `${data.total - data.ok_count - data.blocked_count} failed. Re-run the search to refresh MSSQL/BC status.`
+      );
     } catch (e) {
       setBqStatus("Could not insert: " + e.message, true);
     } finally {

@@ -1096,6 +1096,44 @@ def _bq_lines_for_po(details: list, po_ref: str) -> list:
     } for d in details if d.get("po_ref_number") == po_ref]
 
 
+def _bq_header_to_buffer_header(h: dict) -> dict:
+    return {
+        "poRefNumber": h.get("po_ref_number"),
+        "customerName": h.get("customer_name"),
+        "customerBranchName": h.get("customer_branch_name"),
+        "companyName": h.get("company_name"),
+        "poDate": h.get("po_date"),
+        "deliveryDate": h.get("delivery_date"),
+        "cancellationDate": h.get("cancellation_date"),
+        "remark": h.get("remark"),
+    }
+
+
+def _fetch_existing_bc_order(company: str, po_ref: str) -> tuple:
+    """(so_number, line_count) for a BC Sales Order already existing under this
+    externalDocumentNo, or (None, 0) if none exists (or the check itself failed —
+    treated the same as "not found" here, since this only gates an insert that's safe
+    to attempt either way: a false negative just means a duplicate-looking order gets
+    created, which the normal reconcile flow can still catch and merge by hand)."""
+    try:
+        safe_ref = po_ref.replace("'", "''")
+        resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={
+            "company": company,
+            "filter": f"externalDocumentNo eq '{safe_ref}'",
+            "expand": "salesOrderLines",
+        })
+        body, status_code = _proxy_json(resp)
+        if status_code != 200:
+            return None, 0
+        rows = body.get("data") or []
+        if not rows:
+            return None, 0
+        order = rows[0]
+        return order.get("number"), len(order.get("salesOrderLines") or [])
+    except requests.RequestException:
+        return None, 0
+
+
 @app.route("/api/bigquery/insert-and-buffer", methods=["POST"])
 def api_bigquery_insert_and_buffer():
     """Insert caller-selected int_document_ai/int_document_ai_detail rows into MSSQL
@@ -1107,63 +1145,112 @@ def api_bigquery_insert_and_buffer():
     lookup lands in the buffer first, always, regardless of whether it could have
     auto-resolved; that's the whole point of routing it through here instead of the
     normal automated bridge.
+
+    BLOCKER: before touching MSSQL/the buffer at all, each header is checked against
+    BC by externalDocumentNo. One that already has a Sales Order there is never
+    inserted into MSSQL or the buffer — doing so would be pointless (a future
+    reprocess would just skip header creation and look it up again) and would leave a
+    confusing duplicate-looking trail. Instead it's recorded straight to
+    so_buffer_history_{env} (so it still shows up in /reconcile's History tab rather
+    than silently vanishing), after also checking whether the EXISTING order's line
+    count already covers what BigQuery has for it — if not, the history entry says so
+    and points at "Sync from Cloud SQL" as the existing way to backfill missing lines.
     """
     data = request.get_json(silent=True) or {}
     headers = data.get("headers") or []
     details = data.get("details") or []
-    created_by = (data.get("created_by") or "").strip()
+    employee = data.get("employee") or {}
+    triggered_by = {
+        "name": employee.get("employee_name") or "",
+        "company": employee.get("employee_company") or "",
+        "department": employee.get("employee_department") or "",
+        "email": employee.get("email") or "",
+    } if employee else None
     if not headers:
         return jsonify({"error": "headers must not be empty"}), 400
 
-    try:
-        # Same reasoning as the search route above — an MSSQL insert (then whatever the
-        # AFTER INSERT trigger does) is slower and less predictable than this app's
-        # usual calls.
-        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery", json={"headers": headers, "details": details}, timeout=90)
-        body, status_code = _proxy_json(resp)
-        if status_code != 200 or body.get("status") != "success":
-            return jsonify({"error": body.get("message") or f"MSSQL insert failed ({status_code}): {body}"}), 502
-    except requests.RequestException as exc:
-        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
-
     results = []
+    proceed_headers = []
     for h in headers:
         po_ref = h.get("po_ref_number")
         company = _resolve_bc_company(h.get("company_name"))
         if not company:
             results.append({
-                "po_ref": po_ref, "ok": False,
-                "detail": f"Inserted into MSSQL, but could not resolve a BC company from companyName={h.get('company_name')!r} — not added to any buffer.",
+                "po_ref": po_ref, "status": "failed",
+                "detail": f"Could not resolve a BC company from companyName={h.get('company_name')!r} — nothing inserted.",
             })
             continue
-        buffer_header = {
-            "poRefNumber": po_ref,
-            "customerName": h.get("customer_name"),
-            "customerBranchName": h.get("customer_branch_name"),
-            "companyName": h.get("company_name"),
-            "poDate": h.get("po_date"),
-            "deliveryDate": h.get("delivery_date"),
-            "cancellationDate": h.get("cancellation_date"),
-            "remark": h.get("remark"),
-        }
+
+        so_number, bc_line_count = _fetch_existing_bc_order(company, po_ref)
+        if so_number:
+            bq_lines = _bq_lines_for_po(details, po_ref)
+            lines_complete = bc_line_count >= len(bq_lines)
+            outcome = "resolved" if lines_complete else "still_buffered"
+            note = (
+                f"Already exists in BC as {so_number} — not re-inserted. Lines: {bc_line_count}/{len(bq_lines)} present."
+                if lines_complete else
+                f"Already exists in BC as {so_number} — not re-inserted, but only {bc_line_count}/{len(bq_lines)} lines "
+                f"are present. Use \"Sync from Cloud SQL\" to backfill the missing ones."
+            )
+            try:
+                _bc_api("POST", "/bc/custom/v2/so-buffer/history/manual-entry", json={
+                    "header": _bq_header_to_buffer_header(h), "lines": bq_lines, "company": company,
+                    "outcome": outcome, "triggered_by": triggered_by, "so_number": so_number,
+                    "detail": f"Blocked by BigQuery-lookup insert — {note}",
+                })
+            except requests.RequestException:
+                pass  # best-effort — the block itself still applies even if logging it fails
+            results.append({"po_ref": po_ref, "status": "blocked", "detail": note})
+            continue
+
+        proceed_headers.append(h)
+
+    if proceed_headers:
+        proceed_refs = {h.get("po_ref_number") for h in proceed_headers}
+        proceed_details = [d for d in details if d.get("po_ref_number") in proceed_refs]
+        try:
+            # Same reasoning as the search route above — an MSSQL insert (then whatever
+            # the AFTER INSERT trigger does) is slower and less predictable than this
+            # app's usual calls.
+            resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
+                             json={"headers": proceed_headers, "details": proceed_details}, timeout=90)
+            body, status_code = _proxy_json(resp)
+            if status_code != 200 or body.get("status") != "success":
+                detail = body.get("message") or f"MSSQL insert failed ({status_code}): {body}"
+                for h in proceed_headers:
+                    results.append({"po_ref": h.get("po_ref_number"), "status": "failed", "detail": detail})
+                proceed_headers = []
+        except requests.RequestException as exc:
+            detail = f"Could not reach rgmc-gcp-api: {exc}"
+            for h in proceed_headers:
+                results.append({"po_ref": h.get("po_ref_number"), "status": "failed", "detail": detail})
+            proceed_headers = []
+
+    for h in proceed_headers:
+        po_ref = h.get("po_ref_number")
+        company = _resolve_bc_company(h.get("company_name"))
         try:
             buf_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/manual-entry", json={
-                "header": buffer_header,
+                "header": _bq_header_to_buffer_header(h),
                 "lines": _bq_lines_for_po(details, po_ref),
                 "company": company,
                 "src_company": f"manual-bq-lookup:{company}",
-                "created_by": created_by,
+                "created_by": triggered_by.get("name") if triggered_by else "",
             })
             buf_body, buf_status = _proxy_json(buf_resp)
             if buf_status == 201:
-                results.append({"po_ref": po_ref, "ok": True, "detail": f"Inserted into MSSQL and added to the {company} buffer."})
+                results.append({"po_ref": po_ref, "status": "inserted", "detail": f"Inserted into MSSQL and added to the {company} buffer."})
             else:
                 detail = buf_body.get("detail") or buf_body.get("error") or f"BC-API returned {buf_status}"
-                results.append({"po_ref": po_ref, "ok": False, "detail": f"Inserted into MSSQL, but buffer create failed: {detail}"})
+                results.append({"po_ref": po_ref, "status": "failed", "detail": f"Inserted into MSSQL, but buffer create failed: {detail}"})
         except requests.RequestException as exc:
-            results.append({"po_ref": po_ref, "ok": False, "detail": f"Inserted into MSSQL, but buffer create request failed: {exc}"})
+            results.append({"po_ref": po_ref, "status": "failed", "detail": f"Inserted into MSSQL, but buffer create request failed: {exc}"})
 
-    return jsonify({"data": results, "total": len(results), "ok_count": sum(1 for r in results if r["ok"])})
+    return jsonify({
+        "data": results, "total": len(results),
+        "ok_count": sum(1 for r in results if r["status"] == "inserted"),
+        "blocked_count": sum(1 for r in results if r["status"] == "blocked"),
+    })
 
 
 def _employee_notify_params(data: dict):

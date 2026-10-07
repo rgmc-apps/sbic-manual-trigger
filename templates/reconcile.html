@@ -267,6 +267,9 @@
             (<code>CustomerPOULBQ</code>/<code>CustomerPOULDetailBQ</code> — the same staging tables the automated
             BigQuery bridge uses, promoted into the live tables by BC's own trigger) and place it straight into the
             SO-import buffer for manual reconciliation — it is <strong>never</strong> auto-imported into BC directly.
+            A PO that already has a Sales Order in BC (by External Document No.) is <strong>blocked</strong> from this
+            insert entirely — nothing is added to MSSQL or the buffer for it. It's recorded to the History tab instead,
+            including whether the existing order's lines already cover everything BigQuery has for it.
           </p>
           <p class="status-line" id="bq-status-line"></p>
           <div class="bq-results-list" id="bq-results-list"></div>
