@@ -1138,23 +1138,23 @@ def _fetch_existing_bc_order(company: str, po_ref: str) -> tuple:
 def api_bigquery_insert_and_buffer():
     """Insert caller-selected int_document_ai/int_document_ai_detail rows into MSSQL
     (CustomerPOULBQ/CustomerPOULDetailBQ — promoted into the clean CustomerPOUL/
-    CustomerPOULDetail tables by BC's own AFTER INSERT trigger), then unconditionally
-    place each one straight into the Firestore SO-import buffer for human review.
+    CustomerPOULDetail tables by BC's own AFTER INSERT trigger) — ALWAYS, for every
+    selected header, regardless of whether it already has a BC Sales Order. Keeping
+    MSSQL in sync with what BigQuery actually has is treated as independent of BC's
+    state; this is not an "import into BC" action and was never meant to be gated by
+    BC's own data.
 
-    Deliberately skips any automatic BC-import attempt — every PO surfaced through this
-    lookup lands in the buffer first, always, regardless of whether it could have
-    auto-resolved; that's the whole point of routing it through here instead of the
-    normal automated bridge.
-
-    BLOCKER: before touching MSSQL/the buffer at all, each header is checked against
-    BC by externalDocumentNo. One that already has a Sales Order there is never
-    inserted into MSSQL or the buffer — doing so would be pointless (a future
-    reprocess would just skip header creation and look it up again) and would leave a
-    confusing duplicate-looking trail. Instead it's recorded straight to
-    so_buffer_history_{env} (so it still shows up in /reconcile's History tab rather
-    than silently vanishing), after also checking whether the EXISTING order's line
-    count already covers what BigQuery has for it — if not, the history entry says so
-    and points at "Sync from Cloud SQL" as the existing way to backfill missing lines.
+    BLOCKER (buffer only, not MSSQL): a header already checked into MSSQL is still a
+    free-standing check against BC by externalDocumentNo before it's allowed anywhere
+    near the Firestore buffer — if a Sales Order already exists there, inserting this
+    into the buffer too would be pointless (a future reprocess would just skip header
+    creation and look it up again) and would leave a confusing duplicate-looking
+    trail. Instead it's recorded straight to so_buffer_history_{env} (so it still
+    shows up in /reconcile's History tab rather than silently vanishing), after also
+    checking whether the EXISTING order's line count already covers what BigQuery has
+    for it — if not, the history entry says so and points at "Sync from Cloud SQL" as
+    the existing way to backfill missing lines. Everything else proceeds into the
+    buffer exactly as before, never attempting an automatic BC import itself.
     """
     data = request.get_json(silent=True) or {}
     headers = data.get("headers") or []
@@ -1169,15 +1169,25 @@ def api_bigquery_insert_and_buffer():
     if not headers:
         return jsonify({"error": "headers must not be empty"}), 400
 
+    try:
+        # Same reasoning as the search route above — an MSSQL insert (then whatever the
+        # AFTER INSERT trigger does) is slower and less predictable than this app's
+        # usual calls.
+        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery", json={"headers": headers, "details": details}, timeout=90)
+        body, status_code = _proxy_json(resp)
+        if status_code != 200 or body.get("status") != "success":
+            return jsonify({"error": body.get("message") or f"MSSQL insert failed ({status_code}): {body}"}), 502
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
     results = []
-    proceed_headers = []
     for h in headers:
         po_ref = h.get("po_ref_number")
         company = _resolve_bc_company(h.get("company_name"))
         if not company:
             results.append({
                 "po_ref": po_ref, "status": "failed",
-                "detail": f"Could not resolve a BC company from companyName={h.get('company_name')!r} — nothing inserted.",
+                "detail": f"Inserted into MSSQL, but could not resolve a BC company from companyName={h.get('company_name')!r} — not added to any buffer.",
             })
             continue
 
@@ -1187,48 +1197,23 @@ def api_bigquery_insert_and_buffer():
             lines_complete = bc_line_count >= len(bq_lines)
             outcome = "resolved" if lines_complete else "still_buffered"
             note = (
-                f"Already exists in BC as {so_number} — not re-inserted. Lines: {bc_line_count}/{len(bq_lines)} present."
+                f"Inserted into MSSQL. Already exists in BC as {so_number} — not added to the buffer. "
+                f"Lines: {bc_line_count}/{len(bq_lines)} present."
                 if lines_complete else
-                f"Already exists in BC as {so_number} — not re-inserted, but only {bc_line_count}/{len(bq_lines)} lines "
-                f"are present. Use \"Sync from Cloud SQL\" to backfill the missing ones."
+                f"Inserted into MSSQL. Already exists in BC as {so_number} — not added to the buffer, but only "
+                f"{bc_line_count}/{len(bq_lines)} lines are present. Use \"Sync from Cloud SQL\" to backfill the missing ones."
             )
             try:
                 _bc_api("POST", "/bc/custom/v2/so-buffer/history/manual-entry", json={
                     "header": _bq_header_to_buffer_header(h), "lines": bq_lines, "company": company,
                     "outcome": outcome, "triggered_by": triggered_by, "so_number": so_number,
-                    "detail": f"Blocked by BigQuery-lookup insert — {note}",
+                    "detail": f"Blocked from the buffer by BigQuery-lookup insert — {note}",
                 })
             except requests.RequestException:
                 pass  # best-effort — the block itself still applies even if logging it fails
             results.append({"po_ref": po_ref, "status": "blocked", "detail": note})
             continue
 
-        proceed_headers.append(h)
-
-    if proceed_headers:
-        proceed_refs = {h.get("po_ref_number") for h in proceed_headers}
-        proceed_details = [d for d in details if d.get("po_ref_number") in proceed_refs]
-        try:
-            # Same reasoning as the search route above — an MSSQL insert (then whatever
-            # the AFTER INSERT trigger does) is slower and less predictable than this
-            # app's usual calls.
-            resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
-                             json={"headers": proceed_headers, "details": proceed_details}, timeout=90)
-            body, status_code = _proxy_json(resp)
-            if status_code != 200 or body.get("status") != "success":
-                detail = body.get("message") or f"MSSQL insert failed ({status_code}): {body}"
-                for h in proceed_headers:
-                    results.append({"po_ref": h.get("po_ref_number"), "status": "failed", "detail": detail})
-                proceed_headers = []
-        except requests.RequestException as exc:
-            detail = f"Could not reach rgmc-gcp-api: {exc}"
-            for h in proceed_headers:
-                results.append({"po_ref": h.get("po_ref_number"), "status": "failed", "detail": detail})
-            proceed_headers = []
-
-    for h in proceed_headers:
-        po_ref = h.get("po_ref_number")
-        company = _resolve_bc_company(h.get("company_name"))
         try:
             buf_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/manual-entry", json={
                 "header": _bq_header_to_buffer_header(h),

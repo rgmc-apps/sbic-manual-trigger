@@ -239,8 +239,8 @@
         <div class="action-tab-panel hidden" id="action-panel-bigquery">
           <div class="toolbar">
             <div class="form-group toolbar-select">
-              <label class="form-label" for="bq-po-ref-input">PO Ref</label>
-              <input class="form-input" type="text" id="bq-po-ref-input" placeholder="Exact PO ref (optional)" />
+              <label class="form-label" for="bq-po-ref-input">PO Ref(s)</label>
+              <textarea class="form-input bq-po-ref-textarea" id="bq-po-ref-input" rows="1" placeholder="One or more exact PO refs — comma, space, or newline separated (optional). Ctrl+Enter to search."></textarea>
             </div>
             <div class="form-group toolbar-select">
               <label class="form-label" for="bq-customer-input">Customer</label>
@@ -267,9 +267,11 @@
             (<code>CustomerPOULBQ</code>/<code>CustomerPOULDetailBQ</code> — the same staging tables the automated
             BigQuery bridge uses, promoted into the live tables by BC's own trigger) and place it straight into the
             SO-import buffer for manual reconciliation — it is <strong>never</strong> auto-imported into BC directly.
-            A PO that already has a Sales Order in BC (by External Document No.) is <strong>blocked</strong> from this
-            insert entirely — nothing is added to MSSQL or the buffer for it. It's recorded to the History tab instead,
-            including whether the existing order's lines already cover everything BigQuery has for it.
+            MSSQL is always inserted into, even for a PO that already has a Sales Order in BC (by External Document
+            No.) — keeping MSSQL in sync with BigQuery doesn't depend on BC's state. Only the <strong>buffer</strong>
+            step is blocked for one already in BC (inserting it there too would be pointless and confusing); it's
+            recorded to the History tab instead, including whether the existing order's lines already cover
+            everything BigQuery has for it.
           </p>
           <p class="status-line" id="bq-status-line"></p>
           <div class="bq-results-list" id="bq-results-list"></div>

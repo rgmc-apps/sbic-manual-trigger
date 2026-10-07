@@ -1949,8 +1949,11 @@
   }
 
   bqSearchBtn.addEventListener("click", searchDocumentAi);
-  [bqPoRefInput, bqCustomerInput].forEach((el) => {
-    el.addEventListener("keydown", (e) => { if (e.key === "Enter") searchDocumentAi(); });
+  bqCustomerInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchDocumentAi(); });
+  // bq-po-ref-input is a textarea now (multiple PO refs, one-per-line or comma-separated)
+  // — plain Enter has to stay a newline; Ctrl/Cmd+Enter triggers the search instead.
+  bqPoRefInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) searchDocumentAi();
   });
 
   bqInsertBtn.addEventListener("click", async () => {
@@ -1992,7 +1995,8 @@
       `).join("");
       bqInsertResults.classList.remove("hidden");
       setBqStatus(
-        `${data.ok_count} inserted, ${data.blocked_count} already in BC (blocked, recorded to history), ` +
+        `${data.ok_count} inserted into MSSQL + buffer, ${data.blocked_count} inserted into MSSQL only ` +
+        `(already in BC — skipped the buffer, recorded to history), ` +
         `${data.total - data.ok_count - data.blocked_count} failed. Re-run the search to refresh MSSQL/BC status.`
       );
     } catch (e) {
