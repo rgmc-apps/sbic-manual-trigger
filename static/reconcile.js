@@ -27,10 +27,6 @@
   const bqInsertBtn       = document.getElementById("bq-insert-btn");
   const bqInsertResults   = document.getElementById("bq-insert-results");
   const documentAiRowTemplate = document.getElementById("document-ai-row-template");
-  const bqMssqlPoRefInput    = document.getElementById("bq-mssql-po-ref-input");
-  const bqMssqlBufferBtn     = document.getElementById("bq-mssql-buffer-btn");
-  const bqMssqlStatusLine    = document.getElementById("bq-mssql-status-line");
-  const bqMssqlResults       = document.getElementById("bq-mssql-results");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
   const soUpdateModalTbody     = document.getElementById("so-update-modal-tbody");
@@ -1859,7 +1855,7 @@
     const checked = bqResultsList.querySelectorAll(".bq-row-check:checked");
     bqInsertAction.classList.toggle("hidden", bqResultsList.querySelectorAll(".bq-row-check").length === 0);
     bqInsertBtn.disabled = checked.length === 0;
-    bqInsertBtn.textContent = `Insert Selected (${checked.length}) into MSSQL + Buffer`;
+    bqInsertBtn.textContent = `Add Selected (${checked.length}) to Buffer`;
   }
 
   function buildDocumentAiRow(header) {
@@ -1869,9 +1865,19 @@
     const poRef = header.po_ref_number || "";
     checkbox.dataset.poRef = poRef;
 
+    const isMssqlSourced = header._source === "mssql";
+
     row.querySelector(".group-key").textContent = poRef || "(no PO ref)";
     row.querySelector(".group-desc").textContent =
       `${header.customer_name || "—"} · PO date ${header.po_date || "—"} · created ${header.created_at || "—"}`;
+
+    // Only ever "mssql" when the exact-PO-ref search fell back to CustomerPOUL because
+    // BigQuery had nothing at all for this ref (e.g. legacy-app-encoded) — a plain
+    // BigQuery search never produces this tag, so this badge is never "missing" for a
+    // row that genuinely came from the search results above it.
+    row.querySelector(".bq-status-bigquery").className =
+      `bq-status-badge bq-status-bigquery ${isMssqlSourced ? "missing" : "ok"}`;
+    row.querySelector(".bq-status-bigquery").textContent = isMssqlSourced ? "✗ Not in BigQuery" : "✓ BigQuery";
 
     row.querySelector(".bq-status-mssql").className =
       `bq-status-badge bq-status-mssql ${bqBadgeClass(header.in_mssql)}`;
@@ -1880,10 +1886,14 @@
       `bq-status-badge bq-status-bc ${bqBadgeClass(header.in_bc)}`;
     row.querySelector(".bq-status-bc").textContent = bqBadgeLabel("BC", header.in_bc);
 
-    // Already-in-MSSQL rows are shown for status visibility but aren't selectable here
-    // — the existing Sync/Backfill/Reprocess flows already cover anything MSSQL
-    // already has; this feature is specifically for what's missing from it.
-    if (header.in_mssql !== false) {
+    // Eligible to select: either genuinely not yet in MSSQL (the normal BigQuery-
+    // sourced case — needs an MSSQL insert), OR found only via the CustomerPOUL
+    // fallback (already in MSSQL by definition, but that's the whole point of this
+    // row existing — it still needs buffering, just with no MSSQL insert step).
+    // Anything else already in MSSQL through the normal BigQuery path is shown for
+    // status visibility only — the existing Sync/Backfill/Reprocess flows already
+    // cover it.
+    if (!isMssqlSourced && header.in_mssql !== false) {
       checkbox.disabled = true;
       checkbox.title = header.in_mssql === null
         ? "Could not confirm MSSQL status — re-run the search before relying on this."
@@ -1973,14 +1983,18 @@
     const headers = bqHeaders.filter((h) => selectedRefs.has(h.po_ref_number || ""));
     const details = bqDetails.filter((d) => selectedRefs.has(d.po_ref_number));
 
+    const toInsert = headers.filter((h) => h._source !== "mssql").length;
+    const toBufferOnly = headers.length - toInsert;
+    const confirmParts = [];
+    if (toInsert) confirmParts.push(`insert ${toInsert} PO(s) into MSSQL (CustomerPOULBQ/CustomerPOULDetailBQ)`);
+    if (toBufferOnly) confirmParts.push(`add ${toBufferOnly} PO(s) already in MSSQL straight to the buffer (no MSSQL insert needed)`);
     if (!confirm(
-      `This will insert ${headers.length} PO(s) into MSSQL (CustomerPOULBQ/CustomerPOULDetailBQ) and place each ` +
-      `straight into its SO-import buffer for manual reconciliation — none of them will be auto-imported into BC. Continue?`
+      `This will ${confirmParts.join(" and ")}. None of them will be auto-imported into BC. Continue?`
     )) return;
 
     bqInsertBtn.disabled = true;
     const origLabel = bqInsertBtn.textContent;
-    bqInsertBtn.textContent = "Inserting…";
+    bqInsertBtn.textContent = "Adding…";
     try {
       const res = await fetch("/api/bigquery/insert-and-buffer", {
         method: "POST",
@@ -1999,9 +2013,9 @@
       `).join("");
       bqInsertResults.classList.remove("hidden");
       setBqStatus(
-        `${data.ok_count} inserted into MSSQL + buffer, ${data.blocked_count} inserted into MSSQL only ` +
-        `(already in BC — skipped the buffer, recorded to history), ` +
-        `${data.total - data.ok_count - data.blocked_count} failed. Re-run the search to refresh MSSQL/BC status.`
+        `${data.ok_count} added to the buffer, ${data.blocked_count} already in BC ` +
+        `(blocked, recorded to history), ${data.total - data.ok_count - data.blocked_count} failed. ` +
+        `Re-run the search to refresh MSSQL/BC status.`
       );
     } catch (e) {
       setBqStatus("Could not insert: " + e.message, true);
@@ -2009,66 +2023,5 @@
       bqInsertBtn.disabled = false;
       bqInsertBtn.textContent = origLabel;
     }
-  });
-
-  // ── "Already in MSSQL? Add to buffer only" ───────────────────────────────────
-  // For a PO manually encoded straight into CustomerPOUL/CustomerPOULDetail (SBIC's
-  // legacy app) — never goes through Document AI/BigQuery, so it can never be found by
-  // the search above. Fetches CustomerPOUL/CustomerPOULDetail directly server-side and
-  // buffers it with no MSSQL insert step at all (nothing to insert — it's already there).
-  function setBqMssqlStatus(msg, isError) {
-    bqMssqlStatusLine.textContent = msg || "";
-    bqMssqlStatusLine.classList.toggle("error", !!isError);
-  }
-
-  async function addToBufferOnly() {
-    if (!refreshGate()) {
-      setBqMssqlStatus("Fill in your details above first.", true);
-      return;
-    }
-    const poRefsRaw = bqMssqlPoRefInput.value.trim();
-    if (!poRefsRaw) {
-      setBqMssqlStatus("Enter at least one PO ref.", true);
-      return;
-    }
-    if (!confirm(
-      "This will look up each PO ref directly in CustomerPOUL/CustomerPOULDetail (not BigQuery) and place it " +
-      "straight into the SO-import buffer — no MSSQL insert, since it's already there. Continue?"
-    )) return;
-
-    bqMssqlBufferBtn.disabled = true;
-    setBtnLoading("bq-mssql-buffer-spinner", "bq-mssql-buffer-btn-label", true, "Adding…");
-    try {
-      const res = await fetch("/api/mssql/buffer-only", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ po_refs: poRefsRaw, employee: getEmployeeDetails() }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || data.detail || "Request failed");
-      const results = data.data || [];
-      const statusIcon = { buffered: "✅", blocked: "⛔", failed: "❌" };
-      bqMssqlResults.innerHTML = results.map((r) => `
-        <div class="update-result-row ${r.status === "buffered" ? "ok" : r.status === "blocked" ? "blocked" : "fail"}">
-          <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-          <span>${statusIcon[r.status] || "?"} ${escapeHtml(r.detail)}</span>
-        </div>
-      `).join("");
-      bqMssqlResults.classList.remove("hidden");
-      setBqMssqlStatus(
-        `${data.ok_count} added to buffer, ${data.blocked_count} already in BC ` +
-        `(blocked, recorded to history), ${data.total - data.ok_count - data.blocked_count} failed.`
-      );
-    } catch (e) {
-      setBqMssqlStatus("Error: " + e.message, true);
-    } finally {
-      bqMssqlBufferBtn.disabled = false;
-      setBtnLoading("bq-mssql-buffer-spinner", "bq-mssql-buffer-btn-label", false);
-    }
-  }
-
-  bqMssqlBufferBtn.addEventListener("click", addToBufferOnly);
-  bqMssqlPoRefInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) addToBufferOnly();
   });
 })();
