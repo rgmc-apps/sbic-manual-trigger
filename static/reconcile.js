@@ -16,6 +16,17 @@
   const overridesStatusLine    = document.getElementById("overrides-status-line");
   const overridesListEl        = document.getElementById("overrides-list");
   const overrideRowTemplate    = document.getElementById("override-row-template");
+  const bqPoRefInput      = document.getElementById("bq-po-ref-input");
+  const bqCustomerInput   = document.getElementById("bq-customer-input");
+  const bqDateFrom        = document.getElementById("bq-date-from");
+  const bqDateTo          = document.getElementById("bq-date-to");
+  const bqSearchBtn       = document.getElementById("bq-search-btn");
+  const bqStatusLine      = document.getElementById("bq-status-line");
+  const bqResultsList     = document.getElementById("bq-results-list");
+  const bqInsertAction    = document.getElementById("bq-insert-action");
+  const bqInsertBtn       = document.getElementById("bq-insert-btn");
+  const bqInsertResults   = document.getElementById("bq-insert-results");
+  const documentAiRowTemplate = document.getElementById("document-ai-row-template");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
   const soUpdateModalTbody     = document.getElementById("so-update-modal-tbody");
@@ -1600,6 +1611,8 @@
           old_customer_no: oldCustomerNo,
           new_resolved: ov.resolved,
           selected_ids: selectedIds,
+          override_key: ov.key,
+          override_type: ov.type,
           requested_by_email: employee.email,
           requested_by_name: employee.employee_name,
         }),
@@ -1620,9 +1633,16 @@
         </div>
       `).join("");
       updateResultsEl.classList.remove("hidden");
+      // Reload BEFORE setting the final status — loadOverrides() ends with its own
+      // "Loaded N saved link(s)" status, which would otherwise immediately overwrite
+      // the more specific message below.
+      if (data.followup_created) await loadOverrides();
       setOverridesStatus(
         `Updated ${data.updated}/${data.total} Sales Order(s) in ${company}. ` +
-        `An email with the full result was sent to ${employee.email}.`
+        `An email with the full result was sent to ${employee.email}.` +
+        (data.followup_created
+          ? ` A follow-up override was added to this list tracking the order(s) still stuck under ${oldCustomerNo}.`
+          : "")
       );
       closeSalesOrderUpdateModal();
     } catch (e) {
@@ -1784,5 +1804,198 @@
   overridesLoadBtn.addEventListener("click", loadOverrides);
   overridesKeyInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") loadOverrides();
+  });
+
+  // ── BigQuery (int_document_ai) lookup tab ────────────────────────────────────
+  // Finds POs Document AI parsed into BigQuery that may never have reached MSSQL at
+  // all — independent of the normal automated bridge. Only a header not already in
+  // MSSQL can be selected for insertion; one already there is shown (so the user can
+  // see its BC/MSSQL status) but its checkbox stays disabled — the normal sync/
+  // backfill/reprocess flows already cover it.
+  let bqDetails = []; // the current search's full detail_data, filtered per-row by po_ref_number when expanded
+  let bqHeaders = []; // the current search's full header list, for re-matching a selection back to its exact BigQuery-shaped dict
+
+  function setBqStatus(msg, isError) {
+    bqStatusLine.textContent = msg || "";
+    bqStatusLine.classList.toggle("error", !!isError);
+  }
+
+  function bqBadgeClass(state) {
+    if (state === true) return "ok";
+    if (state === false) return "missing";
+    return "unknown"; // null — the check itself failed, not a confirmed absence
+  }
+
+  function bqBadgeLabel(label, state) {
+    if (state === true) return `✓ ${label}`;
+    if (state === false) return `✗ ${label}`;
+    return `? ${label}`;
+  }
+
+  function renderBqDetailLines(poRef) {
+    const lines = bqDetails.filter((d) => d.po_ref_number === poRef);
+    if (!lines.length) return '<p class="tab-empty">No detail lines found for this PO in BigQuery.</p>';
+    const rows = lines.map((l) => `
+      <tr>
+        <td>${escapeHtml(l.customer_sku_code || "—")}</td>
+        <td>${escapeHtml(l.customer_sku_desc || "—")}</td>
+        <td>${escapeHtml(l.po_qty ?? l.po_qty_pcs ?? "—")}</td>
+        <td>${escapeHtml(l.unit_price ?? "—")}</td>
+      </tr>
+    `).join("");
+    return `
+      <table>
+        <thead><tr><th>SKU</th><th>Description</th><th>Qty</th><th>Unit Price</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+
+  function updateBqInsertActionState() {
+    const checked = bqResultsList.querySelectorAll(".bq-row-check:checked");
+    bqInsertAction.classList.toggle("hidden", bqResultsList.querySelectorAll(".bq-row-check").length === 0);
+    bqInsertBtn.disabled = checked.length === 0;
+    bqInsertBtn.textContent = `Insert Selected (${checked.length}) into MSSQL + Buffer`;
+  }
+
+  function buildDocumentAiRow(header) {
+    const node = documentAiRowTemplate.content.cloneNode(true);
+    const row = node.querySelector(".bq-row");
+    const checkbox = row.querySelector(".bq-row-check");
+    const poRef = header.po_ref_number || "";
+    checkbox.dataset.poRef = poRef;
+
+    row.querySelector(".group-key").textContent = poRef || "(no PO ref)";
+    row.querySelector(".group-desc").textContent =
+      `${header.customer_name || "—"} · PO date ${header.po_date || "—"} · created ${header.created_at || "—"}`;
+
+    row.querySelector(".bq-status-mssql").className =
+      `bq-status-badge bq-status-mssql ${bqBadgeClass(header.in_mssql)}`;
+    row.querySelector(".bq-status-mssql").textContent = bqBadgeLabel("MSSQL", header.in_mssql);
+    row.querySelector(".bq-status-bc").className =
+      `bq-status-badge bq-status-bc ${bqBadgeClass(header.in_bc)}`;
+    row.querySelector(".bq-status-bc").textContent = bqBadgeLabel("BC", header.in_bc);
+
+    // Already-in-MSSQL rows are shown for status visibility but aren't selectable here
+    // — the existing Sync/Backfill/Reprocess flows already cover anything MSSQL
+    // already has; this feature is specifically for what's missing from it.
+    if (header.in_mssql !== false) {
+      checkbox.disabled = true;
+      checkbox.title = header.in_mssql === null
+        ? "Could not confirm MSSQL status — re-run the search before relying on this."
+        : "Already in MSSQL — use Sync/Backfill/Reprocess instead.";
+      row.classList.add("bq-ineligible");
+    } else {
+      checkbox.addEventListener("change", updateBqInsertActionState);
+    }
+
+    const toggleBtn = row.querySelector(".bq-detail-toggle");
+    const detailEl = row.querySelector(".bq-detail-lines");
+    toggleBtn.addEventListener("click", () => {
+      const show = detailEl.classList.contains("hidden");
+      if (show && !detailEl.dataset.rendered) {
+        detailEl.innerHTML = renderBqDetailLines(poRef);
+        detailEl.dataset.rendered = "1";
+      }
+      detailEl.classList.toggle("hidden", !show);
+      toggleBtn.textContent = show ? "Hide detail lines" : "Show detail lines";
+    });
+
+    return row;
+  }
+
+  function renderBqResults(headers) {
+    bqResultsList.innerHTML = "";
+    bqInsertResults.innerHTML = "";
+    bqInsertResults.classList.add("hidden");
+    if (!headers.length) {
+      const empty = document.createElement("div");
+      empty.className = "tab-empty";
+      empty.textContent = "No matching records found in BigQuery.";
+      bqResultsList.appendChild(empty);
+      bqInsertAction.classList.add("hidden");
+      return;
+    }
+    headers.forEach((h) => bqResultsList.appendChild(buildDocumentAiRow(h)));
+    updateBqInsertActionState();
+  }
+
+  async function searchDocumentAi() {
+    const params = new URLSearchParams();
+    const poRef = bqPoRefInput.value.trim();
+    const customer = bqCustomerInput.value.trim();
+    if (poRef) params.set("po_ref_number", poRef);
+    if (customer) params.set("customer_name", customer);
+    if (bqDateFrom.value) params.set("date_from", bqDateFrom.value);
+    if (bqDateTo.value) params.set("date_to", bqDateTo.value);
+
+    bqSearchBtn.disabled = true;
+    setBtnLoading("bq-search-spinner", "bq-search-btn-label", true, "Searching…");
+    setBqStatus("Searching BigQuery…");
+    try {
+      const res = await fetch(`/api/bigquery/document-ai/search?${params.toString()}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
+      bqHeaders = data.headers || [];
+      bqDetails = data.details || [];
+      renderBqResults(bqHeaders);
+      setBqStatus(`Found ${bqHeaders.length} header(s) in BigQuery.`);
+    } catch (e) {
+      setBqStatus("Error: " + e.message, true);
+    } finally {
+      bqSearchBtn.disabled = false;
+      setBtnLoading("bq-search-spinner", "bq-search-btn-label", false);
+    }
+  }
+
+  bqSearchBtn.addEventListener("click", searchDocumentAi);
+  [bqPoRefInput, bqCustomerInput].forEach((el) => {
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter") searchDocumentAi(); });
+  });
+
+  bqInsertBtn.addEventListener("click", async () => {
+    if (!refreshGate()) {
+      setBqStatus("Fill in your details above first.", true);
+      return;
+    }
+    const checkedBoxes = [...bqResultsList.querySelectorAll(".bq-row-check:checked")];
+    if (!checkedBoxes.length) return;
+    const selectedRefs = new Set(checkedBoxes.map((c) => c.dataset.poRef));
+    // Re-match against the search's own header list (not the DOM) for the exact
+    // snake_case BigQuery shape the backend expects — the DOM only has display text.
+    const headers = bqHeaders.filter((h) => selectedRefs.has(h.po_ref_number || ""));
+    const details = bqDetails.filter((d) => selectedRefs.has(d.po_ref_number));
+
+    if (!confirm(
+      `This will insert ${headers.length} PO(s) into MSSQL (CustomerPOULBQ/CustomerPOULDetailBQ) and place each ` +
+      `straight into its SO-import buffer for manual reconciliation — none of them will be auto-imported into BC. Continue?`
+    )) return;
+
+    bqInsertBtn.disabled = true;
+    const origLabel = bqInsertBtn.textContent;
+    bqInsertBtn.textContent = "Inserting…";
+    try {
+      const res = await fetch("/api/bigquery/insert-and-buffer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ headers, details, created_by: getEmployeeDetails().employee_name }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Insert failed");
+      const results = data.data || [];
+      bqInsertResults.innerHTML = results.map((r) => `
+        <div class="update-result-row ${r.ok ? "ok" : "fail"}">
+          <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
+          <span>${r.ok ? "✅ " + escapeHtml(r.detail) : "❌ " + escapeHtml(r.detail)}</span>
+        </div>
+      `).join("");
+      bqInsertResults.classList.remove("hidden");
+      setBqStatus(`Inserted ${data.ok_count}/${data.total} PO(s) into MSSQL + buffer. Re-run the search to refresh MSSQL/BC status.`);
+    } catch (e) {
+      setBqStatus("Could not insert: " + e.message, true);
+    } finally {
+      bqInsertBtn.disabled = false;
+      bqInsertBtn.textContent = origLabel;
+    }
   });
 })();

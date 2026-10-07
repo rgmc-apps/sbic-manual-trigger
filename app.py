@@ -23,6 +23,24 @@ API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 # BC company codes this UI knows about, for the company picker.
 RECONCILE_COMPANIES = ["SBIC", "MTC"]
 
+# Company routing rule mirrored from rgmc-gcp-api's CustomerPOUL.py (mssql_bc_mapping.txt
+# §5) — duplicated here (small, static table) rather than round-tripping through another
+# service call just to resolve a BigQuery row's free-text companyName to a BC company code.
+_COMPANY_KEYWORD_MAP = [
+    ("SUNCOAST", "SBIC"),
+    ("SBIC", "SBIC"),
+    ("MANILA", "MTC"),
+    ("MTC", "MTC"),
+]
+
+
+def _resolve_bc_company(source_company_name: str | None) -> str | None:
+    upper = (source_company_name or "").upper()
+    for keyword, bc_company in _COMPANY_KEYWORD_MAP:
+        if keyword in upper:
+            return bc_company
+    return None
+
 # ---------------------------------------------------------------------------
 # Email configuration — override via environment variables
 # ---------------------------------------------------------------------------
@@ -783,8 +801,56 @@ def api_sales_orders():
         return jsonify({"error": str(exc)}), 502
 
 
+def _create_followup_override(old_customer_no: str, new_resolved: dict, override_key: str,
+                               override_type: str, failed_results: list, requested_by: str) -> None:
+    """When a batch correction only partially succeeds, auto-create ONE override entry
+    tracking the still-stuck orders — reusing the existing overrides collection/endpoint
+    (so it shows up in the Overrides tab like any other saved link) rather than letting
+    that information disappear once the result email is read.
+
+    Keyed with descriptive text that will never match any real PO's customerName/
+    customerBranchName, so it's purely a human-facing follow-up marker — it can never
+    accidentally get "consumed" by the worker's own resolution logic. "Remove link" on
+    it once the stuck orders are sorted out directly in BC.
+
+    Hardcoded to type="customer" regardless of whether the original override that
+    triggered this was branch or customer — both resolve to a customerNo, and this is
+    fundamentally tracking a customer-level correction that didn't fully land.
+    """
+    new_customer_no = new_resolved.get("customerNo", "—")
+    new_customer_desc = new_customer_no
+    if new_resolved.get("shipToCode"):
+        new_customer_desc += f" (ship-to {new_resolved['shipToCode']})"
+    key = f'NEEDS MANUAL CORRECTION — {old_customer_no} still stuck (from "{override_key}" update)'
+    # Deliberately {customerNo, displayName} ONLY — no shipToCode key — to match the
+    # "customer" type's shape exactly. reconcile.js's resolvedDisplay() branches on
+    # resolved.shipToCode being present to mean a BRANCH-shaped override (expects a
+    # .name field, not .displayName); including shipToCode here would make it take
+    # that branch and render "undefined" for the name.
+    resolved = {
+        "customerNo": new_customer_no,
+        "displayName": f"{len(failed_results)} order(s) still under {old_customer_no}, should be {new_customer_desc}",
+        "stillStuckUnder": old_customer_no,
+        "sourceOverrideKey": override_key,
+        "sourceOverrideType": override_type,
+        "stuckOrders": [{"number": r.get("number"), "detail": r.get("detail")} for r in failed_results],
+    }
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/overrides", json={
+            "type": "customer",
+            "key": key,
+            "resolved": resolved,
+            "resolved_by": f"Auto-tracked after {requested_by or 'a'} Sales Order correction",
+            "buffer_ids": [],
+        })
+        if resp.status_code not in (200, 201):
+            app.logger.error("Follow-up override save returned %s: %s", resp.status_code, resp.text)
+    except requests.RequestException as exc:
+        app.logger.error("Could not create follow-up override for stuck orders: %s", exc)
+
+
 def _sales_order_correction_email_body(company: str, old_customer_no: str, new_resolved: dict,
-                                        results: list, requested_by: str) -> str:
+                                        results: list, requested_by: str, followup_created: bool) -> str:
     new_customer_desc = new_resolved.get("customerNo", "—")
     if new_resolved.get("shipToCode"):
         new_customer_desc += f" (ship-to {new_resolved['shipToCode']})"
@@ -812,6 +878,7 @@ def _sales_order_correction_email_body(company: str, old_customer_no: str, new_r
         on updated orders directly in Business Central. A Sales Order already Released is
         reported as a failure above; reopen it in BC before retrying.
       </p>
+      {"<p style='color:#92400e;font-size:12px'><strong>A follow-up override was created</strong> in the Overrides tab tracking the order(s) above that are still stuck under the old customer — remove it once they're corrected in BC.</p>" if followup_created else ""}
       <p style='color:#888;font-size:12px'>SBIC Buffer Reconciliation</p>
     </body></html>
     """
@@ -841,6 +908,8 @@ def api_update_sales_orders_customer():
     requested_by_email = (data.get("requested_by_email") or "").strip()
     requested_by_name = (data.get("requested_by_name") or "").strip()
     selected_ids = [s for s in (data.get("selected_ids") or []) if s]
+    override_key = (data.get("override_key") or old_customer_no).strip()
+    override_type = (data.get("override_type") or "customer").strip()
 
     if not company:
         return jsonify({"error": "company is required"}), 400
@@ -886,15 +955,201 @@ def api_update_sales_orders_customer():
         except requests.RequestException as exc:
             results.append({"ok": False, "number": number, "detail": f"Request failed: {exc}"})
 
+    updated = sum(1 for r in results if r["ok"])
+    failed_results = [r for r in results if not r["ok"]]
+
+    # Only the orders actually ATTEMPTED and rejected by BC count here — one the user
+    # deliberately left unchecked in the modal was never attempted, so it's not a
+    # "failure" needing a follow-up marker, just a choice the user already made.
+    followup_created = False
+    if failed_results:
+        _create_followup_override(
+            old_customer_no, new_resolved, override_key, override_type,
+            failed_results, requested_by_name or requested_by_email,
+        )
+        followup_created = True
+
     if requested_by_email:
-        updated = sum(1 for r in results if r["ok"])
         subject = f"Sales Order customer correction — {company} ({updated}/{len(results)} updated)"
         html_body = _sales_order_correction_email_body(
-            company, old_customer_no, new_resolved, results, requested_by_name or requested_by_email
+            company, old_customer_no, new_resolved, results,
+            requested_by_name or requested_by_email, followup_created,
         )
         send_email(subject, html_body, to_addr=requested_by_email)
 
-    return jsonify({"data": results, "total": len(results), "updated": sum(1 for r in results if r["ok"])})
+    return jsonify({
+        "data": results, "total": len(results), "updated": updated,
+        "followup_created": followup_created,
+    })
+
+
+# ---------------------------------------------------------------------------
+# BigQuery (int_document_ai / int_document_ai_detail) lookup
+# ---------------------------------------------------------------------------
+# Finds POs Document AI parsed from BigQuery that may never have made it into MSSQL
+# (sbic_int) at all — separate from the normal automated BigQuery-bridge path, for a
+# human to find and manually push through when the bridge missed something. Per-PO
+# status (BigQuery / MSSQL / Business Central) tells the user exactly how far along
+# each one already is before they act on it.
+
+def _check_mssql_exists(po_ref: str) -> bool | None:
+    """True/False, or None if the check itself failed (unknown — never reported as
+    "missing" on a mere network error, which would wrongly invite a duplicate insert)."""
+    try:
+        resp = requests.get(f"{GCP_API_BASE}/customerpoul", params={"po_ref_number": po_ref}, timeout=API_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        return (resp.json().get("record_count") or 0) > 0
+    except requests.RequestException:
+        return None
+
+
+def _enrich_document_ai_status(headers: list) -> None:
+    """Attach in_mssql (bool|None) and in_bc (bool) to each header dict, in place."""
+    po_refs = sorted({h.get("po_ref_number") for h in headers if h.get("po_ref_number")})
+    if not po_refs:
+        return
+
+    in_mssql: dict = {}
+    with ThreadPoolExecutor(max_workers=min(20, len(po_refs))) as ex:
+        for po_ref, exists in zip(po_refs, ex.map(_check_mssql_exists, po_refs)):
+            in_mssql[po_ref] = exists
+
+    # One combined filter per BC company, OR-ing multiple VALUES of the same field
+    # (externalDocumentNo) — fine; it's ORing across *distinct fields* that hits BC's
+    # documented 501 limitation (see _multi_field_contains_search).
+    in_bc = {ref: False for ref in po_refs}
+    by_company: dict[str, list[str]] = {}
+    for h in headers:
+        ref = h.get("po_ref_number")
+        company = _resolve_bc_company(h.get("company_name"))
+        if ref and company:
+            by_company.setdefault(company, []).append(ref)
+
+    for company, refs in by_company.items():
+        try:
+            safe_refs = [r.replace("'", "''") for r in set(refs)]
+            odata_filter = " or ".join(f"externalDocumentNo eq '{r}'" for r in safe_refs)
+            resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={"company": company, "filter": odata_filter})
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                for row in body.get("data", []):
+                    ext = row.get("externalDocumentNo")
+                    if ext in in_bc:
+                        in_bc[ext] = True
+        except requests.RequestException:
+            pass  # best-effort — leave this company's refs as "not found" rather than failing the whole search
+
+    for h in headers:
+        ref = h.get("po_ref_number")
+        h["in_mssql"] = in_mssql.get(ref)
+        h["in_bc"] = in_bc.get(ref, False)
+
+
+@app.route("/api/bigquery/document-ai/search")
+def api_bigquery_document_ai_search():
+    params = {}
+    for key in ("po_ref_number", "customer_name", "date_from", "date_to"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    try:
+        resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params=params)
+        body, status_code = _proxy_json(resp)
+        if status_code != 200:
+            return jsonify(body), status_code
+        headers = body.get("data") or []
+        details = body.get("detail_data") or []
+        _enrich_document_ai_status(headers)
+        return jsonify({"headers": headers, "details": details})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
+def _bq_lines_for_po(details: list, po_ref: str) -> list:
+    """BigQuery int_document_ai_detail rows (snake_case) -> the camelCase shape a
+    so_buffer_{env} doc's `lines` are expected to carry — same mapping
+    _recover_lines_for_order already uses for BigQuery-sourced lines, extended with
+    deliveryDate since a freshly-buffered order (not a line-recovery patch onto an
+    existing one) needs it for header-level date fallbacks the worker reads."""
+    return [{
+        "customerSKUCode": d.get("customer_sku_code"),
+        "customerSKUDesc": d.get("customer_sku_desc"),
+        "poQty": d.get("po_qty"),
+        "poQtyPcs": d.get("po_qty_pcs"),
+        "unitOfMeasurement": d.get("unit_of_measurement"),
+        "unitPrice": d.get("unit_price"),
+        "unitPricePcs": d.get("unit_price_pcs"),
+        "netPrice": d.get("net_price"),
+        "deliveryDate": d.get("delivery_date"),
+    } for d in details if d.get("po_ref_number") == po_ref]
+
+
+@app.route("/api/bigquery/insert-and-buffer", methods=["POST"])
+def api_bigquery_insert_and_buffer():
+    """Insert caller-selected int_document_ai/int_document_ai_detail rows into MSSQL
+    (CustomerPOULBQ/CustomerPOULDetailBQ — promoted into the clean CustomerPOUL/
+    CustomerPOULDetail tables by BC's own AFTER INSERT trigger), then unconditionally
+    place each one straight into the Firestore SO-import buffer for human review.
+
+    Deliberately skips any automatic BC-import attempt — every PO surfaced through this
+    lookup lands in the buffer first, always, regardless of whether it could have
+    auto-resolved; that's the whole point of routing it through here instead of the
+    normal automated bridge.
+    """
+    data = request.get_json(silent=True) or {}
+    headers = data.get("headers") or []
+    details = data.get("details") or []
+    created_by = (data.get("created_by") or "").strip()
+    if not headers:
+        return jsonify({"error": "headers must not be empty"}), 400
+
+    try:
+        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery", json={"headers": headers, "details": details})
+        body, status_code = _proxy_json(resp)
+        if status_code != 200 or body.get("status") != "success":
+            return jsonify({"error": body.get("message") or f"MSSQL insert failed ({status_code}): {body}"}), 502
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+    results = []
+    for h in headers:
+        po_ref = h.get("po_ref_number")
+        company = _resolve_bc_company(h.get("company_name"))
+        if not company:
+            results.append({
+                "po_ref": po_ref, "ok": False,
+                "detail": f"Inserted into MSSQL, but could not resolve a BC company from companyName={h.get('company_name')!r} — not added to any buffer.",
+            })
+            continue
+        buffer_header = {
+            "poRefNumber": po_ref,
+            "customerName": h.get("customer_name"),
+            "customerBranchName": h.get("customer_branch_name"),
+            "companyName": h.get("company_name"),
+            "poDate": h.get("po_date"),
+            "deliveryDate": h.get("delivery_date"),
+            "cancellationDate": h.get("cancellation_date"),
+            "remark": h.get("remark"),
+        }
+        try:
+            buf_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/manual-entry", json={
+                "header": buffer_header,
+                "lines": _bq_lines_for_po(details, po_ref),
+                "company": company,
+                "src_company": f"manual-bq-lookup:{company}",
+                "created_by": created_by,
+            })
+            buf_body, buf_status = _proxy_json(buf_resp)
+            if buf_status == 201:
+                results.append({"po_ref": po_ref, "ok": True, "detail": f"Inserted into MSSQL and added to the {company} buffer."})
+            else:
+                detail = buf_body.get("detail") or buf_body.get("error") or f"BC-API returned {buf_status}"
+                results.append({"po_ref": po_ref, "ok": False, "detail": f"Inserted into MSSQL, but buffer create failed: {detail}"})
+        except requests.RequestException as exc:
+            results.append({"po_ref": po_ref, "ok": False, "detail": f"Inserted into MSSQL, but buffer create request failed: {exc}"})
+
+    return jsonify({"data": results, "total": len(results), "ok_count": sum(1 for r in results if r["ok"])})
 
 
 def _employee_notify_params(data: dict):

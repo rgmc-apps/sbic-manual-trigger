@@ -79,6 +79,7 @@
           <button class="action-tab-btn" data-action-tab="cloudsql" type="button">Cloud SQL</button>
           <button class="action-tab-btn" data-action-tab="history" type="button">History</button>
           <button class="action-tab-btn" data-action-tab="overrides" type="button">Overrides</button>
+          <button class="action-tab-btn" data-action-tab="bigquery" type="button">BigQuery Lookup</button>
         </div>
 
         <div class="action-tab-panel" id="action-panel-buffer">
@@ -233,6 +234,46 @@
           </p>
           <p class="status-line" id="overrides-status-line"></p>
           <div class="overrides-list" id="overrides-list"></div>
+        </div>
+
+        <div class="action-tab-panel hidden" id="action-panel-bigquery">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="bq-po-ref-input">PO Ref</label>
+              <input class="form-input" type="text" id="bq-po-ref-input" placeholder="Exact PO ref (optional)" />
+            </div>
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="bq-customer-input">Customer</label>
+              <input class="form-input" type="text" id="bq-customer-input" placeholder="Substring (optional)" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="bq-date-from">From</label>
+              <input class="form-input" type="date" id="bq-date-from" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="bq-date-to">To</label>
+              <input class="form-input" type="date" id="bq-date-to" />
+            </div>
+            <button class="btn-reprocess" id="bq-search-btn" type="button">
+              <span class="btn-spinner hidden" id="bq-search-spinner"></span>
+              <span id="bq-search-btn-label">Search</span>
+            </button>
+          </div>
+          <p class="details-hint sync-hint">
+            Searches BigQuery's <code>int_document_ai</code> (header) and <code>int_document_ai_detail</code> (lines)
+            directly — the raw Document AI-parsed record of a PO, independent of whether it ever made it into MSSQL
+            (<code>sbic_int</code>) or Business Central. Each result shows whether it's already in MSSQL and/or BC.
+            For one not yet in MSSQL, select it and use "Insert Selected" below to insert it into MSSQL
+            (<code>CustomerPOULBQ</code>/<code>CustomerPOULDetailBQ</code> — the same staging tables the automated
+            BigQuery bridge uses, promoted into the live tables by BC's own trigger) and place it straight into the
+            SO-import buffer for manual reconciliation — it is <strong>never</strong> auto-imported into BC directly.
+          </p>
+          <p class="status-line" id="bq-status-line"></p>
+          <div class="bq-results-list" id="bq-results-list"></div>
+          <div class="bq-insert-action hidden" id="bq-insert-action">
+            <button class="btn-reprocess btn-update-orders" id="bq-insert-btn" type="button" disabled>Insert Selected (0) into MSSQL + Buffer</button>
+          </div>
+          <div class="bq-insert-results hidden" id="bq-insert-results"></div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->
@@ -413,6 +454,28 @@
       </div>
       <div class="override-find-orders-status hidden"></div>
       <div class="override-find-orders-results hidden"></div>
+    </div>
+  </template>
+
+  <!-- BigQuery document-ai header row template -->
+  <template id="document-ai-row-template">
+    <div class="group-row bq-row">
+      <div class="group-head">
+        <div class="group-key-wrap bq-key-wrap">
+          <input type="checkbox" class="bq-row-check" />
+          <div>
+            <span class="group-key"></span>
+            <span class="group-desc"></span>
+          </div>
+        </div>
+        <div class="group-meta bq-status-badges">
+          <span class="bq-status-badge bq-status-bigquery">BigQuery</span>
+          <span class="bq-status-badge bq-status-mssql">MSSQL</span>
+          <span class="bq-status-badge bq-status-bc">BC</span>
+        </div>
+      </div>
+      <button class="btn-history-toggle bq-detail-toggle" type="button">Show detail lines</button>
+      <div class="bq-detail-lines hidden"></div>
     </div>
   </template>
 
