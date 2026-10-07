@@ -27,6 +27,10 @@
   const bqInsertBtn       = document.getElementById("bq-insert-btn");
   const bqInsertResults   = document.getElementById("bq-insert-results");
   const documentAiRowTemplate = document.getElementById("document-ai-row-template");
+  const bqMssqlPoRefInput    = document.getElementById("bq-mssql-po-ref-input");
+  const bqMssqlBufferBtn     = document.getElementById("bq-mssql-buffer-btn");
+  const bqMssqlStatusLine    = document.getElementById("bq-mssql-status-line");
+  const bqMssqlResults       = document.getElementById("bq-mssql-results");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
   const soUpdateModalTbody     = document.getElementById("so-update-modal-tbody");
@@ -2005,5 +2009,66 @@
       bqInsertBtn.disabled = false;
       bqInsertBtn.textContent = origLabel;
     }
+  });
+
+  // ── "Already in MSSQL? Add to buffer only" ───────────────────────────────────
+  // For a PO manually encoded straight into CustomerPOUL/CustomerPOULDetail (SBIC's
+  // legacy app) — never goes through Document AI/BigQuery, so it can never be found by
+  // the search above. Fetches CustomerPOUL/CustomerPOULDetail directly server-side and
+  // buffers it with no MSSQL insert step at all (nothing to insert — it's already there).
+  function setBqMssqlStatus(msg, isError) {
+    bqMssqlStatusLine.textContent = msg || "";
+    bqMssqlStatusLine.classList.toggle("error", !!isError);
+  }
+
+  async function addToBufferOnly() {
+    if (!refreshGate()) {
+      setBqMssqlStatus("Fill in your details above first.", true);
+      return;
+    }
+    const poRefsRaw = bqMssqlPoRefInput.value.trim();
+    if (!poRefsRaw) {
+      setBqMssqlStatus("Enter at least one PO ref.", true);
+      return;
+    }
+    if (!confirm(
+      "This will look up each PO ref directly in CustomerPOUL/CustomerPOULDetail (not BigQuery) and place it " +
+      "straight into the SO-import buffer — no MSSQL insert, since it's already there. Continue?"
+    )) return;
+
+    bqMssqlBufferBtn.disabled = true;
+    setBtnLoading("bq-mssql-buffer-spinner", "bq-mssql-buffer-btn-label", true, "Adding…");
+    try {
+      const res = await fetch("/api/mssql/buffer-only", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ po_refs: poRefsRaw, employee: getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Request failed");
+      const results = data.data || [];
+      const statusIcon = { buffered: "✅", blocked: "⛔", failed: "❌" };
+      bqMssqlResults.innerHTML = results.map((r) => `
+        <div class="update-result-row ${r.status === "buffered" ? "ok" : r.status === "blocked" ? "blocked" : "fail"}">
+          <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
+          <span>${statusIcon[r.status] || "?"} ${escapeHtml(r.detail)}</span>
+        </div>
+      `).join("");
+      bqMssqlResults.classList.remove("hidden");
+      setBqMssqlStatus(
+        `${data.ok_count} added to buffer, ${data.blocked_count} already in BC ` +
+        `(blocked, recorded to history), ${data.total - data.ok_count - data.blocked_count} failed.`
+      );
+    } catch (e) {
+      setBqMssqlStatus("Error: " + e.message, true);
+    } finally {
+      bqMssqlBufferBtn.disabled = false;
+      setBtnLoading("bq-mssql-buffer-spinner", "bq-mssql-buffer-btn-label", false);
+    }
+  }
+
+  bqMssqlBufferBtn.addEventListener("click", addToBufferOnly);
+  bqMssqlPoRefInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) addToBufferOnly();
   });
 })();

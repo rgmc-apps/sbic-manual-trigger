@@ -279,6 +279,30 @@
             <button class="btn-reprocess btn-update-orders" id="bq-insert-btn" type="button" disabled>Insert Selected (0) into MSSQL + Buffer</button>
           </div>
           <div class="bq-insert-results hidden" id="bq-insert-results"></div>
+
+          <div class="bq-mssql-only-section">
+            <h4 class="bq-mssql-only-title">Already in MSSQL? Add to buffer only</h4>
+            <p class="details-hint sync-hint">
+              For a PO manually encoded straight into <code>CustomerPOUL</code>/<code>CustomerPOULDetail</code> through
+              SBIC's legacy app — it never goes through Document AI/BigQuery, so it will <strong>never</strong> show up
+              in the search above no matter what you search for. This fetches it directly from
+              <code>CustomerPOUL</code>/<code>CustomerPOULDetail</code> instead and places it straight into the
+              SO-import buffer — no MSSQL insert happens, since it's already there. The same BC-existence check still
+              applies: a PO that already has a Sales Order is recorded to the History tab instead of buffered again.
+            </p>
+            <div class="toolbar">
+              <div class="form-group toolbar-select">
+                <label class="form-label" for="bq-mssql-po-ref-input">PO Ref(s) already in MSSQL</label>
+                <textarea class="form-input bq-po-ref-textarea" id="bq-mssql-po-ref-input" rows="1" placeholder="One or more exact PO refs — comma, space, or newline separated. Ctrl+Enter to submit."></textarea>
+              </div>
+              <button class="btn-reprocess" id="bq-mssql-buffer-btn" type="button">
+                <span class="btn-spinner hidden" id="bq-mssql-buffer-spinner"></span>
+                <span id="bq-mssql-buffer-btn-label">Add to Buffer Only</span>
+              </button>
+            </div>
+            <p class="status-line" id="bq-mssql-status-line"></p>
+            <div class="bq-insert-results hidden" id="bq-mssql-results"></div>
+          </div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->

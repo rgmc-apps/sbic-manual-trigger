@@ -1,4 +1,5 @@
 import os
+import re
 import smtplib
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -1132,6 +1133,150 @@ def _fetch_existing_bc_order(company: str, po_ref: str) -> tuple:
         return order.get("number"), len(order.get("salesOrderLines") or [])
     except requests.RequestException:
         return None, 0
+
+
+def _customerpoul_header_to_buffer_header(row: dict) -> dict:
+    """CustomerPOUL is already camelCase (it IS the table the worker reads natively) —
+    this just picks the specific fields a buffer doc's header needs, same field set as
+    _bq_header_to_buffer_header, plus customerBranchLookUpCode (genuinely available
+    here, unlike from BigQuery) since the worker's ship-to matching falls back to it."""
+    return {
+        "poRefNumber": row.get("poRefNumber"),
+        "customerName": row.get("customerName"),
+        "customerBranchName": row.get("customerBranchName"),
+        "customerBranchLookUpCode": row.get("customerBranchLookUpCode"),
+        "companyName": row.get("companyName"),
+        "poDate": row.get("poDate"),
+        "deliveryDate": row.get("deliveryDate"),
+        "cancellationDate": row.get("cancellationDate"),
+        "remark": row.get("remark"),
+    }
+
+
+def _customerpouldetail_rows_to_buffer_lines(rows: list) -> list:
+    """CustomerPOULDetail (unlike CustomerPOULDetailBQ) is a reduced-column mirror —
+    missing fields (e.g. unitOfMeasurement) just come back None here; there's no richer
+    source to fall back to for a PO that was never staged into the BQ tables at all."""
+    return [{
+        "customerSKUCode": r.get("customerSKUCode"),
+        "customerSKUDesc": r.get("customerSKUDesc"),
+        "poQty": r.get("poQty"),
+        "poQtyPcs": r.get("poQtyPcs"),
+        "unitOfMeasurement": r.get("unitOfMeasurement"),
+        "unitPrice": r.get("unitPrice"),
+        "unitPricePcs": r.get("unitPricePcs"),
+        "netPrice": r.get("netPrice"),
+        "deliveryDate": r.get("deliveryDate"),
+    } for r in rows]
+
+
+@app.route("/api/mssql/buffer-only", methods=["POST"])
+def api_mssql_buffer_only():
+    """For a PO already sitting in MSSQL (CustomerPOUL/CustomerPOULDetail) with no
+    BigQuery record at all — e.g. one manually encoded through SBIC's legacy app, which
+    never goes through Document AI/BigQuery and so can never show up in the BigQuery
+    lookup search above — fetch it directly from CustomerPOUL/CustomerPOULDetail and
+    place it straight into the SO-import buffer. No MSSQL insert happens here; there's
+    nothing to insert, it's already there.
+
+    Same BC-existence blocker as /api/bigquery/insert-and-buffer: a PO that already has
+    a Sales Order is recorded to so_buffer_history_{env} instead of buffered again,
+    with the same existing-order line-count check.
+    """
+    data = request.get_json(silent=True) or {}
+    po_refs = [p for p in re.split(r"[,\s]+", (data.get("po_refs") or "").strip()) if p]
+    employee = data.get("employee") or {}
+    triggered_by = {
+        "name": employee.get("employee_name") or "",
+        "company": employee.get("employee_company") or "",
+        "department": employee.get("employee_department") or "",
+        "email": employee.get("email") or "",
+    } if employee else None
+    if not po_refs:
+        return jsonify({"error": "po_refs is required"}), 400
+
+    results = []
+    for po_ref in po_refs:
+        try:
+            resp = _gcp_api("GET", f"/customerpoul/{po_ref}")
+            body, status_code = _proxy_json(resp)
+        except requests.RequestException as exc:
+            results.append({"po_ref": po_ref, "status": "failed", "detail": f"Could not reach rgmc-gcp-api: {exc}"})
+            continue
+        if status_code == 404 or not (body.get("data") or []):
+            results.append({"po_ref": po_ref, "status": "failed", "detail": "Not found in CustomerPOUL — nothing to buffer."})
+            continue
+        if status_code != 200:
+            results.append({"po_ref": po_ref, "status": "failed", "detail": body.get("detail") or f"CustomerPOUL lookup failed ({status_code})"})
+            continue
+        header_row = body["data"][0]  # most recent, per CustomerPOUL's own ORDER BY customerPOId DESC
+
+        lines_rows = []
+        try:
+            lresp = _gcp_api("GET", f"/customerpouldetail/{po_ref}")
+            lbody, lstatus = _proxy_json(lresp)
+            if lstatus == 200:
+                lines_rows = lbody.get("data") or []
+            # 404 (no detail rows) is left as an empty-lines buffer entry, same
+            # tolerance _create_order already has for a header with zero lines —
+            # not treated as a reason to skip buffering the header altogether.
+        except requests.RequestException:
+            pass
+
+        company = _resolve_bc_company(header_row.get("companyName"))
+        if not company:
+            results.append({
+                "po_ref": po_ref, "status": "failed",
+                "detail": f"Could not resolve a BC company from companyName={header_row.get('companyName')!r} — nothing buffered.",
+            })
+            continue
+
+        buffer_header = _customerpoul_header_to_buffer_header(header_row)
+        buffer_lines = _customerpouldetail_rows_to_buffer_lines(lines_rows)
+
+        so_number, bc_line_count = _fetch_existing_bc_order(company, po_ref)
+        if so_number:
+            lines_complete = bc_line_count >= len(buffer_lines)
+            outcome = "resolved" if lines_complete else "still_buffered"
+            note = (
+                f"Already exists in BC as {so_number} — not added to the buffer. Lines: {bc_line_count}/{len(buffer_lines)} present."
+                if lines_complete else
+                f"Already exists in BC as {so_number} — not added to the buffer, but only {bc_line_count}/{len(buffer_lines)} "
+                f"lines are present. Use \"Sync from Cloud SQL\" to backfill the missing ones."
+            )
+            try:
+                _bc_api("POST", "/bc/custom/v2/so-buffer/history/manual-entry", json={
+                    "header": buffer_header, "lines": buffer_lines, "company": company,
+                    "outcome": outcome, "triggered_by": triggered_by, "so_number": so_number,
+                    "detail": f"Blocked from the buffer by MSSQL-sourced manual insert — {note}",
+                })
+            except requests.RequestException:
+                pass  # best-effort — the block itself still applies even if logging it fails
+            results.append({"po_ref": po_ref, "status": "blocked", "detail": note})
+            continue
+
+        try:
+            buf_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/manual-entry", json={
+                "header": buffer_header,
+                "lines": buffer_lines,
+                "company": company,
+                "src_company": f"manual-mssql-lookup:{company}",
+                "created_by": triggered_by.get("name") if triggered_by else "",
+            })
+            buf_body, buf_status = _proxy_json(buf_resp)
+            if buf_status == 201:
+                results.append({"po_ref": po_ref, "status": "buffered", "detail": f"Already in MSSQL — added to the {company} buffer."})
+            else:
+                detail = buf_body.get("detail") or buf_body.get("error") or f"BC-API returned {buf_status}"
+                results.append({"po_ref": po_ref, "status": "failed", "detail": f"Buffer create failed: {detail}"})
+        except requests.RequestException as exc:
+            results.append({"po_ref": po_ref, "status": "failed", "detail": f"Buffer create request failed: {exc}"})
+
+    return jsonify({
+        "data": results, "total": len(results),
+        "ok_count": sum(1 for r in results if r["status"] == "buffered"),
+        "blocked_count": sum(1 for r in results if r["status"] == "blocked"),
+    })
 
 
 @app.route("/api/bigquery/insert-and-buffer", methods=["POST"])
