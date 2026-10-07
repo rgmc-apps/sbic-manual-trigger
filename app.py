@@ -155,12 +155,19 @@ def _error_email_body(process: dict, name: str, department: str, timestamp: str,
 # ---------------------------------------------------------------------------
 
 def _bc_api(method: str, path: str, **kwargs):
-    resp = requests.request(method, f"{BC_API_BASE}{path}", timeout=API_TIMEOUT, **kwargs)
+    # setdefault, not a hardcoded kwarg — a caller passing its own timeout= used to
+    # collide with this one ("got multiple values for keyword argument 'timeout'"),
+    # which is exactly why every route was stuck at API_TIMEOUT with no way to ask for
+    # longer on a call that's known to need it (e.g. BigQuery queries — see _gcp_api's
+    # document-ai/search caller).
+    kwargs.setdefault("timeout", API_TIMEOUT)
+    resp = requests.request(method, f"{BC_API_BASE}{path}", **kwargs)
     return resp
 
 
 def _gcp_api(method: str, path: str, **kwargs):
-    resp = requests.request(method, f"{GCP_API_BASE}{path}", timeout=API_TIMEOUT, **kwargs)
+    kwargs.setdefault("timeout", API_TIMEOUT)
+    resp = requests.request(method, f"{GCP_API_BASE}{path}", **kwargs)
     return resp
 
 
@@ -1054,7 +1061,11 @@ def api_bigquery_document_ai_search():
         if value:
             params[key] = value
     try:
-        resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params=params)
+        # Two live BigQuery query executions happen server-side for one of these calls
+        # (header, then detail) — slower and far more variable than every other call
+        # this app makes, so it gets its own longer timeout instead of API_TIMEOUT's
+        # 30s (already too short in practice — confirmed by a live read-timeout error).
+        resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params=params, timeout=90)
         body, status_code = _proxy_json(resp)
         if status_code != 200:
             return jsonify(body), status_code
@@ -1105,7 +1116,10 @@ def api_bigquery_insert_and_buffer():
         return jsonify({"error": "headers must not be empty"}), 400
 
     try:
-        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery", json={"headers": headers, "details": details})
+        # Same reasoning as the search route above — an MSSQL insert (then whatever the
+        # AFTER INSERT trigger does) is slower and less predictable than this app's
+        # usual calls.
+        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery", json={"headers": headers, "details": details}, timeout=90)
         body, status_code = _proxy_json(resp)
         if status_code != 200 or body.get("status") != "success":
             return jsonify({"error": body.get("message") or f"MSSQL insert failed ({status_code}): {body}"}), 502
