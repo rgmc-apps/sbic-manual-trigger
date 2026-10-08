@@ -29,8 +29,12 @@ API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 # else untouched, straight into the INSERT statement.
 BQ_UI_ONLY_HEADER_FIELDS = ("_source", "in_mssql", "in_bc")
 
-# BC company codes this UI knows about, for the company picker.
-RECONCILE_COMPANIES = ["SBIC", "MTC"]
+# BC company codes this UI knows about, for the company picker. MTC (Manila Taste
+# Curators) removed 2026-10-08 — confirmed live that no "MTC" company exists in BC
+# Production at all (GET /bc/companies lists SBIC, KW1, etc., no MTC), so every
+# MTC-targeted action here would just 500. Re-add once BC Production actually has
+# a company to route MTC to (its own, or an existing one it should post under).
+RECONCILE_COMPANIES = ["SBIC"]
 
 # Company routing rule mirrored from rgmc-gcp-api's CustomerPOUL.py (mssql_bc_mapping.txt
 # §5) — duplicated here (small, static table) rather than round-tripping through another
