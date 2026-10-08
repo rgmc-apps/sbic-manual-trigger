@@ -33,7 +33,59 @@ body { background: var(--bg); }
 .btn-print:hover { background: var(--brand-dark); }
 .btn-print:active { transform: scale(.97); }
 
+.report-header-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.btn-buffer-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-size: .85rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background var(--transition), border-color var(--transition);
+}
+.btn-buffer-link:hover { background: var(--bg); border-color: var(--brand); }
+
 .report-error-card p { color: var(--text-muted); }
+
+/* ── Your Details mini-gate (only needed for Quick Align) ── */
+.report-gate-card { padding-bottom: 24px; }
+.details-hint { font-size: .8125rem; color: var(--text-muted); margin-top: -10px; margin-bottom: 18px; }
+
+/* ── Quick Align (mirrors reconcile.css's .btn-quick-align/.btn-spinner) ── */
+.btn-spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  opacity: .7;
+  animation: btn-spin .7s linear infinite;
+}
+@keyframes btn-spin { to { transform: rotate(360deg); } }
+.btn-quick-align {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--brand);
+  background: var(--card);
+  color: var(--brand-dark);
+  font-size: .78rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition), color var(--transition);
+}
+.btn-quick-align:hover:not(:disabled) { background: var(--brand); color: #fff; }
+.btn-quick-align:disabled { opacity: .6; cursor: not-allowed; }
+.report-align-cell { min-width: 140px; }
+.bq-align-result { margin-top: 6px; font-size: .78rem; display: flex; flex-direction: column; gap: 3px; }
 
 /* ── Summary stat chips ── */
 .report-summary-card { display: flex; gap: 14px; flex-wrap: wrap; }

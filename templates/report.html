@@ -48,7 +48,38 @@
         {% if c.date_from or c.date_to %}<span class="criteria-chip">Date: {{ c.date_from or "…" }} to {{ c.date_to or "…" }}</span>{% endif %}
         {% if not (c.po_ref_number or c.customer_name or c.date_from or c.date_to) %}<span class="criteria-chip">No search filters (all recent results)</span>{% endif %}
       </div>
-      <button class="btn-print no-print" id="print-btn" type="button">🖨️ Print / Save as PDF</button>
+      <div class="report-header-actions no-print">
+        <button class="btn-print" id="print-btn" type="button">🖨️ Print / Save as PDF</button>
+        {% set companies = report.rows | map(attribute="company") | select | unique | list %}
+        {% for co in companies %}
+        <a class="btn-buffer-link" href="/reconcile?tab=buffer&company={{ co }}" target="_blank" rel="noopener">📂 Open Buffer tab — {{ co }}</a>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="card report-gate-card no-print" id="report-gate-card">
+      <h2 class="card-title">Your Details</h2>
+      <p class="details-hint">Only needed to use <strong>⚡ Quick Align</strong> below (so results get emailed to you and logged under your name) — not required just to view this report.</p>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="employee-name">Full Name <span class="required">*</span></label>
+          <input class="form-input" type="text" id="employee-name" placeholder="e.g. Juan dela Cruz" autocomplete="name" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="employee-company">Company <span class="required">*</span></label>
+          <input class="form-input" type="text" id="employee-company" placeholder="e.g. SBIC" autocomplete="organization" />
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label" for="employee-department">Department <span class="required">*</span></label>
+          <input class="form-input" type="text" id="employee-department" placeholder="e.g. Finance" autocomplete="organization-title" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="employee-email">Email Address <span class="required">*</span></label>
+          <input class="form-input" type="email" id="employee-email" placeholder="e.g. juan.delacruz@rgmcgroup.com" autocomplete="email" />
+        </div>
+      </div>
     </section>
 
     {% set rows = report.rows or [] %}
@@ -84,11 +115,12 @@
               <th>MSSQL</th>
               <th>BC (lines)</th>
               <th>Steps to align</th>
+              <th class="no-print">Action</th>
             </tr>
           </thead>
           <tbody>
             {% for r in rows %}
-            <tr class="report-row report-row-{{ r.status }}">
+            <tr class="report-row report-row-{{ r.status }}" data-po-ref="{{ r.po_ref_number or '' }}">
               <td class="report-po-ref">{{ r.po_ref_number or "—" }}</td>
               <td>
                 <div>{{ r.customer_name or "—" }}</div>
@@ -102,7 +134,21 @@
               <td>
                 {% if r.in_bc %}{{ r.so_number }} ({{ r.lines_present }}/{{ r.lines_total }}){% else %}✗{% endif %}
               </td>
-              <td class="report-action">{{ r.action }}</td>
+              <td class="report-action">
+                {{ r.action }}
+                {% if r.buffer_url %}<div class="report-sub"><a href="{{ r.buffer_url }}" target="_blank" rel="noopener">Open Buffer tab — {{ r.company }} →</a></div>{% endif %}
+                <div class="bq-align-result hidden"></div>
+              </td>
+              <td class="no-print report-align-cell">
+                {% if r.status in ("not_in_bc", "lines_missing") %}
+                <button class="btn-quick-align" type="button" data-po-ref="{{ r.po_ref_number }}">
+                  <span class="btn-spinner hidden"></span>
+                  <span class="btn-quick-align-label">⚡ Quick Align</span>
+                </button>
+                {% else %}
+                <span class="report-sub">—</span>
+                {% endif %}
+              </td>
             </tr>
             {% endfor %}
           </tbody>
@@ -118,12 +164,123 @@
     SBIC &mdash; AI Upload Services &mdash; RGMC IT/MIS Department
   </footer>
 
+  {% if not error %}
+  <script id="report-headers-data" type="application/json">{{ (report.headers or []) | tojson }}</script>
+  <script id="report-details-data" type="application/json">{{ (report.details or []) | tojson }}</script>
   <script>
     (function () {
-      var btn = document.getElementById("print-btn");
-      if (btn) btn.addEventListener("click", function () { window.print(); });
+      "use strict";
+
+      var printBtn = document.getElementById("print-btn");
+      if (printBtn) printBtn.addEventListener("click", function () { window.print(); });
+
+      // Same storage key /reconcile's own gate uses — a browser that's already used
+      // /reconcile has these pre-filled here too, and whatever's entered here is
+      // equally usable back there.
+      var EMPLOYEE_STORAGE_KEY = "sbic_reconcile_employee_details";
+      var fields = {
+        name: document.getElementById("employee-name"),
+        company: document.getElementById("employee-company"),
+        department: document.getElementById("employee-department"),
+        email: document.getElementById("employee-email"),
+      };
+      var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+      function loadEmployee() {
+        try {
+          var saved = JSON.parse(localStorage.getItem(EMPLOYEE_STORAGE_KEY) || "{}");
+          Object.keys(fields).forEach(function (k) { if (saved[k]) fields[k].value = saved[k]; });
+        } catch (e) { /* corrupt/blocked storage — start blank */ }
+      }
+      function saveEmployee() {
+        try {
+          var values = {};
+          Object.keys(fields).forEach(function (k) { values[k] = fields[k].value.trim(); });
+          localStorage.setItem(EMPLOYEE_STORAGE_KEY, JSON.stringify(values));
+        } catch (e) { /* storage unavailable — just won't persist */ }
+      }
+      function employeeValid() {
+        return fields.name.value.trim() && fields.company.value.trim() &&
+          fields.department.value.trim() && EMAIL_RE.test(fields.email.value.trim());
+      }
+      function getEmployee() {
+        return {
+          employee_name: fields.name.value.trim(),
+          employee_company: fields.company.value.trim(),
+          employee_department: fields.department.value.trim(),
+          email: fields.email.value.trim(),
+        };
+      }
+      Object.keys(fields).forEach(function (k) { fields[k].addEventListener("input", saveEmployee); });
+      loadEmployee();
+
+      function escapeHtml(s) {
+        return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      var headers = [];
+      var details = [];
+      try { headers = JSON.parse(document.getElementById("report-headers-data").textContent || "[]"); } catch (e) {}
+      try { details = JSON.parse(document.getElementById("report-details-data").textContent || "[]"); } catch (e) {}
+
+      var ICON = {
+        inserted: "✅", merged: "✅", triggered: "✅", aligned: "✅",
+        blocked: "⛔", unknown: "❓", not_found: "❓", failed: "❌",
+      };
+
+      document.querySelectorAll(".btn-quick-align").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var poRef = btn.dataset.poRef;
+          var resultEl = btn.closest("tr").querySelector(".bq-align-result");
+          if (!employeeValid()) {
+            resultEl.innerHTML = '<div>❌ Fill in Your Details above first (name, company, department, email).</div>';
+            resultEl.classList.remove("hidden");
+            document.getElementById("report-gate-card").scrollIntoView({ behavior: "smooth", block: "center" });
+            return;
+          }
+          var header = headers.find(function (h) { return h.po_ref_number === poRef; });
+          if (!header) {
+            resultEl.innerHTML = '<div>❌ This report has no source data saved for this PO — re-run the search on the BigQuery Lookup tab instead.</div>';
+            resultEl.classList.remove("hidden");
+            return;
+          }
+          var lines = details.filter(function (d) { return d.po_ref_number === poRef; });
+          var spinner = btn.querySelector(".btn-spinner");
+          var label = btn.querySelector(".btn-quick-align-label");
+
+          btn.disabled = true;
+          spinner.classList.remove("hidden");
+          label.textContent = "Aligning…";
+          fetch("/api/bigquery/quick-align", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ headers: [header], details: lines, employee: getEmployee() }),
+          })
+            .then(function (res) { return res.json().then(function (data) { return { res: res, data: data }; }); })
+            .then(function (r) {
+              if (!r.res.ok) throw new Error(r.data.error || r.data.detail || "Quick Align failed");
+              var results = r.data.data || [];
+              resultEl.innerHTML = results.map(function (row) {
+                return "<div>" + (ICON[row.status] || "❓") + " " + escapeHtml(row.detail) + "</div>";
+              }).join("") || "<div>Nothing to align.</div>";
+              resultEl.classList.remove("hidden");
+            })
+            .catch(function (e) {
+              resultEl.innerHTML = "<div>❌ " + escapeHtml(e.message) + "</div>";
+              resultEl.classList.remove("hidden");
+            })
+            .finally(function () {
+              btn.disabled = false;
+              spinner.classList.add("hidden");
+              label.textContent = "⚡ Quick Align";
+            });
+        });
+      });
     })();
   </script>
+  {% endif %}
 
 </body>
 </html>

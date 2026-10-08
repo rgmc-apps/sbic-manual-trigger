@@ -1063,6 +1063,25 @@
 
   loadBtn.addEventListener("click", loadBuffer);
 
+  // Deep link from the BC Alignment Report's "Open Buffer tab — {company}" links
+  // (?tab=buffer&company=SBIC) — jumps straight to that tab with the company
+  // pre-selected and the buffer loaded, instead of making someone click through
+  // manually. loadBuffer() itself still requires Your Details to be filled in first.
+  (function applyDeepLinkFromQuery() {
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get("tab");
+    const company = params.get("company");
+    if (tab && document.querySelector(`.action-tab-btn[data-action-tab="${tab}"]`)) {
+      activateActionTab(tab);
+    }
+    if (company) {
+      [companySelect, cloudsqlCompanySelect, overridesCompanySelect].forEach((sel) => {
+        if (sel && [...sel.options].some((o) => o.value === company)) sel.value = company;
+      });
+      if (tab === "buffer" || !tab) loadBuffer();
+    }
+  })();
+
   // ── Reprocess: trigger + watch ───────────────────────────────────────────
   // The trigger only kicks off an async worker-pool job. Primary signal: poll
   // rgmc-worker-pool's actual run status (ongoing/done/error), written to

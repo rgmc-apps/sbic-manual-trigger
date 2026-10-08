@@ -1257,6 +1257,11 @@ def _bq_report_row(h: dict, details: list) -> dict:
     if company:
         so_number, bc_line_count = _fetch_existing_bc_order(company, po_ref)
 
+    buffer_followup = (
+        "If any SKU/branch/customer still can't be auto-matched, it lands (or stays) in the buffer — "
+        "resolve it on the Buffer tab's Items/Branches/Customers lists, then Reprocess Buffer again."
+    )
+
     if not company:
         status, action = "failed", f"Could not resolve a BC company from companyName={h.get('company_name')!r} — check this PO manually."
     elif so_number and bc_line_count >= total_lines:
@@ -1265,7 +1270,7 @@ def _bq_report_row(h: dict, details: list) -> dict:
         status = "lines_missing"
         action = (
             f"BC order {so_number} is missing lines ({bc_line_count}/{total_lines} present). Go to the "
-            f"Cloud SQL tab, select {company}, and click \"Sync from Cloud SQL\" to backfill the rest."
+            f"Cloud SQL tab, select {company}, and click \"Sync from Cloud SQL\" to backfill the rest. {buffer_followup}"
         )
     elif in_mssql is None:
         status, action = "unknown", "Could not confirm MSSQL status — re-run the search in BigQuery Lookup before acting on this row."
@@ -1274,7 +1279,7 @@ def _bq_report_row(h: dict, details: list) -> dict:
         buffer_note = "buffers it directly, no MSSQL insert needed" if (not in_bigquery or in_mssql) else "inserts it into MSSQL and buffers it"
         action = (
             f"Not yet in BC. In the BigQuery Lookup tab, select this PO and click \"Add Selected to Buffer\" "
-            f"({buffer_note}), then go to the Buffer tab, select {company}, and click \"Reprocess Buffer\"."
+            f"({buffer_note}), then go to the Buffer tab, select {company}, and click \"Reprocess Buffer\". {buffer_followup}"
         )
 
     return {
@@ -1292,6 +1297,7 @@ def _bq_report_row(h: dict, details: list) -> dict:
         "lines_total": total_lines,
         "status": status,
         "action": action,
+        "buffer_url": f"/reconcile?tab=buffer&company={company}" if company else None,
     }
 
 
@@ -1308,7 +1314,7 @@ def _build_bq_report_rows(headers: list, details: list, requested_refs: list) ->
             "company_name": None, "company": None, "po_date": None,
             "in_bigquery": False, "in_mssql": False, "in_bc": False,
             "so_number": None, "lines_present": None, "lines_total": None,
-            "status": "not_found",
+            "status": "not_found", "buffer_url": None,
             "action": "Not found in BigQuery or MSSQL — verify the PO ref number, or wait for Document AI to process it.",
         })
     return rows
@@ -1320,8 +1326,9 @@ def api_bigquery_report():
     search results — one row per PO with its BigQuery/MSSQL/BC status and a plain
     recommended next step naming the exact tab/button on this page that fixes it.
     BigQuery is always treated as the source of truth (see _bq_report_row). Saved to
-    rgmc-bc-api so a person-in-charge can open the resulting link without needing
-    /reconcile access — this never applies anything to MSSQL/BC itself.
+    rgmc-bc-api, including the raw headers/details (not just the computed rows), so
+    the report page's own Quick Align buttons can act directly from the shared link —
+    generating the report itself never applies anything to MSSQL/BC.
     """
     data = request.get_json(silent=True) or {}
     headers = data.get("headers") or []
@@ -1342,6 +1349,7 @@ def api_bigquery_report():
     try:
         resp = _bc_api("POST", "/bc/custom/v2/bq-lookup-reports", json={
             "criteria": criteria, "rows": rows, "generated_by": generated_by,
+            "headers": headers, "details": details,
         })
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
