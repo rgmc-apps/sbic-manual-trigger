@@ -21,6 +21,13 @@ BC_API_BASE = os.environ.get("BC_API_BASE", "https://rgmc-bc-api-prod-9352463724
 GCP_API_BASE = os.environ.get("GCP_API_BASE", "https://rgmc-gcp-api-935246372408.asia-southeast1.run.app")
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 
+# Display-only fields _enrich_document_ai_status/the BigQuery search route stamp onto
+# each header for the UI — never real int_document_ai columns. Must be stripped before
+# a header dict is sent on to rgmc-gcp-api's MSSQL insert (see api_bigquery_insert_and_buffer),
+# since __rename_columns there only renames columns it recognizes and leaves everything
+# else untouched, straight into the INSERT statement.
+BQ_UI_ONLY_HEADER_FIELDS = ("_source", "in_mssql", "in_bc")
+
 # BC company codes this UI knows about, for the company picker.
 RECONCILE_COMPANIES = ["SBIC", "MTC"]
 
@@ -1257,6 +1264,12 @@ def api_bigquery_insert_and_buffer():
     entry says so and points at "Sync from Cloud SQL" as the existing way to backfill
     missing lines. Everything else proceeds into the buffer exactly as before, never
     attempting an automatic BC import itself.
+
+    If the PO isn't blocked by BC but is already sitting in the buffer under its own
+    right (e.g. the worker already failed to import it), this never overwrites that
+    doc — it merges in only the detail lines not already present there (status
+    "merged" in the response), so attempt_count/last_error/resolved* already on it
+    survive untouched. See add_missing_lines_to_buffer in rgmc-bc-api.
     """
     data = request.get_json(silent=True) or {}
     headers = data.get("headers") or []
@@ -1278,12 +1291,15 @@ def api_bigquery_insert_and_buffer():
     if bq_headers:
         bq_refs = {h.get("po_ref_number") for h in bq_headers}
         bq_details = [d for d in details if d.get("po_ref_number") in bq_refs]
+        bq_headers_for_insert = [
+            {k: v for k, v in h.items() if k not in BQ_UI_ONLY_HEADER_FIELDS} for h in bq_headers
+        ]
         try:
             # Same reasoning as the search route above — an MSSQL insert (then
             # whatever the AFTER INSERT trigger does) is slower and less predictable
             # than this app's usual calls.
             resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
-                             json={"headers": bq_headers, "details": bq_details}, timeout=90)
+                             json={"headers": bq_headers_for_insert, "details": bq_details}, timeout=90)
             body, status_code = _proxy_json(resp)
             if status_code != 200 or body.get("status") != "success":
                 detail = body.get("message") or f"MSSQL insert failed ({status_code}): {body}"
@@ -1331,17 +1347,50 @@ def api_bigquery_insert_and_buffer():
             results.append({"po_ref": po_ref, "status": "blocked", "detail": note})
             continue
 
+        bq_lines = _bq_lines_for_po(details, po_ref)
+        prefix = "Already in MSSQL" if already_in_mssql else "Inserted into MSSQL"
+
+        # The PO may already be sitting in the buffer under its own right — e.g. the
+        # worker already tried and failed to import it, and save_failed_order beat this
+        # lookup to the same doc. Merging missing lines into that existing doc (never
+        # overwriting it — see add_missing_lines_to_buffer) preserves attempt_count/
+        # last_error/resolvedShipTo/resolvedCustomer/resolvedItem already on it; only a
+        # PO with no existing buffer doc at all falls through to a fresh create below.
+        try:
+            merge_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/merge-lines", json={
+                "po_ref_number": po_ref, "lines": bq_lines,
+            })
+        except requests.RequestException as exc:
+            results.append({"po_ref": po_ref, "status": "failed", "detail": f"Buffer merge check failed: {exc}"})
+            continue
+
+        if merge_resp.status_code == 200:
+            merge_body, _ = _proxy_json(merge_resp)
+            added = merge_body.get("lines_added", 0)
+            detail = (
+                f"{prefix}. Already in the {company} buffer — added {added} missing line(s)."
+                if added else
+                f"{prefix}. Already in the {company} buffer — all {len(bq_lines)} line(s) were already present, nothing added."
+            )
+            results.append({"po_ref": po_ref, "status": "merged", "detail": detail})
+            continue
+        elif merge_resp.status_code != 404:
+            merge_body, _ = _proxy_json(merge_resp)
+            detail = merge_body.get("detail") or merge_body.get("error") or f"BC-API returned {merge_resp.status_code}"
+            results.append({"po_ref": po_ref, "status": "failed", "detail": f"Buffer merge check failed: {detail}"})
+            continue
+        # else 404 — not yet buffered at all, fall through to a fresh create.
+
         try:
             buf_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/manual-entry", json={
                 "header": _bq_header_to_buffer_header(h),
-                "lines": _bq_lines_for_po(details, po_ref),
+                "lines": bq_lines,
                 "company": company,
                 "src_company": f"{'manual-mssql-lookup' if already_in_mssql else 'manual-bq-lookup'}:{company}",
                 "created_by": triggered_by.get("name") if triggered_by else "",
             })
             buf_body, buf_status = _proxy_json(buf_resp)
             if buf_status == 201:
-                prefix = "Already in MSSQL" if already_in_mssql else "Inserted into MSSQL"
                 results.append({"po_ref": po_ref, "status": "inserted", "detail": f"{prefix} — added to the {company} buffer."})
             else:
                 detail = buf_body.get("detail") or buf_body.get("error") or f"BC-API returned {buf_status}"
@@ -1351,7 +1400,7 @@ def api_bigquery_insert_and_buffer():
 
     return jsonify({
         "data": results, "total": len(results),
-        "ok_count": sum(1 for r in results if r["status"] == "inserted"),
+        "ok_count": sum(1 for r in results if r["status"] in ("inserted", "merged")),
         "blocked_count": sum(1 for r in results if r["status"] == "blocked"),
     })
 

@@ -2004,16 +2004,17 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Insert failed");
       const results = data.data || [];
-      const statusIcon = { inserted: "✅", blocked: "⛔", failed: "❌" };
+      const statusIcon = { inserted: "✅", merged: "➕", blocked: "⛔", failed: "❌" };
+      const rowClass = { inserted: "ok", merged: "ok", blocked: "blocked" };
       bqInsertResults.innerHTML = results.map((r) => `
-        <div class="update-result-row ${r.status === "inserted" ? "ok" : r.status === "blocked" ? "blocked" : "fail"}">
+        <div class="update-result-row ${rowClass[r.status] || "fail"}">
           <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
           <span>${statusIcon[r.status] || "?"} ${escapeHtml(r.detail)}</span>
         </div>
       `).join("");
       bqInsertResults.classList.remove("hidden");
       setBqStatus(
-        `${data.ok_count} added to the buffer, ${data.blocked_count} already in BC ` +
+        `${data.ok_count} added to the buffer (new or merged), ${data.blocked_count} already in BC ` +
         `(blocked, recorded to history), ${data.total - data.ok_count - data.blocked_count} failed. ` +
         `Re-run the search to refresh MSSQL/BC status.`
       );
