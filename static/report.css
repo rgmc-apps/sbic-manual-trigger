@@ -55,7 +55,7 @@ body { background: var(--bg); }
 .report-gate-card { padding-bottom: 24px; }
 .details-hint { font-size: .8125rem; color: var(--text-muted); margin-top: -10px; margin-bottom: 18px; }
 
-/* ── Quick Align (mirrors reconcile.css's .btn-quick-align/.btn-spinner) ── */
+/* ── Quick Align All (one button for the whole report) ── */
 .btn-spinner {
   display: inline-block;
   width: 13px;
@@ -67,25 +67,31 @@ body { background: var(--bg); }
   animation: btn-spin .7s linear infinite;
 }
 @keyframes btn-spin { to { transform: rotate(360deg); } }
-.btn-quick-align {
+.btn-quick-align-all {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
-  border-radius: 999px;
+  gap: 8px;
+  padding: 10px 18px;
+  border-radius: 10px;
   border: 1px solid var(--brand);
   background: var(--card);
   color: var(--brand-dark);
-  font-size: .78rem;
-  font-weight: 600;
+  font-size: .9rem;
+  font-weight: 700;
   cursor: pointer;
   white-space: nowrap;
   transition: background var(--transition), color var(--transition);
 }
-.btn-quick-align:hover:not(:disabled) { background: var(--brand); color: #fff; }
-.btn-quick-align:disabled { opacity: .6; cursor: not-allowed; }
-.report-align-cell { min-width: 140px; }
-.bq-align-result { margin-top: 6px; font-size: .78rem; display: flex; flex-direction: column; gap: 3px; }
+.btn-quick-align-all:hover:not(:disabled) { background: var(--brand); color: #fff; }
+.btn-quick-align-all:disabled { opacity: .6; cursor: not-allowed; }
+.status-line { font-size: .8125rem; color: var(--text-muted); margin-top: 10px; margin-bottom: 0; min-height: 18px; }
+.status-line.error { color: var(--error); }
+
+/* ── Steps to align — bulleted, with the key tool/value bolded via _b() server-side ── */
+.report-steps { margin: 0; padding-left: 18px; }
+.report-steps li { margin-bottom: 5px; }
+.report-steps li:last-child { margin-bottom: 0; }
+.report-async-note { margin-top: 6px; }
 
 /* ── Summary stat chips ── */
 .report-summary-card { display: flex; gap: 14px; flex-wrap: wrap; }

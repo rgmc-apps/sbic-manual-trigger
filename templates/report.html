@@ -33,6 +33,9 @@
     </section>
     {% else %}
 
+    {% set rows = report.rows or [] %}
+    {% set actionable_count = rows | selectattr("status", "in", ["not_in_bc", "lines_missing"]) | list | length %}
+
     <section class="card report-header-card print-title">
       <h1 class="report-print-title">BC Alignment Report</h1>
       <div class="report-meta">
@@ -50,16 +53,24 @@
       </div>
       <div class="report-header-actions no-print">
         <button class="btn-print" id="print-btn" type="button">🖨️ Print / Save as PDF</button>
-        {% set companies = report.rows | map(attribute="company") | select | unique | list %}
+        {% if actionable_count > 0 %}
+        <button class="btn-quick-align-all" id="quick-align-all-btn" type="button">
+          <span class="btn-spinner hidden" id="quick-align-all-spinner"></span>
+          <span id="quick-align-all-label">⚡ Quick Align All ({{ actionable_count }})</span>
+        </button>
+        {% endif %}
+        {% set companies = rows | map(attribute="company") | select | unique | list %}
         {% for co in companies %}
         <a class="btn-buffer-link" href="/reconcile?tab=buffer&company={{ co }}" target="_blank" rel="noopener">📂 Open Buffer tab — {{ co }}</a>
         {% endfor %}
       </div>
+      <p class="status-line no-print" id="quick-align-all-status"></p>
     </section>
 
+    {% if actionable_count > 0 %}
     <section class="card report-gate-card no-print" id="report-gate-card">
       <h2 class="card-title">Your Details</h2>
-      <p class="details-hint">Only needed to use <strong>⚡ Quick Align</strong> below (so results get emailed to you and logged under your name) — not required just to view this report.</p>
+      <p class="details-hint">Only needed to use <strong>⚡ Quick Align All</strong> above (so results get emailed to you and logged under your name) — not required just to view this report.</p>
       <div class="form-row">
         <div class="form-group">
           <label class="form-label" for="employee-name">Full Name <span class="required">*</span></label>
@@ -81,8 +92,8 @@
         </div>
       </div>
     </section>
+    {% endif %}
 
-    {% set rows = report.rows or [] %}
     {% set status_order = ["failed", "not_found", "unknown", "not_in_bc", "lines_missing", "aligned"] %}
     <section class="card report-summary-card no-print">
       {% for s in status_order %}
@@ -115,12 +126,11 @@
               <th>MSSQL</th>
               <th>BC (lines)</th>
               <th>Steps to align</th>
-              <th class="no-print">Action</th>
             </tr>
           </thead>
           <tbody>
             {% for r in rows %}
-            <tr class="report-row report-row-{{ r.status }}" data-po-ref="{{ r.po_ref_number or '' }}">
+            <tr class="report-row report-row-{{ r.status }}" data-po-ref="{{ r.po_ref_number or '' }}" data-company="{{ r.company or '' }}">
               <td class="report-po-ref">{{ r.po_ref_number or "—" }}</td>
               <td>
                 <div>{{ r.customer_name or "—" }}</div>
@@ -135,19 +145,12 @@
                 {% if r.in_bc %}{{ r.so_number }} ({{ r.lines_present }}/{{ r.lines_total }}){% else %}✗{% endif %}
               </td>
               <td class="report-action">
-                {{ r.action }}
+                <ul class="report-steps">
+                  {% for step in (r.action_steps or [r.action]) %}
+                  <li>{{ step | safe }}</li>
+                  {% endfor %}
+                </ul>
                 {% if r.buffer_url %}<div class="report-sub"><a href="{{ r.buffer_url }}" target="_blank" rel="noopener">Open Buffer tab — {{ r.company }} →</a></div>{% endif %}
-                <div class="bq-align-result hidden"></div>
-              </td>
-              <td class="no-print report-align-cell">
-                {% if r.status in ("not_in_bc", "lines_missing") %}
-                <button class="btn-quick-align" type="button" data-po-ref="{{ r.po_ref_number }}">
-                  <span class="btn-spinner hidden"></span>
-                  <span class="btn-quick-align-label">⚡ Quick Align</span>
-                </button>
-                {% else %}
-                <span class="report-sub">—</span>
-                {% endif %}
               </td>
             </tr>
             {% endfor %}
@@ -164,7 +167,8 @@
     SBIC &mdash; AI Upload Services &mdash; RGMC IT/MIS Department
   </footer>
 
-  {% if not error %}
+  {% if not error and actionable_count > 0 %}
+  <script id="report-rows-data" type="application/json">{{ rows | tojson }}</script>
   <script id="report-headers-data" type="application/json">{{ (report.headers or []) | tojson }}</script>
   <script id="report-details-data" type="application/json">{{ (report.details or []) | tojson }}</script>
   <script>
@@ -220,8 +224,10 @@
         });
       }
 
+      var rows = [];
       var headers = [];
       var details = [];
+      try { rows = JSON.parse(document.getElementById("report-rows-data").textContent || "[]"); } catch (e) {}
       try { headers = JSON.parse(document.getElementById("report-headers-data").textContent || "[]"); } catch (e) {}
       try { details = JSON.parse(document.getElementById("report-details-data").textContent || "[]"); } catch (e) {}
 
@@ -229,55 +235,91 @@
         inserted: "✅", merged: "✅", triggered: "✅", aligned: "✅",
         blocked: "⛔", unknown: "❓", not_found: "❓", failed: "❌",
       };
+      var ASYNC_NOTE =
+        "⏳ Reprocess Buffer / Sync from Cloud SQL run in the background — re-open this link " +
+        "later, or check the Buffer/History tabs, to confirm each PO fully resolved.";
 
-      document.querySelectorAll(".btn-quick-align").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          var poRef = btn.dataset.poRef;
-          var resultEl = btn.closest("tr").querySelector(".bq-align-result");
+      var allBtn = document.getElementById("quick-align-all-btn");
+      var allSpinner = document.getElementById("quick-align-all-spinner");
+      var allLabel = document.getElementById("quick-align-all-label");
+      var allStatus = document.getElementById("quick-align-all-status");
+
+      function setAllStatus(msg, isError) {
+        allStatus.textContent = msg || "";
+        allStatus.classList.toggle("error", !!isError);
+      }
+
+      if (allBtn) {
+        allBtn.addEventListener("click", function () {
           if (!employeeValid()) {
-            resultEl.innerHTML = '<div>❌ Fill in Your Details above first (name, company, department, email).</div>';
-            resultEl.classList.remove("hidden");
+            setAllStatus("Fill in Your Details above first (name, company, department, email).", true);
             document.getElementById("report-gate-card").scrollIntoView({ behavior: "smooth", block: "center" });
             return;
           }
-          var header = headers.find(function (h) { return h.po_ref_number === poRef; });
-          if (!header) {
-            resultEl.innerHTML = '<div>❌ This report has no source data saved for this PO — re-run the search on the BigQuery Lookup tab instead.</div>';
-            resultEl.classList.remove("hidden");
+          var actionableRows = rows.filter(function (r) { return r.status === "not_in_bc" || r.status === "lines_missing"; });
+          var actionableRefs = actionableRows.map(function (r) { return r.po_ref_number; });
+          var actionableHeaders = headers.filter(function (h) { return actionableRefs.indexOf(h.po_ref_number) !== -1; });
+          if (!actionableHeaders.length) {
+            setAllStatus("Nothing to align — this report's source data no longer matches its rows. Re-run the search instead.", true);
             return;
           }
-          var lines = details.filter(function (d) { return d.po_ref_number === poRef; });
-          var spinner = btn.querySelector(".btn-spinner");
-          var label = btn.querySelector(".btn-quick-align-label");
+          var actionableDetails = details.filter(function (d) { return actionableRefs.indexOf(d.po_ref_number) !== -1; });
+          var originalLabel = allLabel.textContent;
 
-          btn.disabled = true;
-          spinner.classList.remove("hidden");
-          label.textContent = "Aligning…";
+          allBtn.disabled = true;
+          allSpinner.classList.remove("hidden");
+          allLabel.textContent = "Aligning " + actionableHeaders.length + " PO(s)…";
+          setAllStatus("Running Quick Align for " + actionableHeaders.length + " PO(s)…");
+
           fetch("/api/bigquery/quick-align", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ headers: [header], details: lines, employee: getEmployee() }),
+            body: JSON.stringify({ headers: actionableHeaders, details: actionableDetails, employee: getEmployee() }),
           })
             .then(function (res) { return res.json().then(function (data) { return { res: res, data: data }; }); })
             .then(function (r) {
               if (!r.res.ok) throw new Error(r.data.error || r.data.detail || "Quick Align failed");
               var results = r.data.data || [];
-              resultEl.innerHTML = results.map(function (row) {
-                return "<div>" + (ICON[row.status] || "❓") + " " + escapeHtml(row.detail) + "</div>";
-              }).join("") || "<div>Nothing to align.</div>";
-              resultEl.classList.remove("hidden");
+
+              // Group per-PO messages, plus company-level (po_ref === null, e.g. the
+              // single Reprocess Buffer trigger covering several POs at once) onto
+              // every row for that company.
+              var byPoRef = {};
+              var byCompany = {};
+              results.forEach(function (res) {
+                if (res.po_ref) {
+                  (byPoRef[res.po_ref] = byPoRef[res.po_ref] || []).push(res);
+                } else if (res.company) {
+                  (byCompany[res.company] = byCompany[res.company] || []).push(res);
+                }
+              });
+
+              actionableRows.forEach(function (row) {
+                var tr = document.querySelector('tr[data-po-ref="' + CSS.escape(row.po_ref_number || "") + '"]');
+                if (!tr) return;
+                var msgs = (byPoRef[row.po_ref_number] || []).concat(byCompany[row.company] || []);
+                var actionCell = tr.querySelector(".report-action");
+                var stepsHtml = msgs.map(function (m) {
+                  return "<li>" + (ICON[m.status] || "❓") + " " + escapeHtml(m.detail) + "</li>";
+                }).join("") || "<li>No action was taken.</li>";
+                actionCell.innerHTML =
+                  '<ul class="report-steps">' + stepsHtml + "</ul>" +
+                  '<div class="report-sub report-async-note">' + ASYNC_NOTE + "</div>";
+              });
+
+              var okCount = results.filter(function (r) { return ["inserted", "merged", "triggered"].indexOf(r.status) !== -1; }).length;
+              setAllStatus(okCount + " of " + results.length + " step(s) completed. " + ASYNC_NOTE);
             })
             .catch(function (e) {
-              resultEl.innerHTML = "<div>❌ " + escapeHtml(e.message) + "</div>";
-              resultEl.classList.remove("hidden");
+              setAllStatus("Could not run Quick Align: " + e.message, true);
             })
             .finally(function () {
-              btn.disabled = false;
-              spinner.classList.add("hidden");
-              label.textContent = "⚡ Quick Align";
+              allBtn.disabled = false;
+              allSpinner.classList.add("hidden");
+              allLabel.textContent = originalLabel;
             });
         });
-      });
+      }
     })();
   </script>
   {% endif %}

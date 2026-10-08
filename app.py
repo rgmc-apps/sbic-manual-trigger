@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, render_template, request, jsonify, url_for
+from markupsafe import escape as _esc
 from datetime import datetime
 
 app = Flask(__name__)
@@ -1239,6 +1240,26 @@ def _fetch_existing_bc_order(company: str, po_ref: str) -> tuple:
         return None, 0
 
 
+def _b(value) -> str:
+    """HTML-escaped value wrapped in <strong> — for the one important word/number in a
+    bullet of _bq_report_row's action_steps, never the surrounding sentence (so a
+    bullet reads as one normal sentence with just the key term bolded, not shouted)."""
+    return f"<strong>{_esc(value)}</strong>"
+
+
+def _plain(step: str) -> str:
+    """action_steps's HTML stripped back to plain text — for callers that need a bare
+    string (e.g. /api/bigquery/quick-align's "no action taken" detail, shown via
+    escapeHtml() client-side, which would otherwise print the literal <strong> tags)."""
+    return re.sub(r"</?strong>", "", step)
+
+
+_BUFFER_FOLLOWUP_STEP = (
+    f"If any SKU/branch/customer still can't be auto-matched, resolve it on the {_b('Buffer')} tab's "
+    f"Items/Branches/Customers lists, then click {_b('Reprocess Buffer')} again."
+)
+
+
 def _bq_report_row(h: dict, details: list) -> dict:
     """One alignment-report row for a header already in the BigQuery Lookup search
     results — BigQuery is the source of truth (see its search route), so the
@@ -1246,6 +1267,11 @@ def _bq_report_row(h: dict, details: list) -> dict:
     already has, never the other way around. Runs one live BC lookup per call (same
     _fetch_existing_bc_order used by the insert-and-buffer blocker) to get the real
     current line count, not just the in_bc flag the search enrichment already attached.
+
+    action_steps is a list of HTML-safe bullet strings (bold only on the tab/button
+    names and key values — see _b) for the report's "Steps to align" column. action is
+    the same recommendation as one plain-text-ish sentence, kept for callers that just
+    need a short string (e.g. /api/bigquery/quick-align's "no action taken" rows).
     """
     po_ref = h.get("po_ref_number") or ""
     company = _resolve_bc_company(h.get("company_name"))
@@ -1257,30 +1283,34 @@ def _bq_report_row(h: dict, details: list) -> dict:
     if company:
         so_number, bc_line_count = _fetch_existing_bc_order(company, po_ref)
 
-    buffer_followup = (
-        "If any SKU/branch/customer still can't be auto-matched, it lands (or stays) in the buffer — "
-        "resolve it on the Buffer tab's Items/Branches/Customers lists, then Reprocess Buffer again."
-    )
-
     if not company:
-        status, action = "failed", f"Could not resolve a BC company from companyName={h.get('company_name')!r} — check this PO manually."
+        status = "failed"
+        action_steps = [
+            f"{_b('Could not resolve a BC company')} from companyName \"{_esc(h.get('company_name'))}\".",
+            "Check this PO manually.",
+        ]
     elif so_number and bc_line_count >= total_lines:
-        status, action = "aligned", f"Already aligned — BC order {so_number} has all {total_lines} line(s). No action needed."
+        status = "aligned"
+        action_steps = [f"{_b('Already aligned')} — BC order {_b(so_number)} has all {total_lines} line(s). No action needed."]
     elif so_number:
         status = "lines_missing"
-        action = (
-            f"BC order {so_number} is missing lines ({bc_line_count}/{total_lines} present). Go to the "
-            f"Cloud SQL tab, select {company}, and click \"Sync from Cloud SQL\" to backfill the rest. {buffer_followup}"
-        )
+        action_steps = [
+            f"BC order {_b(so_number)} is missing lines ({bc_line_count}/{total_lines} present).",
+            f"Go to the {_b('Cloud SQL')} tab, select {_b(company)}, and click {_b('Sync from Cloud SQL')} to backfill the rest.",
+            _BUFFER_FOLLOWUP_STEP,
+        ]
     elif in_mssql is None:
-        status, action = "unknown", "Could not confirm MSSQL status — re-run the search in BigQuery Lookup before acting on this row."
+        status = "unknown"
+        action_steps = [f"{_b('Could not confirm MSSQL status')} — re-run the search in BigQuery Lookup before acting on this row."]
     else:
         status = "not_in_bc"
         buffer_note = "buffers it directly, no MSSQL insert needed" if (not in_bigquery or in_mssql) else "inserts it into MSSQL and buffers it"
-        action = (
-            f"Not yet in BC. In the BigQuery Lookup tab, select this PO and click \"Add Selected to Buffer\" "
-            f"({buffer_note}), then go to the Buffer tab, select {company}, and click \"Reprocess Buffer\". {buffer_followup}"
-        )
+        action_steps = [
+            f"{_b('Not yet in BC')}.",
+            f"Go to the {_b('BigQuery Lookup')} tab, select this PO, and click {_b('Add Selected to Buffer')} ({buffer_note}).",
+            f"Go to the {_b('Buffer')} tab, select {_b(company)}, and click {_b('Reprocess Buffer')}.",
+            _BUFFER_FOLLOWUP_STEP,
+        ]
 
     return {
         "po_ref_number": po_ref,
@@ -1296,7 +1326,8 @@ def _bq_report_row(h: dict, details: list) -> dict:
         "lines_present": bc_line_count if so_number else None,
         "lines_total": total_lines,
         "status": status,
-        "action": action,
+        "action": " ".join(_plain(step) for step in action_steps),
+        "action_steps": action_steps,
         "buffer_url": f"/reconcile?tab=buffer&company={company}" if company else None,
     }
 
@@ -1309,13 +1340,18 @@ def _build_bq_report_rows(headers: list, details: list, requested_refs: list) ->
     for ref in requested_refs:
         if ref in found_refs:
             continue
+        not_found_steps = [
+            f"{_b('Not found')} in BigQuery or MSSQL.",
+            "Verify the PO ref number, or wait for Document AI to process it.",
+        ]
         rows.append({
             "po_ref_number": ref, "customer_name": None, "customer_branch_name": None,
             "company_name": None, "company": None, "po_date": None,
             "in_bigquery": False, "in_mssql": False, "in_bc": False,
             "so_number": None, "lines_present": None, "lines_total": None,
             "status": "not_found", "buffer_url": None,
-            "action": "Not found in BigQuery or MSSQL — verify the PO ref number, or wait for Document AI to process it.",
+            "action": " ".join(_plain(step) for step in not_found_steps),
+            "action_steps": not_found_steps,
         })
     return rows
 
@@ -1591,13 +1627,17 @@ def api_bigquery_quick_align():
         "notify_email": employee.get("email") or "",
     }
     rows = [_bq_report_row(h, details) for h in headers]
+    po_ref_to_company = {r["po_ref_number"]: r["company"] for r in rows}
     results = []
 
     not_in_bc_headers = [h for h, r in zip(headers, rows) if r["status"] == "not_in_bc"]
     if not_in_bc_headers:
         buffer_outcome = _insert_and_buffer(not_in_bc_headers, details, employee)
         for r in buffer_outcome["data"]:
-            results.append({"po_ref": r["po_ref"], "action": "buffer", "status": r["status"], "detail": r["detail"]})
+            results.append({
+                "po_ref": r["po_ref"], "company": po_ref_to_company.get(r["po_ref"]),
+                "action": "buffer", "status": r["status"], "detail": r["detail"],
+            })
 
         companies_touched = sorted({
             _resolve_bc_company(h.get("company_name")) for h in not_in_bc_headers
@@ -1612,7 +1652,10 @@ def api_bigquery_quick_align():
                     f"Reprocess Buffer failed for {company}: {body.get('detail') or body}")
             except requests.RequestException as exc:
                 ok, detail = False, f"Reprocess Buffer request failed for {company}: {exc}"
-            results.append({"po_ref": None, "action": "reprocess", "status": "triggered" if ok else "failed", "detail": detail})
+            results.append({
+                "po_ref": None, "company": company,
+                "action": "reprocess", "status": "triggered" if ok else "failed", "detail": detail,
+            })
 
     lines_missing_by_company: dict = {}
     for r in rows:
@@ -1630,11 +1673,17 @@ def api_bigquery_quick_align():
         except requests.RequestException as exc:
             ok, detail = False, f"Sync from Cloud SQL request failed for {company}: {exc}"
         for po_ref in po_refs:
-            results.append({"po_ref": po_ref, "action": "sync", "status": "triggered" if ok else "failed", "detail": detail})
+            results.append({
+                "po_ref": po_ref, "company": company,
+                "action": "sync", "status": "triggered" if ok else "failed", "detail": detail,
+            })
 
     for r in rows:
         if r["status"] not in ("not_in_bc", "lines_missing"):
-            results.append({"po_ref": r["po_ref_number"], "action": "none", "status": r["status"], "detail": r["action"]})
+            results.append({
+                "po_ref": r["po_ref_number"], "company": r["company"],
+                "action": "none", "status": r["status"], "detail": r["action"],
+            })
 
     return jsonify({"data": results, "total": len(results)})
 
