@@ -1,0 +1,98 @@
+/* ── BC Alignment Report — shareable, read-only, printable ── */
+
+body { background: var(--bg); }
+.main-wide { max-width: 1080px; }
+.report-main { display: flex; flex-direction: column; gap: 20px; }
+
+.report-print-title { display: none; }
+
+.report-header-card { display: flex; flex-direction: column; gap: 10px; }
+.report-meta { font-size: .85rem; color: var(--text-muted); display: flex; gap: 10px; flex-wrap: wrap; }
+.report-criteria { display: flex; gap: 8px; flex-wrap: wrap; }
+.criteria-chip {
+  font-size: .78rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  color: var(--text);
+}
+.btn-print {
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid var(--brand);
+  background: var(--brand);
+  color: #fff;
+  font-weight: 600;
+  font-size: .9rem;
+  cursor: pointer;
+  transition: background var(--transition), transform var(--transition);
+}
+.btn-print:hover { background: var(--brand-dark); }
+.btn-print:active { transform: scale(.97); }
+
+.report-error-card p { color: var(--text-muted); }
+
+/* ── Summary stat chips ── */
+.report-summary-card { display: flex; gap: 14px; flex-wrap: wrap; }
+.report-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  min-width: 120px;
+}
+.report-stat-value { font-size: 1.4rem; font-weight: 700; }
+.report-stat-label { font-size: .72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; }
+.report-stat-aligned { border-color: var(--success-border); background: var(--success-bg); }
+.report-stat-aligned .report-stat-value { color: var(--success); }
+.report-stat-lines_missing, .report-stat-not_in_bc { border-color: var(--warn-border); background: var(--warn-bg); }
+.report-stat-lines_missing .report-stat-value, .report-stat-not_in_bc .report-stat-value { color: var(--warn-text); }
+.report-stat-not_found, .report-stat-failed { border-color: var(--error-border); background: var(--error-bg); }
+.report-stat-not_found .report-stat-value, .report-stat-failed .report-stat-value { color: var(--error); }
+
+/* ── Table ── */
+.report-table-wrap { overflow-x: auto; }
+.report-table { width: 100%; border-collapse: collapse; font-size: .84rem; }
+.report-table th {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-muted);
+  font-size: .72rem;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  white-space: nowrap;
+}
+.report-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.report-po-ref { font-weight: 600; white-space: nowrap; }
+.report-sub { font-size: .76rem; color: var(--text-muted); }
+.report-action { min-width: 280px; color: var(--text); }
+
+.report-row-aligned { background: var(--success-bg); }
+.report-row-lines_missing, .report-row-not_in_bc { background: var(--warn-bg); }
+.report-row-not_found, .report-row-failed { background: var(--error-bg); }
+.report-row-unknown { background: var(--bg); }
+
+/* ── Print to PDF ── */
+@media print {
+  .no-print { display: none !important; }
+  body { background: #fff; }
+  .main-wide { max-width: 100%; }
+  .report-print-title { display: block; font-size: 1.4rem; margin: 0 0 4px; }
+  .card, .report-header-card, .report-table-card {
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    margin-bottom: 16px !important;
+  }
+  .report-table { font-size: .76rem; }
+  .report-table th { white-space: normal; }
+  .report-row { break-inside: avoid; }
+  a[href]::after { content: ""; }
+}

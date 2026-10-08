@@ -5,7 +5,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, url_for
 from datetime import datetime
 
 app = Flask(__name__)
@@ -1238,8 +1238,145 @@ def _fetch_existing_bc_order(company: str, po_ref: str) -> tuple:
     except requests.RequestException:
         return None, 0
 
-@app.route("/api/bigquery/insert-and-buffer", methods=["POST"])
-def api_bigquery_insert_and_buffer():
+
+def _bq_report_row(h: dict, details: list) -> dict:
+    """One alignment-report row for a header already in the BigQuery Lookup search
+    results — BigQuery is the source of truth (see its search route), so the
+    recommendation always points at the tool that brings MSSQL/BC up to what BigQuery
+    already has, never the other way around. Runs one live BC lookup per call (same
+    _fetch_existing_bc_order used by the insert-and-buffer blocker) to get the real
+    current line count, not just the in_bc flag the search enrichment already attached.
+    """
+    po_ref = h.get("po_ref_number") or ""
+    company = _resolve_bc_company(h.get("company_name"))
+    total_lines = len(_bq_lines_for_po(details, po_ref))
+    in_bigquery = h.get("_source") != "mssql"
+    in_mssql = h.get("in_mssql")
+
+    so_number, bc_line_count = (None, 0)
+    if company:
+        so_number, bc_line_count = _fetch_existing_bc_order(company, po_ref)
+
+    if not company:
+        status, action = "failed", f"Could not resolve a BC company from companyName={h.get('company_name')!r} — check this PO manually."
+    elif so_number and bc_line_count >= total_lines:
+        status, action = "aligned", f"Already aligned — BC order {so_number} has all {total_lines} line(s). No action needed."
+    elif so_number:
+        status = "lines_missing"
+        action = (
+            f"BC order {so_number} is missing lines ({bc_line_count}/{total_lines} present). Go to the "
+            f"Cloud SQL tab, select {company}, and click \"Sync from Cloud SQL\" to backfill the rest."
+        )
+    elif in_mssql is None:
+        status, action = "unknown", "Could not confirm MSSQL status — re-run the search in BigQuery Lookup before acting on this row."
+    else:
+        status = "not_in_bc"
+        buffer_note = "buffers it directly, no MSSQL insert needed" if (not in_bigquery or in_mssql) else "inserts it into MSSQL and buffers it"
+        action = (
+            f"Not yet in BC. In the BigQuery Lookup tab, select this PO and click \"Add Selected to Buffer\" "
+            f"({buffer_note}), then go to the Buffer tab, select {company}, and click \"Reprocess Buffer\"."
+        )
+
+    return {
+        "po_ref_number": po_ref,
+        "customer_name": h.get("customer_name"),
+        "customer_branch_name": h.get("customer_branch_name"),
+        "company_name": h.get("company_name"),
+        "company": company,
+        "po_date": h.get("po_date"),
+        "in_bigquery": in_bigquery,
+        "in_mssql": in_mssql,
+        "in_bc": bool(so_number),
+        "so_number": so_number,
+        "lines_present": bc_line_count if so_number else None,
+        "lines_total": total_lines,
+        "status": status,
+        "action": action,
+    }
+
+
+def _build_bq_report_rows(headers: list, details: list, requested_refs: list) -> list:
+    """One row per header found, plus one "not_found" row for any requested PO ref the
+    search came back with nothing for at all (neither BigQuery nor its MSSQL fallback)."""
+    rows = [_bq_report_row(h, details) for h in headers]
+    found_refs = {h.get("po_ref_number") for h in headers}
+    for ref in requested_refs:
+        if ref in found_refs:
+            continue
+        rows.append({
+            "po_ref_number": ref, "customer_name": None, "customer_branch_name": None,
+            "company_name": None, "company": None, "po_date": None,
+            "in_bigquery": False, "in_mssql": False, "in_bc": False,
+            "so_number": None, "lines_present": None, "lines_total": None,
+            "status": "not_found",
+            "action": "Not found in BigQuery or MSSQL — verify the PO ref number, or wait for Document AI to process it.",
+        })
+    return rows
+
+
+@app.route("/api/bigquery/report", methods=["POST"])
+def api_bigquery_report():
+    """Build and save a shareable alignment report for the current BigQuery Lookup
+    search results — one row per PO with its BigQuery/MSSQL/BC status and a plain
+    recommended next step naming the exact tab/button on this page that fixes it.
+    BigQuery is always treated as the source of truth (see _bq_report_row). Saved to
+    rgmc-bc-api so a person-in-charge can open the resulting link without needing
+    /reconcile access — this never applies anything to MSSQL/BC itself.
+    """
+    data = request.get_json(silent=True) or {}
+    headers = data.get("headers") or []
+    details = data.get("details") or []
+    criteria = data.get("criteria") or {}
+    employee = data.get("employee") or {}
+    requested_refs = _split_po_refs(criteria.get("po_ref_number") or "")
+    if not headers and not requested_refs:
+        return jsonify({"error": "Nothing to report — run a search first."}), 400
+
+    rows = _build_bq_report_rows(headers, details, requested_refs)
+    generated_by = {
+        "name": employee.get("employee_name") or "",
+        "company": employee.get("employee_company") or "",
+        "department": employee.get("employee_department") or "",
+        "email": employee.get("email") or "",
+    }
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/bq-lookup-reports", json={
+            "criteria": criteria, "rows": rows, "generated_by": generated_by,
+        })
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    body, status_code = _proxy_json(resp)
+    if status_code != 201:
+        detail = body.get("detail") or body.get("error") or f"rgmc-bc-api returned {status_code}"
+        return jsonify({"error": detail}), 502
+
+    report_id = body.get("id")
+    # Built from the Host/X-Forwarded-Proto headers rather than url_for(_external=True) —
+    # Cloud Run terminates TLS upstream and forwards plain HTTP to this container, so
+    # Flask's own scheme guessing (with no ProxyFix configured) would emit "http://"
+    # for a service that's actually HTTPS-only.
+    scheme = request.headers.get("X-Forwarded-Proto", "https")
+    report_url = f"{scheme}://{request.host}{url_for('report_page', report_id=report_id)}"
+    return jsonify({"report_id": report_id, "url": report_url})
+
+
+@app.route("/report/<report_id>")
+def report_page(report_id):
+    """Standalone, read-only alignment report — no employee gate, since the whole
+    point is a person-in-charge who has no reason to be logged into /reconcile can
+    open this link directly."""
+    try:
+        resp = _bc_api("GET", f"/bc/custom/v2/bq-lookup-reports/{report_id}")
+    except requests.RequestException:
+        return render_template("report.html", report=None, error="Could not reach the report service. Try again later."), 502
+    if resp.status_code == 404:
+        return render_template("report.html", report=None, error="This report link doesn't exist or has expired."), 404
+    if resp.status_code != 200:
+        return render_template("report.html", report=None, error=f"Could not load this report (status {resp.status_code})."), 502
+    return render_template("report.html", report=resp.json(), error=None)
+
+
+def _insert_and_buffer(headers: list, details: list, employee: dict) -> dict:
     """Add caller-selected PO(s) to the SO-import buffer — source-aware per header via
     each one's "_source" tag (set by /api/bigquery/document-ai/search):
 
@@ -1270,19 +1407,17 @@ def api_bigquery_insert_and_buffer():
     doc — it merges in only the detail lines not already present there (status
     "merged" in the response), so attempt_count/last_error/resolved* already on it
     survive untouched. See add_missing_lines_to_buffer in rgmc-bc-api.
+
+    Shared by both the /api/bigquery/insert-and-buffer route (caller-checked selection)
+    and /api/bigquery/quick-align (the "not yet in BC" branch) — called directly, not
+    over HTTP, so quick-align doesn't round-trip through this app's own routing.
     """
-    data = request.get_json(silent=True) or {}
-    headers = data.get("headers") or []
-    details = data.get("details") or []
-    employee = data.get("employee") or {}
     triggered_by = {
         "name": employee.get("employee_name") or "",
         "company": employee.get("employee_company") or "",
         "department": employee.get("employee_department") or "",
         "email": employee.get("email") or "",
     } if employee else None
-    if not headers:
-        return jsonify({"error": "headers must not be empty"}), 400
 
     bq_headers = [h for h in headers if h.get("_source") != "mssql"]
     mssql_only_headers = [h for h in headers if h.get("_source") == "mssql"]
@@ -1398,11 +1533,102 @@ def api_bigquery_insert_and_buffer():
         except requests.RequestException as exc:
             results.append({"po_ref": po_ref, "status": "failed", "detail": f"Buffer create request failed: {exc}"})
 
-    return jsonify({
+    return {
         "data": results, "total": len(results),
         "ok_count": sum(1 for r in results if r["status"] in ("inserted", "merged")),
         "blocked_count": sum(1 for r in results if r["status"] == "blocked"),
-    })
+    }
+
+
+@app.route("/api/bigquery/insert-and-buffer", methods=["POST"])
+def api_bigquery_insert_and_buffer():
+    data = request.get_json(silent=True) or {}
+    headers = data.get("headers") or []
+    details = data.get("details") or []
+    employee = data.get("employee") or {}
+    if not headers:
+        return jsonify({"error": "headers must not be empty"}), 400
+    return jsonify(_insert_and_buffer(headers, details, employee))
+
+
+@app.route("/api/bigquery/quick-align", methods=["POST"])
+def api_bigquery_quick_align():
+    """One-click alignment for one or more BigQuery Lookup rows. BigQuery is always
+    the source of truth (see _bq_report_row's status logic) — this only ever brings
+    MSSQL/BC up to what BigQuery already has, never the reverse, and every action
+    here is an existing, already-vetted tool; nothing new talks to BC directly:
+
+      status "not_in_bc"     -> insert into MSSQL (if needed) + add to the buffer
+                                 (_insert_and_buffer, same as Add Selected to Buffer),
+                                 then trigger Reprocess Buffer once per distinct
+                                 company touched (same as clicking it manually).
+      status "lines_missing" -> trigger Sync from Cloud SQL, scoped to exactly these
+                                 PO refs via po_ref_numbers (one call per company, so
+                                 a multi-row align doesn't trip the 30s-per-path rate
+                                 limiter on /customerpoul/sync-inserted-orders).
+      anything else           -> reported back with no action taken (already aligned,
+                                 or there's genuinely nothing safe to automate yet).
+    """
+    data = request.get_json(silent=True) or {}
+    headers = data.get("headers") or []
+    details = data.get("details") or []
+    employee = data.get("employee") or {}
+    if not headers:
+        return jsonify({"error": "headers must not be empty"}), 400
+
+    notify_params = {
+        "notify_name": employee.get("employee_name") or "",
+        "notify_company": employee.get("employee_company") or "",
+        "notify_department": employee.get("employee_department") or "",
+        "notify_email": employee.get("email") or "",
+    }
+    rows = [_bq_report_row(h, details) for h in headers]
+    results = []
+
+    not_in_bc_headers = [h for h, r in zip(headers, rows) if r["status"] == "not_in_bc"]
+    if not_in_bc_headers:
+        buffer_outcome = _insert_and_buffer(not_in_bc_headers, details, employee)
+        for r in buffer_outcome["data"]:
+            results.append({"po_ref": r["po_ref"], "action": "buffer", "status": r["status"], "detail": r["detail"]})
+
+        companies_touched = sorted({
+            _resolve_bc_company(h.get("company_name")) for h in not_in_bc_headers
+            if _resolve_bc_company(h.get("company_name"))
+        })
+        for company in companies_touched:
+            try:
+                resp = _gcp_api("POST", "/customerpoul/reprocess-buffer", params={"companies": company, **notify_params})
+                body, status_code = _proxy_json(resp)
+                ok = status_code == 200
+                detail = f"Reprocess Buffer triggered for {company}." if ok else (
+                    f"Reprocess Buffer failed for {company}: {body.get('detail') or body}")
+            except requests.RequestException as exc:
+                ok, detail = False, f"Reprocess Buffer request failed for {company}: {exc}"
+            results.append({"po_ref": None, "action": "reprocess", "status": "triggered" if ok else "failed", "detail": detail})
+
+    lines_missing_by_company: dict = {}
+    for r in rows:
+        if r["status"] == "lines_missing" and r["company"]:
+            lines_missing_by_company.setdefault(r["company"], []).append(r["po_ref_number"])
+    for company, po_refs in lines_missing_by_company.items():
+        try:
+            resp = _gcp_api("POST", "/customerpoul/sync-inserted-orders", params={
+                "companies": company, "po_ref_numbers": ",".join(po_refs), **notify_params,
+            })
+            body, status_code = _proxy_json(resp)
+            ok = status_code == 200
+            detail = f"Sync from Cloud SQL triggered for {len(po_refs)} PO(s) in {company}." if ok else (
+                f"Sync from Cloud SQL failed for {company}: {body.get('detail') or body}")
+        except requests.RequestException as exc:
+            ok, detail = False, f"Sync from Cloud SQL request failed for {company}: {exc}"
+        for po_ref in po_refs:
+            results.append({"po_ref": po_ref, "action": "sync", "status": "triggered" if ok else "failed", "detail": detail})
+
+    for r in rows:
+        if r["status"] not in ("not_in_bc", "lines_missing"):
+            results.append({"po_ref": r["po_ref_number"], "action": "none", "status": r["status"], "detail": r["action"]})
+
+    return jsonify({"data": results, "total": len(results)})
 
 
 def _employee_notify_params(data: dict):

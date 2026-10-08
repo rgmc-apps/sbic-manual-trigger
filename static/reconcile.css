@@ -744,12 +744,55 @@
 .bq-status-badge.ok { background: var(--success-bg); color: var(--success); border-color: var(--success-border); }
 .bq-status-badge.missing { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
 .bq-status-badge.unknown { background: var(--bg); color: var(--text-muted); border-color: var(--border); }
-.bq-detail-toggle { margin-top: 10px; display: inline-block; }
+.bq-row-actions { margin-top: 10px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.bq-detail-toggle { display: inline-block; }
+.btn-quick-align {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--brand);
+  background: var(--card);
+  color: var(--brand-dark);
+  font-size: .74rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.btn-quick-align:hover:not(:disabled) { background: var(--brand); color: #fff; }
+.btn-quick-align:disabled { opacity: .6; cursor: not-allowed; }
+.bq-align-result { margin-top: 8px; font-size: .78rem; display: flex; flex-direction: column; gap: 4px; }
 .bq-detail-lines { margin-top: 10px; }
 .bq-detail-lines table { width: 100%; border-collapse: collapse; font-size: .78rem; }
 .bq-detail-lines th, .bq-detail-lines td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border); }
 .bq-detail-lines th { color: var(--text-muted); font-weight: 600; }
 
-.bq-insert-action { margin-top: 16px; }
+.bq-insert-action { margin-top: 16px; display: flex; gap: 10px; flex-wrap: wrap; }
 .bq-insert-results { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.btn-bq-report { background: var(--card); color: var(--brand); border-color: var(--brand); }
+.btn-bq-report:hover:not(:disabled) { background: var(--brand); color: #fff; }
+.bq-report-result {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: .85rem;
+}
+.report-link { color: var(--brand-dark); font-weight: 600; word-break: break-all; }
+.btn-copy-link {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  font-size: .76rem;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.btn-copy-link:hover { background: var(--bg); }
 .btn-modal-cancel:hover { border-color: var(--text-muted); }

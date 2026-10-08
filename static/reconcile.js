@@ -26,6 +26,8 @@
   const bqInsertAction    = document.getElementById("bq-insert-action");
   const bqInsertBtn       = document.getElementById("bq-insert-btn");
   const bqInsertResults   = document.getElementById("bq-insert-results");
+  const bqReportBtn       = document.getElementById("bq-report-btn");
+  const bqReportResult    = document.getElementById("bq-report-result");
   const documentAiRowTemplate = document.getElementById("document-ai-row-template");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
@@ -1915,7 +1917,56 @@
       toggleBtn.textContent = show ? "Hide detail lines" : "Show detail lines";
     });
 
+    const alignBtn = row.querySelector(".btn-quick-align");
+    const alignResultEl = row.querySelector(".bq-align-result");
+    alignBtn.addEventListener("click", () => quickAlignOneRow(header, alignBtn, alignResultEl));
+
     return row;
+  }
+
+  const QUICK_ALIGN_ICON = {
+    inserted: "✅", merged: "✅", triggered: "✅", aligned: "✅",
+    blocked: "⛔", unknown: "❓", not_found: "❓", failed: "❌",
+  };
+
+  // Checks this one PO against all three data sources server-side (BigQuery is
+  // always the source of truth) and runs whichever existing tool brings MSSQL/BC up
+  // to match it — see /api/bigquery/quick-align. Scoped to this single row's own
+  // detail lines, not the whole search result set.
+  async function quickAlignOneRow(header, btn, resultEl) {
+    if (!refreshGate()) {
+      setBqStatus("Fill in your details above first.", true);
+      return;
+    }
+    const poRef = header.po_ref_number || "";
+    const lines = bqDetails.filter((d) => d.po_ref_number === poRef);
+    const spinner = btn.querySelector(".btn-spinner");
+    const label = btn.querySelector(".btn-quick-align-label");
+
+    btn.disabled = true;
+    if (spinner) spinner.classList.remove("hidden");
+    if (label) label.textContent = "Aligning…";
+    try {
+      const res = await fetch("/api/bigquery/quick-align", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ headers: [header], details: lines, employee: getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Quick Align failed");
+      const results = data.data || [];
+      resultEl.innerHTML = results.map((r) => `
+        <div>${QUICK_ALIGN_ICON[r.status] || "❓"} ${escapeHtml(r.detail)}</div>
+      `).join("") || "<div>Nothing to align.</div>";
+      resultEl.classList.remove("hidden");
+    } catch (e) {
+      resultEl.innerHTML = `<div>❌ ${escapeHtml(e.message)}</div>`;
+      resultEl.classList.remove("hidden");
+    } finally {
+      btn.disabled = false;
+      if (spinner) spinner.classList.add("hidden");
+      if (label) label.textContent = "⚡ Quick Align";
+    }
   }
 
   function renderBqResults(headers) {
@@ -2023,6 +2074,59 @@
     } finally {
       bqInsertBtn.disabled = false;
       bqInsertBtn.textContent = origLabel;
+    }
+  });
+
+  // Generate Report covers every result the current search found (not just what's
+  // checked) — it's a status snapshot for a person-in-charge, not an action on BC/MSSQL.
+  bqReportBtn.addEventListener("click", async () => {
+    if (!refreshGate()) {
+      setBqStatus("Fill in your details above first.", true);
+      return;
+    }
+    if (!bqHeaders.length) {
+      setBqStatus("Nothing to report — run a search first.", true);
+      return;
+    }
+    const criteria = {
+      po_ref_number: bqPoRefInput.value.trim(),
+      customer_name: bqCustomerInput.value.trim(),
+      date_from: bqDateFrom.value,
+      date_to: bqDateTo.value,
+    };
+
+    bqReportBtn.disabled = true;
+    setBtnLoading("bq-report-spinner", "bq-report-btn-label", true, "Generating…");
+    try {
+      const res = await fetch("/api/bigquery/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ headers: bqHeaders, details: bqDetails, criteria, employee: getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Could not generate the report");
+
+      bqReportResult.innerHTML = `
+        <span>✅ Report ready — share this link with the person-in-charge:</span>
+        <a href="${data.url}" target="_blank" rel="noopener" class="report-link">${escapeHtml(data.url)}</a>
+        <button class="btn-copy-link" id="bq-report-copy-btn" type="button">Copy link</button>
+      `;
+      bqReportResult.classList.remove("hidden");
+      document.getElementById("bq-report-copy-btn").addEventListener("click", async (e) => {
+        const btn = e.currentTarget;
+        try {
+          await navigator.clipboard.writeText(data.url);
+          btn.textContent = "Copied!";
+          setTimeout(() => { btn.textContent = "Copy link"; }, 1500);
+        } catch {
+          setBqStatus("Could not copy automatically — select and copy the link manually.", true);
+        }
+      });
+    } catch (e) {
+      setBqStatus("Could not generate report: " + e.message, true);
+    } finally {
+      bqReportBtn.disabled = false;
+      setBtnLoading("bq-report-spinner", "bq-report-btn-label", false);
     }
   });
 })();

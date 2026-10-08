@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BC Alignment Report</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/report.css" />
+</head>
+<body>
+
+  <header class="site-header no-print">
+    <div class="header-inner">
+      <div class="logo-mark">
+        <img src="/static/logo.png" alt="SBIC Logo" class="site-logo" />
+      </div>
+      <div>
+        <h1 class="site-title">BC Alignment Report</h1>
+        <p class="site-subtitle">Shareable snapshot of one BigQuery Lookup search — BigQuery is the source of truth</p>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/reconcile">Back to Reconciliation</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="main main-wide report-main">
+
+    {% if error %}
+    <section class="card report-error-card">
+      <h2 class="card-title">Report unavailable</h2>
+      <p>{{ error }}</p>
+    </section>
+    {% else %}
+
+    <section class="card report-header-card print-title">
+      <h1 class="report-print-title">BC Alignment Report</h1>
+      <div class="report-meta">
+        <span>Generated {{ report.generated_at or "—" }}</span>
+        {% if report.generated_by and report.generated_by.name %}
+        <span>by {{ report.generated_by.name }}{% if report.generated_by.company %} ({{ report.generated_by.company }}){% endif %}</span>
+        {% endif %}
+      </div>
+      <div class="report-criteria">
+        {% set c = report.criteria or {} %}
+        {% if c.po_ref_number %}<span class="criteria-chip">PO Ref(s): {{ c.po_ref_number }}</span>{% endif %}
+        {% if c.customer_name %}<span class="criteria-chip">Customer: {{ c.customer_name }}</span>{% endif %}
+        {% if c.date_from or c.date_to %}<span class="criteria-chip">Date: {{ c.date_from or "…" }} to {{ c.date_to or "…" }}</span>{% endif %}
+        {% if not (c.po_ref_number or c.customer_name or c.date_from or c.date_to) %}<span class="criteria-chip">No search filters (all recent results)</span>{% endif %}
+      </div>
+      <button class="btn-print no-print" id="print-btn" type="button">🖨️ Print / Save as PDF</button>
+    </section>
+
+    {% set rows = report.rows or [] %}
+    {% set status_order = ["failed", "not_found", "unknown", "not_in_bc", "lines_missing", "aligned"] %}
+    <section class="card report-summary-card no-print">
+      {% for s in status_order %}
+      {% set n = rows | selectattr("status", "equalto", s) | list | length %}
+      {% if n > 0 %}
+      <div class="report-stat report-stat-{{ s }}">
+        <span class="report-stat-value">{{ n }}</span>
+        <span class="report-stat-label">
+          {% if s == "aligned" %}Aligned
+          {% elif s == "lines_missing" %}Lines missing in BC
+          {% elif s == "not_in_bc" %}Not yet in BC
+          {% elif s == "not_found" %}Not found anywhere
+          {% elif s == "unknown" %}Status unknown
+          {% else %}Could not resolve{% endif %}
+        </span>
+      </div>
+      {% endif %}
+      {% endfor %}
+    </section>
+
+    <section class="card report-table-card">
+      <div class="report-table-wrap">
+        <table class="report-table">
+          <thead>
+            <tr>
+              <th>PO Ref</th>
+              <th>Customer / Branch</th>
+              <th>Company</th>
+              <th>BigQuery</th>
+              <th>MSSQL</th>
+              <th>BC (lines)</th>
+              <th>Steps to align</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rows %}
+            <tr class="report-row report-row-{{ r.status }}">
+              <td class="report-po-ref">{{ r.po_ref_number or "—" }}</td>
+              <td>
+                <div>{{ r.customer_name or "—" }}</div>
+                {% if r.customer_branch_name %}<div class="report-sub">{{ r.customer_branch_name }}</div>{% endif %}
+              </td>
+              <td>{{ r.company or r.company_name or "—" }}</td>
+              <td>{{ "✓" if r.in_bigquery else "✗" }}</td>
+              <td>
+                {% if r.in_mssql == true %}✓{% elif r.in_mssql == false %}✗{% else %}?{% endif %}
+              </td>
+              <td>
+                {% if r.in_bc %}{{ r.so_number }} ({{ r.lines_present }}/{{ r.lines_total }}){% else %}✗{% endif %}
+              </td>
+              <td class="report-action">{{ r.action }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    {% endif %}
+
+  </main>
+
+  <footer class="site-footer no-print">
+    SBIC &mdash; AI Upload Services &mdash; RGMC IT/MIS Department
+  </footer>
+
+  <script>
+    (function () {
+      var btn = document.getElementById("print-btn");
+      if (btn) btn.addEventListener("click", function () { window.print(); });
+    })();
+  </script>
+
+</body>
+</html>
