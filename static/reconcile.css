@@ -27,6 +27,9 @@
 .details-hint { font-size: .8125rem; color: var(--text-muted); margin-top: -12px; margin-bottom: 20px; }
 .sync-hint { margin-top: 12px; margin-bottom: 0; }
 .gate-hint { color: var(--warn-text); margin-top: 12px; }
+.hint-list { margin: 8px 0 0; padding-left: 18px; }
+.hint-list li { margin-bottom: 5px; }
+.hint-list li:last-child { margin-bottom: 0; }
 
 /* ── Info tooltip (pure CSS, hover + keyboard focus) ── */
 .info-tip {

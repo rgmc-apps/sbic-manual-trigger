@@ -66,10 +66,9 @@
 
       <!-- Notice: overrides are now consumed by reprocessing/sync -->
       <section class="card notice-card">
-        <strong>Note:</strong> a saved branch/customer link takes priority over automatic
-        ship-to matching, and a saved SKU link takes priority over automatic item matching.
-        Nothing is applied to Business Central automatically — once you've linked what you
-        need, click <strong>Reprocess Buffer</strong> yourself to send it.
+        <strong>Note:</strong> saved branch/customer/SKU links take priority over automatic
+        matching. Nothing touches Business Central automatically — click <strong>Reprocess
+        Buffer</strong> yourself when you're ready.
       </section>
 
       <!-- Company picker + summary -->
@@ -125,7 +124,7 @@
             </button>
           </div>
           <p class="details-hint sync-hint">
-            "Sync from Cloud SQL" backfills lines onto BC orders already inserted (found by PO ref) whose lines are missing or incomplete — for orders whose buffer entry is already gone. It does not require a loaded buffer above.
+            Fills in missing lines on BC orders that already exist (matched by PO ref) — for orders no longer in the buffer. Doesn't need a loaded buffer above.
           </p>
 
           <div class="toolbar backfill-toolbar">
@@ -143,7 +142,7 @@
             </button>
           </div>
           <p class="details-hint sync-hint">
-            "Backfill from Cloud SQL" creates BC sales orders (header + lines) straight from SBIC's SQL Server (CustomerPOUL where createBy='trigger', joined to CustomerPOULDetail) for POs never inserted into BC at all — the opposite of Sync from Cloud SQL above. A PO whose external document number already exists in BC is skipped untouched. From/To are optional and filter by the PO's own date; leave both blank to consider every createBy='trigger' row. Anything that can't be fully resolved is buffered below for reconciliation, same as every other import path.
+            Creates new BC sales orders straight from SQL Server for POs never inserted into BC — the opposite of Sync above. Existing POs are skipped untouched. From/To are optional date filters. Anything that can't be fully resolved lands in the buffer below.
           </p>
         </div>
 
@@ -181,7 +180,7 @@
             </button>
           </div>
           <p class="details-hint sync-hint">
-            Every PO a <strong>Reprocess Buffer</strong> run has touched — its header/lines at that attempt, the outcome, and who triggered it. A PO can appear more than once if it was reprocessed more than once; most recent first.
+            Every PO a <strong>Reprocess Buffer</strong> run has touched, with its outcome and who triggered it. Reprocessed more than once? It shows up once per attempt, newest first.
           </p>
           <p class="status-line" id="history-status-line"></p>
           <div class="history-list" id="history-list"></div>
@@ -220,18 +219,18 @@
               <span id="overrides-load-btn-label">Load Overrides</span>
             </button>
           </div>
-          <p class="details-hint sync-hint">
-            Every manually-saved SKU / branch / customer link to a BC record — the links <strong>Reprocess Buffer</strong>
-            and syncing consult ahead of automatic matching. Editing a link here only affects POs still sitting in the
-            buffer (they pick it up automatically on the next Reprocess Buffer) or new inbound POs. For a branch or
-            customer link, "Find previous orders" also searches Business Central for Sales Orders <strong>already
-            created</strong> under the old value — restricted to orders this app's own automated upload created
-            (submittedBy = "SBIC AI Uploading" only, never a human-entered BC order) — and lets you update just those
-            orders' header (Sell-to Customer No. / Ship-to Code) to the corrected value. Line pricing/discounts are
-            <strong>not</strong> recalculated by that update and should be reviewed in BC afterward; you'll get an
-            email with the full per-order result either way. Company above is only used to search/update BC when
-            editing a link or finding previous orders — the overrides list itself covers every company.
-          </p>
+          <div class="details-hint sync-hint">
+            Manually-saved SKU / branch / customer links to BC records — consulted by <strong>Reprocess Buffer</strong>
+            and syncing ahead of automatic matching.
+            <ul class="hint-list">
+              <li>A link applies to buffered POs on their next reprocess, and to new inbound POs — not retroactively.</li>
+              <li>For branch/customer links, <strong>Find previous orders</strong> finds BC Sales Orders this app's own
+                auto-upload already created under the old value, and lets you fix just their header (Sell-to Customer
+                No. / Ship-to Code) — line pricing isn't touched, so review that in BC after.</li>
+              <li>You'll get an emailed result either way. Company above only scopes the BC search/update — the list
+                below always covers every company.</li>
+            </ul>
+          </div>
           <p class="status-line" id="overrides-status-line"></p>
           <div class="overrides-list" id="overrides-list"></div>
         </div>
@@ -259,24 +258,18 @@
               <span id="bq-search-btn-label">Search</span>
             </button>
           </div>
-          <p class="details-hint sync-hint">
-            Searches BigQuery's <code>int_document_ai</code> (header) and <code>int_document_ai_detail</code> (lines)
-            directly — the raw Document AI-parsed record of a PO, independent of whether it ever made it into MSSQL
-            (<code>sbic_int</code>) or Business Central. Each result shows whether it's already in MSSQL and/or BC.
-            Searching by an exact PO ref also checks <code>CustomerPOUL</code>/<code>CustomerPOULDetail</code> directly
-            for any ref BigQuery doesn't have at all — e.g. one manually encoded through SBIC's legacy app, which never
-            goes through Document AI/BigQuery — and lists it alongside the rest, flagged "Not in BigQuery."
-            For one not yet in MSSQL, select it and use "Add Selected to Buffer" below to insert it into MSSQL
-            (<code>CustomerPOULBQ</code>/<code>CustomerPOULDetailBQ</code> — the same staging tables the automated
-            BigQuery bridge uses, promoted into the live tables by BC's own trigger) and place it into the SO-import
-            buffer for manual reconciliation; one already in MSSQL skips straight to the buffer with no MSSQL insert
-            at all. Either way it is <strong>never</strong> auto-imported into BC directly. MSSQL is always inserted
-            into (when applicable), even for a PO that already has a Sales Order in BC (by External Document No.) —
-            keeping MSSQL in sync with BigQuery doesn't depend on BC's state. Only the <strong>buffer</strong> step is
-            blocked for one already in BC (adding it there too would be pointless and confusing); it's recorded to
-            the History tab instead, including whether the existing order's lines already cover everything available
-            for it.
-          </p>
+          <div class="details-hint sync-hint">
+            Searches BigQuery's raw Document AI-parsed PO records directly — independent of MSSQL or Business Central.
+            Each result shows its MSSQL/BC status.
+            <ul class="hint-list">
+              <li>An exact PO ref search also checks <code>CustomerPOUL</code> for refs BigQuery never got at all (e.g.
+                legacy-app entries) — flagged "Not in BigQuery."</li>
+              <li><strong>Add Selected to Buffer</strong> inserts into MSSQL staging (if not already there) and adds the
+                PO to the SO-import buffer for manual reconciliation — <strong>never</strong> straight into BC.</li>
+              <li>Already has a BC Sales Order? The buffer step is skipped and recorded to History instead. Already in
+                the buffer? Only its missing lines are added — nothing already there gets overwritten.</li>
+            </ul>
+          </div>
           <p class="status-line" id="bq-status-line"></p>
           <div class="bq-results-list" id="bq-results-list"></div>
           <div class="bq-insert-action hidden" id="bq-insert-action">
@@ -311,7 +304,7 @@
             <span class="summary-value" id="stat-orders">0</span>
             <span class="summary-label">
               Buffered POs
-              <span class="info-tip" tabindex="0" data-tooltip="A purchase order that failed to import into Business Central automatically — usually because its SKU code, customer branch, or customer name didn't exactly match an existing BC record. It sits here until you link it below (or it's fixed at the source), then Reprocess Buffer retries creating it in BC.">ⓘ</span>
+              <span class="info-tip" tabindex="0" data-tooltip="A PO that failed to auto-import into BC — usually a SKU, branch, or customer mismatch. Link it below, then Reprocess Buffer retries it.">ⓘ</span>
             </span>
           </div>
           <div class="summary-stat"><span class="summary-value" id="stat-sku">0/0</span><span class="summary-label">SKU groups resolved</span></div>
@@ -342,7 +335,7 @@
           <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To) <span class="tab-count" id="tab-count-branch"></span></button>
           <button class="tab-btn" data-tab="customer">Customers <span class="tab-count" id="tab-count-customer"></span></button>
           <button class="tab-btn" data-tab="orders">Buffered Orders <span class="tab-count" id="tab-count-orders"></span></button>
-          <span class="info-tip tabs-info-tip" tabindex="0" data-tooltip="The buffer is Firestore storage for orders Business Central rejected on auto-import. Each one stays here — with whatever lines it has — until its SKU/branch/customer links are resolved and it's successfully reprocessed into BC.">ⓘ</span>
+          <span class="info-tip tabs-info-tip" tabindex="0" data-tooltip="Orders BC rejected on auto-import, held here until their SKU/branch/customer links are resolved and reprocessed.">ⓘ</span>
         </div>
 
         <div class="tab-panel" id="panel-sku" data-lookup="items"></div>
