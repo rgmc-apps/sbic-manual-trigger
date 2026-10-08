@@ -1629,6 +1629,9 @@ def api_bigquery_quick_align():
     rows = [_bq_report_row(h, details) for h in headers]
     po_ref_to_company = {r["po_ref_number"]: r["company"] for r in rows}
     results = []
+    run_ids = []  # [{"company", "action", "run_id"}, ...] — so the caller can watch each
+    # triggered reprocess/sync through to completion (same polling the Buffer tab's own
+    # Reprocess/Sync buttons use) instead of guessing when it's safe to refresh.
 
     not_in_bc_headers = [h for h, r in zip(headers, rows) if r["status"] == "not_in_bc"]
     if not_in_bc_headers:
@@ -1650,6 +1653,8 @@ def api_bigquery_quick_align():
                 ok = status_code == 200
                 detail = f"Reprocess Buffer triggered for {company}." if ok else (
                     f"Reprocess Buffer failed for {company}: {body.get('detail') or body}")
+                if ok and body.get("run_id"):
+                    run_ids.append({"company": company, "action": "reprocess", "run_id": body["run_id"]})
             except requests.RequestException as exc:
                 ok, detail = False, f"Reprocess Buffer request failed for {company}: {exc}"
             results.append({
@@ -1670,6 +1675,8 @@ def api_bigquery_quick_align():
             ok = status_code == 200
             detail = f"Sync from Cloud SQL triggered for {len(po_refs)} PO(s) in {company}." if ok else (
                 f"Sync from Cloud SQL failed for {company}: {body.get('detail') or body}")
+            if ok and body.get("run_id"):
+                run_ids.append({"company": company, "action": "sync", "run_id": body["run_id"]})
         except requests.RequestException as exc:
             ok, detail = False, f"Sync from Cloud SQL request failed for {company}: {exc}"
         for po_ref in po_refs:
@@ -1685,7 +1692,7 @@ def api_bigquery_quick_align():
                 "action": "none", "status": r["status"], "detail": r["action"],
             })
 
-    return jsonify({"data": results, "total": len(results)})
+    return jsonify({"data": results, "total": len(results), "run_ids": run_ids})
 
 
 def _employee_notify_params(data: dict):

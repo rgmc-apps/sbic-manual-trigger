@@ -981,6 +981,13 @@
     document.querySelectorAll(".action-tab-btn").forEach((b) => b.classList.remove("active"));
     targetBtn.classList.add("active");
     document.querySelectorAll(".action-tab-panel").forEach((p) => p.classList.toggle("hidden", p !== next));
+
+    // Reprocess/Sync/Backfill/Quick Align can all run from elsewhere (another tab, or
+    // the BigQuery Lookup tab's background-triggered Reprocess/Sync) with no live
+    // watcher tied to whatever's currently on screen — coming back to the Buffer tab
+    // is the one moment we know for sure the user wants the current truth, not
+    // whatever was last fetched.
+    if (tabKey === "buffer" && state) refreshBufferSilently();
   }
 
   document.querySelectorAll(".action-tab-btn").forEach((btn) => {
@@ -1979,6 +1986,14 @@
 
       const okCount = results.filter((r) => ["inserted", "merged", "triggered"].includes(r.status)).length;
       setBqStatus(`${okCount} of ${results.length} step(s) completed. ${QUICK_ALIGN_ASYNC_NOTE}`);
+
+      // If the Buffer tab is already loaded for one of the companies this just
+      // triggered Reprocess/Sync for, watch that run through to completion the exact
+      // same way the Buffer tab's own buttons do — so switching over (or just leaving
+      // it open) shows the real end state instead of whatever was last fetched.
+      const runIds = data.run_ids || [];
+      const matching = state && runIds.find((r) => r.company === state.company);
+      if (matching) startWatching(matching.run_id, state.order_count);
     } catch (e) {
       setBqStatus("Could not run Quick Align: " + e.message, true);
     } finally {
