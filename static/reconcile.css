@@ -727,7 +727,6 @@
 .bq-results-list { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
 .bq-key-wrap { display: flex; align-items: flex-start; gap: 10px; }
 .bq-row-check { margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; }
-.bq-row.bq-ineligible { opacity: .6; }
 .bq-status-badges { display: flex; gap: 6px; flex-wrap: wrap; }
 .bq-status-badge {
   font-size: .68rem;
