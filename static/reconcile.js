@@ -24,10 +24,9 @@
   const bqStatusLine      = document.getElementById("bq-status-line");
   const bqResultsList     = document.getElementById("bq-results-list");
   const bqInsertAction    = document.getElementById("bq-insert-action");
-  const bqInsertBtn       = document.getElementById("bq-insert-btn");
-  const bqInsertResults   = document.getElementById("bq-insert-results");
   const bqReportBtn       = document.getElementById("bq-report-btn");
   const bqReportResult    = document.getElementById("bq-report-result");
+  const bqQuickAlignAllBtn = document.getElementById("bq-quick-align-all-btn");
   const documentAiRowTemplate = document.getElementById("document-ai-row-template");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
@@ -1356,8 +1355,8 @@
   // Read-only log of every PO a Reprocess Buffer run has touched (so_buffer_history_{env},
   // written by rgmc-worker-pool) — distinct from the sku/branch/customer "Past
   // resolutions" history above, which is about override links, not PO attempts.
-  const OUTCOME_LABEL = { resolved: "Resolved", still_buffered: "Still buffered", failed: "Failed" };
-  const OUTCOME_BADGE_CLASS = { resolved: "ready", still_buffered: "pending", failed: "failed" };
+  const OUTCOME_LABEL = { resolved: "Resolved", still_buffered: "Still buffered", failed: "Failed", blocked_in_bc: "Blocked in BC" };
+  const OUTCOME_BADGE_CLASS = { resolved: "ready", still_buffered: "pending", failed: "failed", blocked_in_bc: "failed" };
 
   function setHistoryStatus(msg, isError) {
     historyStatusLine.textContent = msg || "";
@@ -1872,19 +1871,11 @@
     `;
   }
 
-  function updateBqInsertActionState() {
-    const checked = bqResultsList.querySelectorAll(".bq-row-check:checked");
-    bqInsertAction.classList.toggle("hidden", bqResultsList.querySelectorAll(".bq-row-check").length === 0);
-    bqInsertBtn.disabled = checked.length === 0;
-    bqInsertBtn.textContent = `Add Selected (${checked.length}) to Buffer`;
-  }
-
   function buildDocumentAiRow(header) {
     const node = documentAiRowTemplate.content.cloneNode(true);
     const row = node.querySelector(".bq-row");
-    const checkbox = row.querySelector(".bq-row-check");
     const poRef = header.po_ref_number || "";
-    checkbox.dataset.poRef = poRef;
+    row.dataset.poRef = poRef;
 
     const isMssqlSourced = header._source === "mssql";
 
@@ -1907,23 +1898,6 @@
       `bq-status-badge bq-status-bc ${bqBadgeClass(header.in_bc)}`;
     row.querySelector(".bq-status-bc").textContent = bqBadgeLabel("BC", header.in_bc);
 
-    // Eligible to select: either genuinely not yet in MSSQL (the normal BigQuery-
-    // sourced case — needs an MSSQL insert), OR found only via the CustomerPOUL
-    // fallback (already in MSSQL by definition, but that's the whole point of this
-    // row existing — it still needs buffering, just with no MSSQL insert step).
-    // Anything else already in MSSQL through the normal BigQuery path is shown for
-    // status visibility only — the existing Sync/Backfill/Reprocess flows already
-    // cover it.
-    if (!isMssqlSourced && header.in_mssql !== false) {
-      checkbox.disabled = true;
-      checkbox.title = header.in_mssql === null
-        ? "Could not confirm MSSQL status — re-run the search before relying on this."
-        : "Already in MSSQL — use Sync/Backfill/Reprocess instead.";
-      row.classList.add("bq-ineligible");
-    } else {
-      checkbox.addEventListener("change", updateBqInsertActionState);
-    }
-
     const toggleBtn = row.querySelector(".bq-detail-toggle");
     const detailEl = row.querySelector(".bq-detail-lines");
     toggleBtn.addEventListener("click", () => {
@@ -1936,10 +1910,6 @@
       toggleBtn.textContent = show ? "Hide detail lines" : "Show detail lines";
     });
 
-    const alignBtn = row.querySelector(".btn-quick-align");
-    const alignResultEl = row.querySelector(".bq-align-result");
-    alignBtn.addEventListener("click", () => quickAlignOneRow(header, alignBtn, alignResultEl));
-
     return row;
   }
 
@@ -1947,51 +1917,82 @@
     inserted: "✅", merged: "✅", triggered: "✅", aligned: "✅",
     blocked: "⛔", unknown: "❓", not_found: "❓", failed: "❌",
   };
+  const QUICK_ALIGN_ASYNC_NOTE =
+    "⏳ Reprocess Buffer / Sync from Cloud SQL run in the background — re-run this search " +
+    "later, or check the Buffer/History tabs, to confirm each PO fully resolved.";
 
-  // Checks this one PO against all three data sources server-side (BigQuery is
-  // always the source of truth) and runs whichever existing tool brings MSSQL/BC up
-  // to match it — see /api/bigquery/quick-align. Scoped to this single row's own
-  // detail lines, not the whole search result set.
-  async function quickAlignOneRow(header, btn, resultEl) {
+  // Checks every currently-searched PO against all three data sources server-side
+  // (BigQuery is always the source of truth) and runs whichever existing tool brings
+  // MSSQL/BC up to match it — see /api/bigquery/quick-align. One batch call for the
+  // whole result set (not one call per row) so POs sharing a company get folded into
+  // a single Reprocess Buffer / Sync from Cloud SQL trigger instead of each row
+  // tripping the 30s-per-path rate limiter on its own.
+  async function quickAlignAll() {
     if (!refreshGate()) {
       setBqStatus("Fill in your details above first.", true);
       return;
     }
-    const poRef = header.po_ref_number || "";
-    const lines = bqDetails.filter((d) => d.po_ref_number === poRef);
-    const spinner = btn.querySelector(".btn-spinner");
-    const label = btn.querySelector(".btn-quick-align-label");
-
-    btn.disabled = true;
-    if (spinner) spinner.classList.remove("hidden");
-    if (label) label.textContent = "Aligning…";
+    if (!bqHeaders.length) {
+      setBqStatus("Nothing to align — run a search first.", true);
+      return;
+    }
+    const spinner = document.getElementById("bq-quick-align-all-spinner");
+    const label = document.getElementById("bq-quick-align-all-btn-label");
+    bqQuickAlignAllBtn.disabled = true;
+    spinner.classList.remove("hidden");
+    label.textContent = `Aligning ${bqHeaders.length} PO(s)…`;
+    setBqStatus(`Running Quick Align for ${bqHeaders.length} PO(s)…`);
     try {
       const res = await fetch("/api/bigquery/quick-align", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ headers: [header], details: lines, employee: getEmployeeDetails() }),
+        body: JSON.stringify({ headers: bqHeaders, details: bqDetails, employee: getEmployeeDetails() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Quick Align failed");
       const results = data.data || [];
-      resultEl.innerHTML = results.map((r) => `
-        <div>${QUICK_ALIGN_ICON[r.status] || "❓"} ${escapeHtml(r.detail)}</div>
-      `).join("") || "<div>Nothing to align.</div>";
-      resultEl.classList.remove("hidden");
+
+      // Group per-PO messages, plus company-level ones (po_ref === null — the single
+      // Reprocess Buffer trigger covering every "not yet in BC" PO for that company
+      // at once) onto every row for that company.
+      const byPoRef = {};
+      const byCompany = {};
+      results.forEach((r) => {
+        if (r.po_ref) (byPoRef[r.po_ref] = byPoRef[r.po_ref] || []).push(r);
+        else if (r.company) (byCompany[r.company] = byCompany[r.company] || []).push(r);
+      });
+
+      bqHeaders.forEach((h) => {
+        const poRef = h.po_ref_number || "";
+        const row = bqResultsList.querySelector(`.bq-row[data-po-ref="${CSS.escape(poRef)}"]`);
+        if (!row) return;
+        const resultEl = row.querySelector(".bq-align-result");
+        const ownMsgs = byPoRef[poRef] || [];
+        const company = ownMsgs.length ? ownMsgs[0].company : null;
+        const msgs = ownMsgs.concat(company && byCompany[company] ? byCompany[company] : []);
+        if (!msgs.length) return; // "none" rows with nothing worth showing inline
+        resultEl.innerHTML = msgs.map((m) => `
+          <div>${QUICK_ALIGN_ICON[m.status] || "❓"} ${escapeHtml(m.detail)}</div>
+        `).join("") + `<div class="bq-align-async-note">${QUICK_ALIGN_ASYNC_NOTE}</div>`;
+        resultEl.classList.remove("hidden");
+      });
+
+      const okCount = results.filter((r) => ["inserted", "merged", "triggered"].includes(r.status)).length;
+      setBqStatus(`${okCount} of ${results.length} step(s) completed. ${QUICK_ALIGN_ASYNC_NOTE}`);
     } catch (e) {
-      resultEl.innerHTML = `<div>❌ ${escapeHtml(e.message)}</div>`;
-      resultEl.classList.remove("hidden");
+      setBqStatus("Could not run Quick Align: " + e.message, true);
     } finally {
-      btn.disabled = false;
-      if (spinner) spinner.classList.add("hidden");
-      if (label) label.textContent = "⚡ Quick Align";
+      bqQuickAlignAllBtn.disabled = false;
+      spinner.classList.add("hidden");
+      label.textContent = "⚡ Quick Align All";
     }
   }
 
+  bqQuickAlignAllBtn.addEventListener("click", quickAlignAll);
+
   function renderBqResults(headers) {
     bqResultsList.innerHTML = "";
-    bqInsertResults.innerHTML = "";
-    bqInsertResults.classList.add("hidden");
+    bqReportResult.classList.add("hidden");
     if (!headers.length) {
       const empty = document.createElement("div");
       empty.className = "tab-empty";
@@ -2001,7 +2002,7 @@
       return;
     }
     headers.forEach((h) => bqResultsList.appendChild(buildDocumentAiRow(h)));
-    updateBqInsertActionState();
+    bqInsertAction.classList.remove("hidden");
   }
 
   async function searchDocumentAi() {
@@ -2040,64 +2041,8 @@
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) searchDocumentAi();
   });
 
-  bqInsertBtn.addEventListener("click", async () => {
-    if (!refreshGate()) {
-      setBqStatus("Fill in your details above first.", true);
-      return;
-    }
-    const checkedBoxes = [...bqResultsList.querySelectorAll(".bq-row-check:checked")];
-    if (!checkedBoxes.length) return;
-    const selectedRefs = new Set(checkedBoxes.map((c) => c.dataset.poRef));
-    // Re-match against the search's own header list (not the DOM) for the exact
-    // snake_case BigQuery shape the backend expects — the DOM only has display text.
-    const headers = bqHeaders.filter((h) => selectedRefs.has(h.po_ref_number || ""));
-    const details = bqDetails.filter((d) => selectedRefs.has(d.po_ref_number));
-
-    const toInsert = headers.filter((h) => h._source !== "mssql").length;
-    const toBufferOnly = headers.length - toInsert;
-    const confirmParts = [];
-    if (toInsert) confirmParts.push(`insert ${toInsert} PO(s) into MSSQL (CustomerPOULBQ/CustomerPOULDetailBQ)`);
-    if (toBufferOnly) confirmParts.push(`add ${toBufferOnly} PO(s) already in MSSQL straight to the buffer (no MSSQL insert needed)`);
-    if (!confirm(
-      `This will ${confirmParts.join(" and ")}. None of them will be auto-imported into BC. Continue?`
-    )) return;
-
-    bqInsertBtn.disabled = true;
-    const origLabel = bqInsertBtn.textContent;
-    bqInsertBtn.textContent = "Adding…";
-    try {
-      const res = await fetch("/api/bigquery/insert-and-buffer", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ headers, details, employee: getEmployeeDetails() }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || data.detail || "Insert failed");
-      const results = data.data || [];
-      const statusIcon = { inserted: "✅", merged: "➕", blocked: "⛔", failed: "❌" };
-      const rowClass = { inserted: "ok", merged: "ok", blocked: "blocked" };
-      bqInsertResults.innerHTML = results.map((r) => `
-        <div class="update-result-row ${rowClass[r.status] || "fail"}">
-          <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-          <span>${statusIcon[r.status] || "?"} ${escapeHtml(r.detail)}</span>
-        </div>
-      `).join("");
-      bqInsertResults.classList.remove("hidden");
-      setBqStatus(
-        `${data.ok_count} added to the buffer (new or merged), ${data.blocked_count} already in BC ` +
-        `(blocked, recorded to history), ${data.total - data.ok_count - data.blocked_count} failed. ` +
-        `Re-run the search to refresh MSSQL/BC status.`
-      );
-    } catch (e) {
-      setBqStatus("Could not insert: " + e.message, true);
-    } finally {
-      bqInsertBtn.disabled = false;
-      bqInsertBtn.textContent = origLabel;
-    }
-  });
-
-  // Generate Report covers every result the current search found (not just what's
-  // checked) — it's a status snapshot for a person-in-charge, not an action on BC/MSSQL.
+  // Generate Report covers every result the current search found — it's a status
+  // snapshot for a person-in-charge, not an action on BC/MSSQL.
   bqReportBtn.addEventListener("click", async () => {
     if (!refreshGate()) {
       setBqStatus("Fill in your details above first.", true);

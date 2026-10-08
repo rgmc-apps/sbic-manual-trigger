@@ -167,6 +167,7 @@
                   <option value="resolved">Resolved</option>
                   <option value="still_buffered">Still buffered</option>
                   <option value="failed">Failed</option>
+                  <option value="blocked_in_bc">Blocked in BC</option>
                 </select>
               </div>
             </div>
@@ -265,25 +266,31 @@
             <ul class="hint-list">
               <li>An exact PO ref search also checks <code>CustomerPOUL</code> for refs BigQuery never got at all (e.g.
                 legacy-app entries) — flagged "Not in BigQuery."</li>
-              <li><strong>⚡ Quick Align</strong> (per row) fixes the gap automatically using the existing tools: not
-                yet in BC → inserts into MSSQL + buffers it + triggers Reprocess Buffer; in BC but missing lines →
-                triggers Sync from Cloud SQL for just that PO. It never writes to BC directly.</li>
-              <li><strong>Add Selected to Buffer</strong> and <strong>📋 Generate Shareable Report</strong> below act on
-                every result currently shown — the report gives a link anyone can open to see each PO's status, has its
-                own <strong>⚡ Quick Align</strong> buttons (needs their own name/email first), a direct link to the
-                Buffer tab per company, and a print-to-PDF option.</li>
+              <li><strong>⚡ Quick Align All</strong> is the one button that fixes every result shown, using the same
+                existing, already-vetted tools this page always used — not yet in BC → inserts into MSSQL + buffers it,
+                then one <strong>Reprocess Buffer</strong> trigger per company covers every PO that needed it; in BC
+                but missing lines → one <strong>Sync from Cloud SQL</strong> trigger per company covers every PO
+                missing lines. It <strong>never</strong> writes to BC directly.</li>
+              <li>Reprocessing/syncing happens in the <strong>background</strong> — it is not instant. Re-run the
+                search later, or check the Buffer/History tabs, to confirm each PO actually resolved in BC; a click
+                here is a trigger, not a guarantee, so treat Business Central itself as the final check.</li>
+              <li><strong>📋 Generate Shareable Report</strong> acts on every result currently shown — gives a link
+                anyone can open to see each PO's status, has its own <strong>⚡ Quick Align All</strong> button (needs
+                their own name/email first), a direct link to the Buffer tab per company, and a print-to-PDF option.</li>
             </ul>
           </div>
           <p class="status-line" id="bq-status-line"></p>
           <div class="bq-results-list" id="bq-results-list"></div>
           <div class="bq-insert-action hidden" id="bq-insert-action">
-            <button class="btn-reprocess btn-update-orders" id="bq-insert-btn" type="button" disabled>Add Selected (0) to Buffer</button>
+            <button class="btn-reprocess btn-bq-quick-align-all" id="bq-quick-align-all-btn" type="button">
+              <span class="btn-spinner hidden" id="bq-quick-align-all-spinner"></span>
+              <span id="bq-quick-align-all-btn-label">⚡ Quick Align All</span>
+            </button>
             <button class="btn-reprocess btn-bq-report" id="bq-report-btn" type="button">
               <span class="btn-spinner hidden" id="bq-report-spinner"></span>
               <span id="bq-report-btn-label">📋 Generate Shareable Report</span>
             </button>
           </div>
-          <div class="bq-insert-results hidden" id="bq-insert-results"></div>
           <div class="bq-report-result hidden" id="bq-report-result"></div>
         </div>
 
@@ -468,12 +475,14 @@
     </div>
   </template>
 
-  <!-- BigQuery document-ai header row template -->
+  <!-- BigQuery document-ai header row template — read-only status display. Every row
+       shown is acted on by the single Quick Align All button below the list; there is
+       no per-row selection, so BC remains the one place that actually validates a PO
+       before/after it's touched. -->
   <template id="document-ai-row-template">
     <div class="group-row bq-row">
       <div class="group-head">
         <div class="group-key-wrap bq-key-wrap">
-          <input type="checkbox" class="bq-row-check" />
           <div>
             <span class="group-key"></span>
             <span class="group-desc"></span>
@@ -487,10 +496,6 @@
       </div>
       <div class="bq-row-actions">
         <button class="btn-history-toggle bq-detail-toggle" type="button">Show detail lines</button>
-        <button class="btn-quick-align" type="button">
-          <span class="btn-spinner hidden"></span>
-          <span class="btn-quick-align-label">⚡ Quick Align</span>
-        </button>
       </div>
       <div class="bq-detail-lines hidden"></div>
       <div class="bq-align-result hidden"></div>
