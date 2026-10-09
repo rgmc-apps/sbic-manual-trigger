@@ -700,12 +700,26 @@
     const searchInput = row.querySelector(".search-input");
     const searchResults = row.querySelector(".search-results");
     if (type === "uom") {
-      // No free-text search for uom — an item's BC-valid units of measure are a
-      // short, fixed list (rgmc-bc-api's Item Unit of Measure lookup, scoped to
-      // group.item_no), so it's loaded once in full the first time the panel opens
-      // rather than typed for.
-      row.querySelector(".search-row").style.display = "none";
+      // Candidates stay scoped to THIS item's own BC-valid units (rgmc-bc-api's Item
+      // Unit of Measure lookup) — never a free-text search across every unit code in
+      // BC, since a code not already attached to this item in BC would just fail the
+      // exact same rejection again (confirmed live for MU01CH02: BC's company-wide
+      // Units of Measure list has 13 codes incl. "CS", but MU01CH02's OWN Item Units
+      // of Measure table has exactly one, "PC/S" — those are different BC tables).
+      // The full (short) list loads once per panel-open; the search box just filters
+      // it client-side, for an item with enough valid units that scrolling is a pain.
+      searchInput.placeholder = "Filter this item's valid units…";
+      let uomCandidates = null;
       let uomLoaded = false;
+      function renderFiltered() {
+        const term = searchInput.value.trim().toLowerCase();
+        const filtered = !term
+          ? uomCandidates
+          : uomCandidates.filter((c) =>
+              (c.code || "").toLowerCase().includes(term) || (c.name || "").toLowerCase().includes(term)
+            );
+        renderCandidateList(searchResults, type, filtered, saveLink);
+      }
       toggleBtn.addEventListener("click", async () => {
         if (!linkPanel.classList.contains("is-open") || uomLoaded) return;
         uomLoaded = true;
@@ -715,11 +729,15 @@
           const res = await fetch(url);
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
-          renderCandidateList(searchResults, type, normalizeCandidates(type, data.data), saveLink);
+          uomCandidates = normalizeCandidates(type, data.data);
+          renderFiltered();
         } catch (e) {
           searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
           uomLoaded = false;
         }
+      });
+      searchInput.addEventListener("input", () => {
+        if (uomCandidates) renderFiltered();
       });
     } else {
       if (type === "branch") {
@@ -1811,12 +1829,24 @@
     if (ov.type === "branch") searchInput.placeholder = "Search by ship-to name, code, or lookup code…";
 
     if (ov.type === "uom") {
-      // A uom override's key is "{itemNo}::{rawUom}" — there's no free-text search for
-      // it (see buildGroupRow's equivalent uom handling), just the one item's full
-      // valid-UOM list, loaded once the first time the panel opens.
-      row.querySelector(".search-row").style.display = "none";
+      // A uom override's key is "{itemNo}::{rawUom}" — candidates stay scoped to this
+      // item's own BC-valid units (same reasoning as buildGroupRow's uom handling: a
+      // code not already attached to the item in BC would just fail again), loaded
+      // once the first time the panel opens; the search box filters that list
+      // client-side rather than re-querying BC per keystroke.
+      searchInput.placeholder = "Filter this item's valid units…";
       const itemNo = ov.key.split("::")[0];
+      let uomCandidates = null;
       let uomLoaded = false;
+      function renderFiltered() {
+        const term = searchInput.value.trim().toLowerCase();
+        const filtered = !term
+          ? uomCandidates
+          : uomCandidates.filter((c) =>
+              (c.code || "").toLowerCase().includes(term) || (c.name || "").toLowerCase().includes(term)
+            );
+        renderCandidateList(searchResults, ov.type, filtered, pickCandidate);
+      }
       toggleBtn.addEventListener("click", async () => {
         if (!linkPanel.classList.contains("is-open") || uomLoaded) return;
         uomLoaded = true;
@@ -1832,11 +1862,15 @@
           const res = await fetch(url);
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
-          renderCandidateList(searchResults, ov.type, normalizeCandidates(ov.type, data.data), pickCandidate);
+          uomCandidates = normalizeCandidates(ov.type, data.data);
+          renderFiltered();
         } catch (e) {
           searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
           uomLoaded = false;
         }
+      });
+      searchInput.addEventListener("input", () => {
+        if (uomCandidates) renderFiltered();
       });
       return row;
     }
