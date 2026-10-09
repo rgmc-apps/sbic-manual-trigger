@@ -193,6 +193,62 @@ def _proxy_json(resp: requests.Response):
     return body, resp.status_code
 
 
+# Matches the UOM-specific sentence inside rgmc-worker-pool's _describe_line_rejection
+# output, e.g. "item 'MU01CH02' (from reconcile-page SKU link): Unit of Measure Code
+# 'CS' does not exist in 'Item Unit of Measure' in BC — ...". Recovers (itemNo, badCode)
+# from last_error text alone, for an order buffered BEFORE line.uomIssue existed (every
+# failure prior to that fix shipping) — without this, those orders would never appear
+# on the Unit of Measure tab until their next reprocess attempt re-fails the same way.
+_UOM_REJECTION_RE = re.compile(
+    r"item '([^']+)' \(from [^)]+\): Unit of Measure Code '([^']+)' does not exist"
+)
+
+
+def _extract_uom_issues(order: dict) -> list[dict]:
+    """Every Unit-of-Measure rejection this buffered order currently carries, deduped
+    by item number — structurally tagged lines (line.uomIssue) first, then any rejection
+    named only in last_error (see _UOM_REJECTION_RE) that isn't already covered by one.
+    For a last_error-only match, the actual raw unit-of-measure text is recovered from
+    the order's own matching line (by resolvedItem.itemNo) — last_error only ever names
+    the REJECTED code (e.g. "CS"), never the original source text — so a uom override
+    saved from this stays correctly matchable against that line later
+    (so_buffer_service.apply_resolution_to_buffer compares against unitOfMeasurement
+    directly, not against anything derived from last_error).
+    Returns [{"itemNo", "rawUom", "badCode", "description"}, ...].
+    """
+    lines = order.get("lines") or []
+    issues: dict[str, dict] = {}
+
+    for line in lines:
+        uom_issue = line.get("uomIssue") or {}
+        item_no = (uom_issue.get("itemNo") or "").strip()
+        if item_no:
+            issues[item_no.upper()] = {
+                "itemNo": item_no,
+                "rawUom": uom_issue.get("rawUom") or "",
+                "badCode": uom_issue.get("badCode") or "",
+                "description": (line.get("resolvedItem") or {}).get("description")
+                or (line.get("customerSKUDesc") or "").strip(),
+            }
+
+    for item_no, bad_code in _UOM_REJECTION_RE.findall(order.get("last_error") or ""):
+        key = item_no.strip().upper()
+        if key in issues:
+            continue
+        match_line = next(
+            (l for l in lines if ((l.get("resolvedItem") or {}).get("itemNo") or "").strip().upper() == key),
+            None,
+        )
+        issues[key] = {
+            "itemNo": item_no,
+            "rawUom": (match_line.get("unitOfMeasurement") or "") if match_line else "",
+            "badCode": bad_code,
+            "description": ((match_line.get("resolvedItem") or {}) if match_line else {}).get("description") or "",
+        }
+
+    return list(issues.values())
+
+
 def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = None) -> dict:
     """Group buffered orders by shared SKU code / customer branch name / customer name.
 
@@ -288,28 +344,22 @@ def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = No
             if buffer_id not in g["buffer_ids"]:
                 g["buffer_ids"].append(buffer_id)
 
-            # uomIssue is tagged by rgmc-worker-pool only at the exact moment BC
-            # rejects this line's Unit of Measure Code for this item (see
-            # so_import_worker.py's _uom_rejection_bad_code) — a line without it either
-            # never reached BC yet or failed for an unrelated reason, so there's
-            # nothing to group here.
-            uom_issue = line.get("uomIssue") or {}
-            item_no = (uom_issue.get("itemNo") or "").strip()
-            if item_no:
-                raw_uom = uom_issue.get("rawUom") or ""
-                uom_key = f"{item_no}::{raw_uom}"
-                g = uom_groups.setdefault(uom_key.upper(), {
-                    "key": uom_key,
-                    "item_no": item_no,
-                    "raw_uom": raw_uom,
-                    "bad_code": uom_issue.get("badCode") or "",
-                    "description": (line.get("resolvedItem") or {}).get("description") or desc,
-                    "po_refs": [], "buffer_ids": [],
-                })
-                if po_ref not in g["po_refs"]:
-                    g["po_refs"].append(po_ref)
-                if buffer_id not in g["buffer_ids"]:
-                    g["buffer_ids"].append(buffer_id)
+        for uom_issue in _extract_uom_issues(order):
+            item_no = uom_issue["itemNo"]
+            raw_uom = uom_issue["rawUom"]
+            uom_key = f"{item_no}::{raw_uom}"
+            g = uom_groups.setdefault(uom_key.upper(), {
+                "key": uom_key,
+                "item_no": item_no,
+                "raw_uom": raw_uom,
+                "bad_code": uom_issue["badCode"],
+                "description": uom_issue["description"],
+                "po_refs": [], "buffer_ids": [],
+            })
+            if po_ref not in g["po_refs"]:
+                g["po_refs"].append(po_ref)
+            if buffer_id not in g["buffer_ids"]:
+                g["buffer_ids"].append(buffer_id)
 
     def _finalize(groups: dict, override_type: str) -> list:
         result = []
