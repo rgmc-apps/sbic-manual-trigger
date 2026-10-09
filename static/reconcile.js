@@ -135,7 +135,7 @@
     }
   }
 
-  const LOOKUP_PATH = { sku: "items", branch: "ship-to", customer: "customers" };
+  const LOOKUP_PATH = { sku: "items", branch: "ship-to", customer: "customers", uom: "uom" };
 
   // { company, order_count, orders, groups: { sku: [...], branch: [...], customer: [...] } }
   let state = null;
@@ -200,7 +200,7 @@
     setStatText("stat-orders", state.order_count);
 
     let totalGroups = 0, totalResolved = 0;
-    ["sku", "branch", "customer"].forEach((type) => {
+    ["sku", "branch", "customer", "uom"].forEach((type) => {
       const list = state.groups[type];
       const done = resolvedCount(list);
       setStatText(`stat-${type}`, `${done}/${list.length}`);
@@ -256,6 +256,16 @@
           raw: c,
         };
       }
+      if (type === "uom") {
+        // rgmc-bc-api's Item Unit of Measure lookup — code/description/
+        // qtyPerUnitOfMeasure, already scoped to the group's one item.
+        return {
+          code: c.code, name: c.description || "",
+          score: null, extra: null,
+          extraLabel: c.qtyPerUnitOfMeasure != null ? `qty per UOM: ${c.qtyPerUnitOfMeasure}` : null,
+          raw: c,
+        };
+      }
       // customer — RGMC's custom customers page uses customerNo/name/address
       return { code: c.customerNo, name: c.name || "", address: c.address || "", score: c.score, extra: null, raw: c };
     });
@@ -264,6 +274,7 @@
   function resolvedPayload(type, candidate) {
     if (type === "sku") return { itemNo: candidate.code, description: candidate.name };
     if (type === "branch") return { customerNo: candidate.extra, shipToCode: candidate.code, name: candidate.name };
+    if (type === "uom") return { uomCode: candidate.code, description: candidate.name };
     return { customerNo: candidate.code, displayName: candidate.name };
   }
 
@@ -294,6 +305,7 @@
     if (!resolved) return "";
     if (resolved.itemNo) return `${resolved.itemNo} — ${resolved.description || ""}`;
     if (resolved.shipToCode) return `${resolved.shipToCode} (${resolved.customerNo}) — ${resolved.name || ""}`;
+    if (resolved.uomCode) return `${resolved.uomCode} — ${resolved.description || ""}`;
     if (resolved.customerNo) return `${resolved.customerNo} — ${resolved.displayName || ""}`;
     return JSON.stringify(resolved);
   }
@@ -452,6 +464,9 @@
       const company = group.company_name || "—";
       return `${group.key} (${customer} - ${company})`;
     }
+    if (type === "uom") {
+      return `${group.item_no} — raw unit "${group.raw_uom}" (BC rejected "${group.bad_code}")`;
+    }
     return group.key;
   }
 
@@ -474,8 +489,8 @@
     const orders = state.orders.filter((o) => ids.has(o.id));
     if (!orders.length) return null;
 
-    const labelFor = { branch: "Branch", customer: "Customer", sku: "Items" };
-    const needs = { branch: 0, customer: 0, sku: 0 };
+    const labelFor = { branch: "Branch", customer: "Customer", sku: "Items", uom: "Unit of Measure" };
+    const needs = { branch: 0, customer: 0, sku: 0, uom: 0 };
     const blocked = []; // { poRef, labels } — which specific PO(s), and what each still needs
     orders.forEach((o) => {
       const r = orderReadiness(o);
@@ -484,6 +499,7 @@
       if (!r.branchOk) { needs.branch++; missing.push(labelFor.branch); }
       if (!r.customerOk) { needs.customer++; missing.push(labelFor.customer); }
       if (!r.skuOk) { needs.sku++; missing.push(labelFor.sku); }
+      if (!r.uomOk) { needs.uom++; missing.push(labelFor.uom); }
       if (missing.length) blocked.push({ poRef: (o.header || {}).poRefNumber || o.id, labels: missing });
     });
     if (!blocked.length) return null;
@@ -557,8 +573,9 @@
 
           renderGroupsPanel("sku");
           renderInactivePanel();
-          renderGroupsPanel("branch"); // branch/customer blocked-notes may change — inactive SKUs no longer count against order readiness
+          renderGroupsPanel("branch"); // branch/customer/uom blocked-notes may change — inactive SKUs no longer count against order readiness
           renderGroupsPanel("customer");
+          renderGroupsPanel("uom");
           renderOrdersPanel(); // readiness may have changed
           renderSummary();
           setStatus(`Marked "${group.key}" inactive.`);
@@ -653,11 +670,13 @@
       }
     }
 
-    // Suggestions (BC fuzzy match via rgmc-gcp-api) — sku/branch only.
+    // Suggestions (BC fuzzy match via rgmc-gcp-api) — sku/branch only. "customer" has
+    // no suggest endpoint (inferred via its branch link instead); "uom" has no fuzzy
+    // match either — its "search" below already loads the item's full valid-UOM list.
     const suggestBtn = row.querySelector(".btn-suggest");
     const suggestStatus = row.querySelector(".suggest-status");
     const suggestResults = row.querySelector(".suggest-results");
-    if (type === "customer") {
+    if (type === "customer" || type === "uom") {
       suggestBtn.style.display = "none";
     } else {
       suggestBtn.addEventListener("click", async () => {
@@ -679,35 +698,59 @@
 
     // Manual search (BC list/search via rgmc-bc-api).
     const searchInput = row.querySelector(".search-input");
-    if (type === "branch") {
-      searchInput.placeholder = "Search by ship-to name, code, or lookup code…";
-    }
     const searchResults = row.querySelector(".search-results");
-    let searchTimer = null;
-    searchInput.addEventListener("input", () => {
-      clearTimeout(searchTimer);
-      const term = searchInput.value.trim();
-      if (term.length < 2) {
-        searchResults.innerHTML = "";
-        return;
-      }
-      searchTimer = setTimeout(async () => {
+    if (type === "uom") {
+      // No free-text search for uom — an item's BC-valid units of measure are a
+      // short, fixed list (rgmc-bc-api's Item Unit of Measure lookup, scoped to
+      // group.item_no), so it's loaded once in full the first time the panel opens
+      // rather than typed for.
+      row.querySelector(".search-row").style.display = "none";
+      let uomLoaded = false;
+      toggleBtn.addEventListener("click", async () => {
+        if (!linkPanel.classList.contains("is-open") || uomLoaded) return;
+        uomLoaded = true;
         searchResults.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
         try {
-          const url = `/api/lookup/${LOOKUP_PATH[type]}?search=${encodeURIComponent(term)}&company=${encodeURIComponent(state.company)}`;
+          const url = `/api/lookup/uom?item_no=${encodeURIComponent(group.item_no)}&company=${encodeURIComponent(state.company)}`;
           const res = await fetch(url);
           const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
-          // Stale response guard — the debounce already waits 350ms, but a slow BC
-          // round-trip can still resolve after the user has typed something newer.
-          if (searchInput.value.trim() !== term) return;
+          if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
           renderCandidateList(searchResults, type, normalizeCandidates(type, data.data), saveLink);
         } catch (e) {
-          if (searchInput.value.trim() !== term) return;
           searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+          uomLoaded = false;
         }
-      }, 350);
-    });
+      });
+    } else {
+      if (type === "branch") {
+        searchInput.placeholder = "Search by ship-to name, code, or lookup code…";
+      }
+      let searchTimer = null;
+      searchInput.addEventListener("input", () => {
+        clearTimeout(searchTimer);
+        const term = searchInput.value.trim();
+        if (term.length < 2) {
+          searchResults.innerHTML = "";
+          return;
+        }
+        searchTimer = setTimeout(async () => {
+          searchResults.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
+          try {
+            const url = `/api/lookup/${LOOKUP_PATH[type]}?search=${encodeURIComponent(term)}&company=${encodeURIComponent(state.company)}`;
+            const res = await fetch(url);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
+            // Stale response guard — the debounce already waits 350ms, but a slow BC
+            // round-trip can still resolve after the user has typed something newer.
+            if (searchInput.value.trim() !== term) return;
+            renderCandidateList(searchResults, type, normalizeCandidates(type, data.data), saveLink);
+          } catch (e) {
+            if (searchInput.value.trim() !== term) return;
+            searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+          }
+        }, 350);
+      });
+    }
 
     // History — past resolutions for this exact key, for reference (e.g. it was
     // resolved before under a different link, or by someone else).
@@ -749,7 +792,7 @@
   // that a SKU group's blocked-note was counting as unready. Refresh the two panels
   // the caller didn't just rebuild itself so their blocked notes stay in sync.
   function refreshOtherGroupPanels(exceptType) {
-    ["sku", "branch", "customer"].forEach((t) => {
+    ["sku", "branch", "customer", "uom"].forEach((t) => {
       if (t !== exceptType) renderGroupsPanel(t);
     });
   }
@@ -845,8 +888,9 @@
 
         renderGroupsPanel("sku");
         renderInactivePanel();
-        renderGroupsPanel("branch"); // branch/customer blocked-notes may change — this SKU counts against order readiness again
+        renderGroupsPanel("branch"); // branch/customer/uom blocked-notes may change — this SKU counts against order readiness again
         renderGroupsPanel("customer");
+        renderGroupsPanel("uom");
         renderOrdersPanel(); // readiness may have changed
         renderSummary();
         setStatus(`Reactivated "${group.key}".`);
@@ -887,10 +931,18 @@
     }))].filter((s) => !isSkuInactive(s));
     const skuResolved = skuKeys.filter((s) => groupResolvedFor("sku", s)).length;
     const skuOk = skuKeys.length === 0 || skuResolved === skuKeys.length;
+    // uomIssue is only tagged by rgmc-worker-pool at the moment BC actually rejects a
+    // line's Unit of Measure Code for its item — a line without it isn't a UOM problem.
+    const uomKeys = [...new Set(
+      lines.filter((l) => l.uomIssue && l.uomIssue.itemNo).map((l) => `${l.uomIssue.itemNo}::${l.uomIssue.rawUom || ""}`)
+    )];
+    const uomResolved = uomKeys.filter((k) => groupResolvedFor("uom", k)).length;
+    const uomOk = uomKeys.length === 0 || uomResolved === uomKeys.length;
     return {
-      branchOk, customerOk, skuOk,
+      branchOk, customerOk, skuOk, uomOk,
       skuResolved, skuTotal: skuKeys.length,
-      ready: branchOk && customerOk && skuOk,
+      uomResolved, uomTotal: uomKeys.length,
+      ready: branchOk && customerOk && skuOk && uomOk,
     };
   }
 
@@ -928,6 +980,7 @@
           <span class="link-chip ${r.branchOk ? "ok" : "pending"}">Branch ${r.branchOk ? "✓" : "✗"}</span>
           <span class="link-chip ${r.customerOk ? "ok" : "pending"}">Customer ${r.customerOk ? "✓" : "✗"}</span>
           <span class="link-chip ${r.skuOk ? "ok" : "pending"}">Items ${r.skuResolved}/${r.skuTotal}</span>
+          ${r.uomTotal ? `<span class="link-chip ${r.uomOk ? "ok" : "pending"}">Unit of Measure ${r.uomResolved}/${r.uomTotal}</span>` : ""}
         </div>
         <div class="order-error">${escapeHtml(order.last_error || "")}</div>
       `;
@@ -1001,6 +1054,7 @@
     renderInactivePanel();
     renderGroupsPanel("branch");
     renderGroupsPanel("customer");
+    renderGroupsPanel("uom");
     renderOrdersPanel();
     revealOnce(tabsCard);
     reprocessBtn.disabled = state.order_count === 0;
@@ -1491,7 +1545,7 @@
   // Sell-to Customer No. on an already-created order; that's deliberately left to a
   // human doing it in BC itself, since BC's own behavior once a header has lines isn't
   // something this page has ever exercised.
-  const OVERRIDE_TYPE_LABEL = { sku: "SKU", branch: "Branch", customer: "Customer" };
+  const OVERRIDE_TYPE_LABEL = { sku: "SKU", branch: "Branch", customer: "Customer", uom: "Unit of Measure" };
 
   function setOverridesStatus(msg, isError) {
     overridesStatusLine.textContent = msg || "";
@@ -1700,7 +1754,7 @@
     // Mutable, not a const snapshot — an edit below updates this so the button and the
     // auto-triggered post-edit search always act on the CURRENT vs. the just-replaced
     // customer number, not whatever was true when the row was first built.
-    let currentCustomerNo = ov.type === "sku" ? null : (ov.resolved || {}).customerNo;
+    let currentCustomerNo = ov.type === "sku" || ov.type === "uom" ? null : (ov.resolved || {}).customerNo;
     if (currentCustomerNo) findBtn.classList.remove("hidden");
     findBtn.addEventListener("click", () => findPreviousOrders(currentCustomerNo, findStatusEl, findResultsEl, ov));
 
@@ -1720,9 +1774,73 @@
 
     toggleBtn.addEventListener("click", () => linkPanel.classList.toggle("is-open"));
 
+    async function pickCandidate(candidate) {
+      const oldCustomerNo = currentCustomerNo;
+      linkPanel.classList.add("is-saving");
+      try {
+        const resolvedBy = getEmployeeDetails().employee_name;
+        const resolved = resolvedPayload(ov.type, candidate);
+        const data = await saveOverride(ov.type, ov.key, resolved, resolvedBy, []);
+        ov.resolved = resolved;
+        ov.resolved_by = data.resolved_by || "";
+        ov.resolved_at = data.resolved_at || "";
+        ov.id = data.id;
+        resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(ov.resolved);
+        resolvedBox.querySelector(".resolved-by").textContent =
+          ov.resolved_by ? `(by ${ov.resolved_by}, ${ov.resolved_at || ""})` : "";
+        linkPanel.classList.remove("is-open");
+        setOverridesStatus(`Updated the link for "${ov.key}".`);
+
+        currentCustomerNo = ov.type === "sku" || ov.type === "uom" ? null : resolved.customerNo;
+        if (currentCustomerNo) findBtn.classList.remove("hidden");
+        if (oldCustomerNo && currentCustomerNo && oldCustomerNo !== currentCustomerNo) {
+          // The link just changed — show what's now stale under the OLD value
+          // first, since that's the actionable list (the current value's own
+          // orders, if any, are presumably already correct).
+          await findPreviousOrders(oldCustomerNo, findStatusEl, findResultsEl, ov);
+        }
+      } catch (e) {
+        setOverridesStatus("Could not save link: " + e.message, true);
+      } finally {
+        linkPanel.classList.remove("is-saving");
+      }
+    }
+
     const searchInput = row.querySelector(".search-input");
     const searchResults = row.querySelector(".search-results");
     if (ov.type === "branch") searchInput.placeholder = "Search by ship-to name, code, or lookup code…";
+
+    if (ov.type === "uom") {
+      // A uom override's key is "{itemNo}::{rawUom}" — there's no free-text search for
+      // it (see buildGroupRow's equivalent uom handling), just the one item's full
+      // valid-UOM list, loaded once the first time the panel opens.
+      row.querySelector(".search-row").style.display = "none";
+      const itemNo = ov.key.split("::")[0];
+      let uomLoaded = false;
+      toggleBtn.addEventListener("click", async () => {
+        if (!linkPanel.classList.contains("is-open") || uomLoaded) return;
+        uomLoaded = true;
+        const company = overridesCompanySelect.value;
+        if (!company) {
+          searchResults.innerHTML = `<div class="search-hint">Select a company above first.</div>`;
+          uomLoaded = false;
+          return;
+        }
+        searchResults.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
+        try {
+          const url = `/api/lookup/uom?item_no=${encodeURIComponent(itemNo)}&company=${encodeURIComponent(company)}`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || data.error || "Lookup failed");
+          renderCandidateList(searchResults, ov.type, normalizeCandidates(ov.type, data.data), pickCandidate);
+        } catch (e) {
+          searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+          uomLoaded = false;
+        }
+      });
+      return row;
+    }
+
     let searchTimer = null;
     searchInput.addEventListener("input", () => {
       clearTimeout(searchTimer);
@@ -1744,37 +1862,7 @@
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
           if (searchInput.value.trim() !== term) return; // stale response guard
-          renderCandidateList(searchResults, ov.type, normalizeCandidates(ov.type, data.data), async (candidate) => {
-            const oldCustomerNo = currentCustomerNo;
-            linkPanel.classList.add("is-saving");
-            try {
-              const resolvedBy = getEmployeeDetails().employee_name;
-              const resolved = resolvedPayload(ov.type, candidate);
-              const data = await saveOverride(ov.type, ov.key, resolved, resolvedBy, []);
-              ov.resolved = resolved;
-              ov.resolved_by = data.resolved_by || "";
-              ov.resolved_at = data.resolved_at || "";
-              ov.id = data.id;
-              resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(ov.resolved);
-              resolvedBox.querySelector(".resolved-by").textContent =
-                ov.resolved_by ? `(by ${ov.resolved_by}, ${ov.resolved_at || ""})` : "";
-              linkPanel.classList.remove("is-open");
-              setOverridesStatus(`Updated the link for "${ov.key}".`);
-
-              currentCustomerNo = ov.type === "sku" ? null : resolved.customerNo;
-              if (currentCustomerNo) findBtn.classList.remove("hidden");
-              if (oldCustomerNo && currentCustomerNo && oldCustomerNo !== currentCustomerNo) {
-                // The link just changed — show what's now stale under the OLD value
-                // first, since that's the actionable list (the current value's own
-                // orders, if any, are presumably already correct).
-                await findPreviousOrders(oldCustomerNo, findStatusEl, findResultsEl, ov);
-              }
-            } catch (e) {
-              setOverridesStatus("Could not save link: " + e.message, true);
-            } finally {
-              linkPanel.classList.remove("is-saving");
-            }
-          });
+          renderCandidateList(searchResults, ov.type, normalizeCandidates(ov.type, data.data), pickCandidate);
         } catch (e) {
           if (searchInput.value.trim() !== term) return;
           searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;

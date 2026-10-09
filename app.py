@@ -217,6 +217,7 @@ def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = No
     sku_groups: dict[str, dict] = {}
     branch_groups: dict[str, dict] = {}
     customer_groups: dict[str, dict] = {}
+    uom_groups: dict[str, dict] = {}
 
     for order in orders:
         header = order.get("header") or {}
@@ -287,6 +288,29 @@ def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = No
             if buffer_id not in g["buffer_ids"]:
                 g["buffer_ids"].append(buffer_id)
 
+            # uomIssue is tagged by rgmc-worker-pool only at the exact moment BC
+            # rejects this line's Unit of Measure Code for this item (see
+            # so_import_worker.py's _uom_rejection_bad_code) — a line without it either
+            # never reached BC yet or failed for an unrelated reason, so there's
+            # nothing to group here.
+            uom_issue = line.get("uomIssue") or {}
+            item_no = (uom_issue.get("itemNo") or "").strip()
+            if item_no:
+                raw_uom = uom_issue.get("rawUom") or ""
+                uom_key = f"{item_no}::{raw_uom}"
+                g = uom_groups.setdefault(uom_key.upper(), {
+                    "key": uom_key,
+                    "item_no": item_no,
+                    "raw_uom": raw_uom,
+                    "bad_code": uom_issue.get("badCode") or "",
+                    "description": (line.get("resolvedItem") or {}).get("description") or desc,
+                    "po_refs": [], "buffer_ids": [],
+                })
+                if po_ref not in g["po_refs"]:
+                    g["po_refs"].append(po_ref)
+                if buffer_id not in g["buffer_ids"]:
+                    g["buffer_ids"].append(buffer_id)
+
     def _finalize(groups: dict, override_type: str) -> list:
         result = []
         for key_upper, g in groups.items():
@@ -318,6 +342,7 @@ def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = No
         "sku_inactive": sku_inactive,
         "branch": _finalize(branch_groups, "branch"),
         "customer": _finalize(customer_groups, "customer"),
+        "uom": _finalize(uom_groups, "uom"),
     }
 
 
@@ -624,6 +649,23 @@ def api_lookup_customers():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/lookup/uom")
+def api_lookup_uom():
+    """Valid units of measure for one item, via rgmc-bc-api's Item Unit of Measure
+    lookup — unlike the sku/branch/customer lookups, this is scoped to one exact
+    item_no (the group's own item), not a free-text search across a whole table."""
+    company = request.args.get("company", "")
+    item_no = (request.args.get("item_no") or "").strip()
+    if not item_no:
+        return jsonify({"data": []})
+    try:
+        resp = _bc_api("GET", f"/bc/custom/v2/items/{item_no}/unit-of-measure", params={"company": company})
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/lookup/ship-to")
 def api_lookup_ship_to():
     """Search existing BC ship-to addresses by name, via rgmc-bc-api."""
@@ -670,8 +712,8 @@ def api_save_override():
     resolved_by = (data.get("resolved_by") or "").strip()
     buffer_ids = data.get("buffer_ids") or []
 
-    if override_type not in ("sku", "branch", "customer"):
-        return jsonify({"error": "type must be sku, branch, or customer"}), 400
+    if override_type not in ("sku", "branch", "customer", "uom"):
+        return jsonify({"error": "type must be sku, branch, customer, or uom"}), 400
     if not key:
         return jsonify({"error": "key is required"}), 400
     if not resolved:

@@ -197,6 +197,7 @@
                   <option value="sku">SKU</option>
                   <option value="branch">Branch (Ship-To)</option>
                   <option value="customer">Customer</option>
+                  <option value="uom">Unit of Measure</option>
                 </select>
               </div>
             </div>
@@ -326,6 +327,7 @@
           <div class="summary-stat"><span class="summary-value" id="stat-sku">0/0</span><span class="summary-label">SKU groups resolved</span></div>
           <div class="summary-stat"><span class="summary-value" id="stat-branch">0/0</span><span class="summary-label">Branch groups resolved</span></div>
           <div class="summary-stat"><span class="summary-value" id="stat-customer">0/0</span><span class="summary-label">Customer groups resolved</span></div>
+          <div class="summary-stat"><span class="summary-value" id="stat-uom">0/0</span><span class="summary-label">Unit of Measure groups resolved</span></div>
         </div>
 
         <div class="overall-progress hidden" id="overall-progress">
@@ -350,14 +352,16 @@
           <button class="tab-btn" data-tab="sku-inactive">Inactive Items <span class="tab-count" id="tab-count-sku-inactive"></span></button>
           <button class="tab-btn" data-tab="branch">Customer Branches (Ship-To) <span class="tab-count" id="tab-count-branch"></span></button>
           <button class="tab-btn" data-tab="customer">Customers <span class="tab-count" id="tab-count-customer"></span></button>
+          <button class="tab-btn" data-tab="uom">Unit of Measure <span class="tab-count" id="tab-count-uom"></span></button>
           <button class="tab-btn" data-tab="orders">Buffered Orders <span class="tab-count" id="tab-count-orders"></span></button>
-          <span class="info-tip tabs-info-tip" tabindex="0" data-tooltip="Orders BC rejected on auto-import, held here until their SKU/branch/customer links are resolved and reprocessed.">ⓘ</span>
+          <span class="info-tip tabs-info-tip" tabindex="0" data-tooltip="Orders BC rejected on auto-import, held here until their SKU/branch/customer/unit-of-measure links are resolved and reprocessed.">ⓘ</span>
         </div>
 
         <div class="tab-panel" id="panel-sku" data-lookup="items"></div>
         <div class="tab-panel hidden" id="panel-sku-inactive"></div>
         <div class="tab-panel hidden" id="panel-branch" data-lookup="ship-to"></div>
         <div class="tab-panel hidden" id="panel-customer" data-lookup="customers"></div>
+        <div class="tab-panel hidden" id="panel-uom" data-lookup="uom"></div>
         <div class="tab-panel hidden" id="panel-orders"></div>
       </section>
 
