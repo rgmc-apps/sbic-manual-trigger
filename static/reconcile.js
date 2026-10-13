@@ -1984,20 +1984,30 @@
     return `? ${label}`;
   }
 
-  function renderBqDetailLines(poRef) {
+  // Same raw-SKU-or-description identity app.py's _buffer_line_key/so_buffer_service's
+  // _line_key use server-side, so a detail line here matches the bufferedSkus keys the
+  // search response already computed against the actual buffer doc's lines.
+  function bqLineBufferKey(l) {
+    const sku = (l.customer_sku_code || "").trim();
+    return (sku || (l.customer_sku_desc || "").trim() || "(no SKU code, no description)").toUpperCase();
+  }
+
+  function renderBqDetailLines(poRef, bufferedSkus) {
     const lines = bqDetails.filter((d) => d.po_ref_number === poRef);
     if (!lines.length) return '<p class="tab-empty">No detail lines found for this PO in BigQuery.</p>';
+    const bufferedSet = bufferedSkus ? new Set(bufferedSkus) : null;
     const rows = lines.map((l) => `
       <tr>
         <td>${escapeHtml(l.customer_sku_code || "—")}</td>
         <td>${escapeHtml(l.customer_sku_desc || "—")}</td>
         <td>${escapeHtml(l.po_qty ?? l.po_qty_pcs ?? "—")}</td>
         <td>${escapeHtml(l.unit_price ?? "—")}</td>
+        <td>${bufferedSet ? (bufferedSet.has(bqLineBufferKey(l)) ? "✓" : "—") : "—"}</td>
       </tr>
     `).join("");
     return `
       <table>
-        <thead><tr><th>SKU</th><th>Description</th><th>Qty</th><th>Unit Price</th></tr></thead>
+        <thead><tr><th>SKU</th><th>Description</th><th>Qty</th><th>Unit Price</th><th>In Buffer?</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     `;
@@ -2030,12 +2040,19 @@
       `bq-status-badge bq-status-bc ${bqBadgeClass(header.in_bc)}`;
     row.querySelector(".bq-status-bc").textContent = bqBadgeLabel("BC", header.in_bc);
 
+    // Unlike MSSQL/BC, being in the buffer isn't inherently bad (a brand-new PO sits
+    // there briefly before its first retry) — "missing"/warn styling just flags it as
+    // worth a look, "unknown"/neutral styling for the common not-buffered case.
+    row.querySelector(".bq-status-buffer").className =
+      `bq-status-badge bq-status-buffer ${header.in_buffer ? "missing" : "unknown"}`;
+    row.querySelector(".bq-status-buffer").textContent = header.in_buffer ? "📋 In Buffer" : "Not buffered";
+
     const toggleBtn = row.querySelector(".bq-detail-toggle");
     const detailEl = row.querySelector(".bq-detail-lines");
     toggleBtn.addEventListener("click", () => {
       const show = detailEl.classList.contains("hidden");
       if (show && !detailEl.dataset.rendered) {
-        detailEl.innerHTML = renderBqDetailLines(poRef);
+        detailEl.innerHTML = renderBqDetailLines(poRef, header.bufferedSkus);
         detailEl.dataset.rendered = "1";
       }
       detailEl.classList.toggle("hidden", !show);

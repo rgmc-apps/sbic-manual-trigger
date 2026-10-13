@@ -27,7 +27,7 @@ API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 # a header dict is sent on to rgmc-gcp-api's MSSQL insert (see api_bigquery_insert_and_buffer),
 # since __rename_columns there only renames columns it recognizes and leaves everything
 # else untouched, straight into the INSERT statement.
-BQ_UI_ONLY_HEADER_FIELDS = ("_source", "in_mssql", "in_bc")
+BQ_UI_ONLY_HEADER_FIELDS = ("_source", "in_mssql", "in_bc", "in_buffer", "bufferedSkus")
 
 # BC company codes this UI knows about, for the company picker. MTC (Manila Taste
 # Curators) removed 2026-10-08 — confirmed live that no "MTC" company exists in BC
@@ -1162,6 +1162,54 @@ def _enrich_document_ai_status(headers: list) -> None:
         h["in_bc"] = in_bc.get(ref, False)
 
 
+def _buffer_line_key(sku_code, sku_desc) -> str:
+    """Same raw-SKU identity so_buffer_service._line_key uses on the rgmc-bc-api side
+    (customerSKUCode, falling back to customerSKUDesc) — so a BigQuery detail line and
+    an already-buffered line for the same item compare equal regardless of which side
+    produced them."""
+    sku = (sku_code or "").strip()
+    return (sku or (sku_desc or "").strip() or "(no SKU code, no description)").upper()
+
+
+def _enrich_buffer_status(headers: list) -> None:
+    """Attach in_buffer (bool) and, when True, bufferedSkus (list[str]) to each header
+    dict, in place — whether this PO is already sitting in rgmc-worker-pool's Firestore
+    so_buffer_{env} (stuck pending manual reconciliation, or just not yet retried) and
+    which of its lines are already represented there. Without this, a PO already
+    queued for reconciliation reads the same as one Quick Align would be inserting
+    fresh, when in fact _insert_and_buffer would just merge in whatever lines are
+    still missing (see add_missing_lines_to_buffer) — see _bq_report_row's "not_in_bc"
+    branch, which uses this to say so explicitly.
+
+    One unfiltered GET /bc/custom/v2/so-buffer for the whole search (never per-PO or
+    per-company) — list_buffered_orders's own docstring says the collection is small
+    (tens of documents), so this is cheap regardless of how many headers were found.
+    """
+    if not headers:
+        return
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer")
+        body, status_code = _proxy_json(resp)
+        docs = (body.get("data") or []) if status_code == 200 else []
+    except requests.RequestException:
+        docs = []
+
+    by_po_ref: dict = {}
+    for doc in docs:
+        po_ref = (doc.get("header") or {}).get("poRefNumber")
+        if po_ref:
+            by_po_ref[po_ref] = doc
+
+    for h in headers:
+        doc = by_po_ref.get(h.get("po_ref_number"))
+        h["in_buffer"] = doc is not None
+        if doc is not None:
+            h["bufferedSkus"] = sorted({
+                _buffer_line_key(line.get("customerSKUCode"), line.get("customerSKUDesc"))
+                for line in (doc.get("lines") or [])
+            })
+
+
 def _split_po_refs(raw: str) -> list:
     return [p for p in re.split(r"[,\s]+", (raw or "").strip()) if p]
 
@@ -1274,6 +1322,7 @@ def api_bigquery_document_ai_search():
                     details.extend(mssql_lines)
 
         _enrich_document_ai_status(headers)
+        _enrich_buffer_status(headers)
         return jsonify({"headers": headers, "details": details})
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
@@ -1402,6 +1451,16 @@ def _bq_report_row(h: dict, details: list) -> dict:
     elif in_mssql is None:
         status = "unknown"
         action_steps = [f"{_b('Could not confirm MSSQL status')} — re-run the search in BigQuery Lookup before acting on this row."]
+    elif h.get("in_buffer"):
+        # Already sitting in the Firestore buffer (a prior import attempt failed, or it
+        # was added here before) — Quick Align's insert-and-buffer step would just
+        # merge in whatever lines are still missing (add_missing_lines_to_buffer),
+        # never a fresh insert, so say so instead of implying this is untouched.
+        status = "not_in_bc"
+        action_steps = [
+            f"{_b('Not yet in BC')} — but already sitting in the {_b('Buffer')} tab, waiting on reconciliation or a retry.",
+            f"Go to the {_b('Buffer')} tab, select {_b(company)}, resolve any flagged SKU/branch/customer/UOM links, then click {_b('Reprocess Buffer')}.",
+        ]
     else:
         status = "not_in_bc"
         buffer_note = "buffers it directly, no MSSQL insert needed" if (not in_bigquery or in_mssql) else "inserts it into MSSQL and buffers it"
@@ -1422,6 +1481,7 @@ def _bq_report_row(h: dict, details: list) -> dict:
         "in_bigquery": in_bigquery,
         "in_mssql": in_mssql,
         "in_bc": bool(so_number),
+        "in_buffer": bool(h.get("in_buffer")),
         "so_number": so_number,
         "lines_present": bc_line_count if so_number else None,
         "lines_total": total_lines,
@@ -1447,7 +1507,7 @@ def _build_bq_report_rows(headers: list, details: list, requested_refs: list) ->
         rows.append({
             "po_ref_number": ref, "customer_name": None, "customer_branch_name": None,
             "company_name": None, "company": None, "po_date": None,
-            "in_bigquery": False, "in_mssql": False, "in_bc": False,
+            "in_bigquery": False, "in_mssql": False, "in_bc": False, "in_buffer": False,
             "so_number": None, "lines_present": None, "lines_total": None,
             "status": "not_found", "buffer_url": None,
             "action": " ".join(_plain(step) for step in not_found_steps),

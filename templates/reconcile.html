@@ -261,12 +261,16 @@
             </button>
           </div>
           <div class="details-hint sync-hint">
-            A 3-way checker: compares BigQuery's raw Document AI-parsed PO records against MSSQL and Business Central.
-            <strong>BigQuery is always the source of truth</strong> — MSSQL and BC are checked against it, never the
-            other way around.
+            Compares BigQuery's raw Document AI-parsed PO records against MSSQL, Business Central, and the SO-import
+            <strong>Buffer</strong>. <strong>BigQuery is always the source of truth</strong> — MSSQL and BC are checked
+            against it, never the other way around.
             <ul class="hint-list">
               <li>An exact PO ref search also checks <code>CustomerPOUL</code> for refs BigQuery never got at all (e.g.
                 legacy-app entries) — flagged "Not in BigQuery."</li>
+              <li>The <strong>Buffer</strong> badge shows whether a PO is already sitting in the Firestore buffer,
+                waiting on reconciliation or a retry — not necessarily bad, but it means <strong>Quick Align All</strong>
+                will merge in missing lines and trigger Reprocess Buffer rather than inserting it fresh. Expand
+                <strong>Show detail lines</strong> on a buffered PO to see which individual items are already there.</li>
               <li><strong>⚡ Quick Align All</strong> is the one button that fixes every result shown, using the same
                 existing, already-vetted tools this page always used — not yet in BC → inserts into MSSQL + buffers it,
                 then one <strong>Reprocess Buffer</strong> trigger (batched across every company touched) covers every
@@ -507,6 +511,7 @@
           <span class="bq-status-badge bq-status-bigquery">BigQuery</span>
           <span class="bq-status-badge bq-status-mssql">MSSQL</span>
           <span class="bq-status-badge bq-status-bc">BC</span>
+          <span class="bq-status-badge bq-status-buffer">Buffer</span>
         </div>
       </div>
       <div class="bq-row-actions">

@@ -125,6 +125,7 @@
               <th>BigQuery</th>
               <th>MSSQL</th>
               <th>BC (lines)</th>
+              <th>Buffer</th>
               <th>Steps to align</th>
             </tr>
           </thead>
@@ -144,6 +145,7 @@
               <td>
                 {% if r.in_bc %}{{ r.so_number }} ({{ r.lines_present }}/{{ r.lines_total }}){% else %}✗{% endif %}
               </td>
+              <td>{{ "✓" if r.in_buffer else "—" }}</td>
               <td class="report-action">
                 <ul class="report-steps">
                   {% for step in (r.action_steps or [r.action]) %}
