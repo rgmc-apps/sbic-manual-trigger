@@ -39,11 +39,15 @@ RECONCILE_COMPANIES = ["SBIC"]
 # Company routing rule mirrored from rgmc-gcp-api's CustomerPOUL.py (mssql_bc_mapping.txt
 # §5) — duplicated here (small, static table) rather than round-tripping through another
 # service call just to resolve a BigQuery row's free-text companyName to a BC company code.
+# No MTC entry — see RECONCILE_COMPANIES above: BC Production has no "MTC" company, so
+# routing a Manila Taste Curators row there just 500s every BC call made with it (e.g.
+# GET /bc/custom/v2/sales-orders?company=MTC -> "Company 'MTC' not found in Business
+# Central"). Leaving the keyword unmapped makes _resolve_bc_company return None for
+# those rows instead, which every caller already handles as "could not resolve a BC
+# company" (see _bq_report_row/_insert_and_buffer) rather than attempting a doomed call.
 _COMPANY_KEYWORD_MAP = [
     ("SUNCOAST", "SBIC"),
     ("SBIC", "SBIC"),
-    ("MANILA", "MTC"),
-    ("MTC", "MTC"),
 ]
 
 
