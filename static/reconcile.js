@@ -27,6 +27,8 @@
   const bqReportBtn       = document.getElementById("bq-report-btn");
   const bqReportResult    = document.getElementById("bq-report-result");
   const bqQuickAlignAllBtn = document.getElementById("bq-quick-align-all-btn");
+  const bqGroupToolbar    = document.getElementById("bq-group-toolbar");
+  const bqGroupSelect     = document.getElementById("bq-group-select");
   const documentAiRowTemplate = document.getElementById("document-ai-row-template");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
@@ -1963,6 +1965,7 @@
   // backfill/reprocess flows already cover it.
   let bqDetails = []; // the current search's full detail_data, filtered per-row by po_ref_number when expanded
   let bqHeaders = []; // the current search's full header list, for re-matching a selection back to its exact BigQuery-shaped dict
+  let bqGroupMode = "flat"; // "flat" | "presence" — see bqPresenceBucket/renderBqResultsGrouped
 
   function setBqStatus(msg, isError) {
     bqStatusLine.textContent = msg || "";
@@ -2131,6 +2134,46 @@
 
   bqQuickAlignAllBtn.addEventListener("click", quickAlignAll);
 
+  // Buckets a header by MSSQL/BC presence so results can be grouped for easier
+  // checking (see bq-group-select) instead of scanning per-row badges on a flat
+  // list — mutually exclusive, ordered most- to least-actionable. in_bc is always
+  // boolean from _enrich_document_ai_status (never null), in_mssql can be null when
+  // the live MSSQL check itself failed (see bqBadgeClass).
+  function bqPresenceBucket(header) {
+    const mssql = header.in_mssql;
+    const bc = header.in_bc;
+    if (mssql === false && bc === false) return "missing_both";
+    if (mssql === false) return "missing_mssql";
+    if (bc === false) return "missing_bc";
+    if (mssql == null || bc == null) return "unknown";
+    return "aligned";
+  }
+
+  const BQ_PRESENCE_GROUPS = [
+    { key: "missing_both", label: "❌ Missing from MSSQL and Business Central" },
+    { key: "missing_mssql", label: "⚠️ Missing from MSSQL only (already in BC)" },
+    { key: "missing_bc", label: "⚠️ Missing from Business Central only (already in MSSQL)" },
+    { key: "unknown", label: "❓ Status unknown — a live check failed, re-run the search" },
+    { key: "aligned", label: "✅ Present in both" },
+  ];
+
+  function renderBqResultsGrouped(headers) {
+    const buckets = {};
+    headers.forEach((h) => {
+      const key = bqPresenceBucket(h);
+      (buckets[key] = buckets[key] || []).push(h);
+    });
+    BQ_PRESENCE_GROUPS.forEach(({ key, label }) => {
+      const rows = buckets[key];
+      if (!rows || !rows.length) return;
+      const heading = document.createElement("div");
+      heading.className = "bq-group-heading";
+      heading.innerHTML = `<span>${label}</span><span class="bq-group-count">${rows.length}</span>`;
+      bqResultsList.appendChild(heading);
+      rows.forEach((h) => bqResultsList.appendChild(buildDocumentAiRow(h)));
+    });
+  }
+
   function renderBqResults(headers) {
     bqResultsList.innerHTML = "";
     bqReportResult.classList.add("hidden");
@@ -2140,11 +2183,22 @@
       empty.textContent = "No matching records found in BigQuery.";
       bqResultsList.appendChild(empty);
       bqInsertAction.classList.add("hidden");
+      bqGroupToolbar.classList.add("hidden");
       return;
     }
-    headers.forEach((h) => bqResultsList.appendChild(buildDocumentAiRow(h)));
+    if (bqGroupMode === "presence") {
+      renderBqResultsGrouped(headers);
+    } else {
+      headers.forEach((h) => bqResultsList.appendChild(buildDocumentAiRow(h)));
+    }
     bqInsertAction.classList.remove("hidden");
+    bqGroupToolbar.classList.remove("hidden");
   }
+
+  bqGroupSelect.addEventListener("change", () => {
+    bqGroupMode = bqGroupSelect.value;
+    if (bqHeaders.length) renderBqResults(bqHeaders);
+  });
 
   async function searchDocumentAi() {
     const params = new URLSearchParams();

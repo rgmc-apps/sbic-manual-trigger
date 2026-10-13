@@ -752,6 +752,31 @@
 .bq-detail-lines th, .bq-detail-lines td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border); }
 .bq-detail-lines th { color: var(--text-muted); font-weight: 600; }
 
+.bq-group-toolbar { margin-top: 14px; display: flex; align-items: center; gap: 8px; }
+.bq-group-toolbar .form-label { margin: 0; }
+.bq-group-toolbar select { width: auto; }
+.bq-group-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: .8rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin: 18px 0 2px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.bq-results-list > .bq-group-heading:first-child { margin-top: 0; }
+.bq-group-count {
+  font-size: .68rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
 .bq-insert-action { margin-top: 16px; display: flex; gap: 10px; flex-wrap: wrap; }
 .btn-bq-report, .btn-bq-quick-align-all { background: var(--card); color: var(--brand); border-color: var(--brand); }
 .btn-bq-report:hover:not(:disabled), .btn-bq-quick-align-all:hover:not(:disabled) { background: var(--brand); color: #fff; }

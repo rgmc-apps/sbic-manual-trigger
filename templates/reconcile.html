@@ -269,15 +269,19 @@
                 legacy-app entries) — flagged "Not in BigQuery."</li>
               <li><strong>⚡ Quick Align All</strong> is the one button that fixes every result shown, using the same
                 existing, already-vetted tools this page always used — not yet in BC → inserts into MSSQL + buffers it,
-                then one <strong>Reprocess Buffer</strong> trigger per company covers every PO that needed it; in BC
-                but missing lines → one <strong>Sync from Cloud SQL</strong> trigger per company covers every PO
-                missing lines. It <strong>never</strong> writes to BC directly.</li>
+                then one <strong>Reprocess Buffer</strong> trigger (batched across every company touched) covers every
+                PO that needed it; in BC but missing lines → one <strong>Sync from Cloud SQL</strong> trigger (also
+                batched across companies) covers every PO missing lines. It <strong>never</strong> writes to BC
+                directly.</li>
               <li>Reprocessing/syncing happens in the <strong>background</strong> — it is not instant. Re-run the
                 search later, or check the Buffer/History tabs, to confirm each PO actually resolved in BC; a click
                 here is a trigger, not a guarantee, so treat Business Central itself as the final check.</li>
               <li><strong>📋 Generate Shareable Report</strong> acts on every result currently shown — gives a link
                 anyone can open to see each PO's status, has its own <strong>⚡ Quick Align All</strong> button (needs
                 their own name/email first), a direct link to the Buffer tab per company, and a print-to-PDF option.</li>
+              <li>Use <strong>Group by</strong> above the results to bucket them by what's missing — everything absent
+                from both MSSQL and BC, from just one of the two, status-unknown (a live check failed — re-run the
+                search), and fully aligned — instead of scanning badges on a flat list.</li>
             </ul>
           </div>
           <p class="status-line" id="bq-status-line"></p>
@@ -292,6 +296,13 @@
             </button>
           </div>
           <div class="bq-report-result hidden" id="bq-report-result"></div>
+          <div class="bq-group-toolbar hidden" id="bq-group-toolbar">
+            <label class="form-label" for="bq-group-select">Group by</label>
+            <select class="form-input" id="bq-group-select">
+              <option value="flat">None (flat list)</option>
+              <option value="presence">Missing from MSSQL / Business Central</option>
+            </select>
+          </div>
           <div class="bq-results-list" id="bq-results-list"></div>
         </div>
 
