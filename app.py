@@ -1700,14 +1700,24 @@ def api_bigquery_quick_align():
 
       status "not_in_bc"     -> insert into MSSQL (if needed) + add to the buffer
                                  (_insert_and_buffer, same as Add Selected to Buffer),
-                                 then trigger Reprocess Buffer once per distinct
-                                 company touched (same as clicking it manually).
+                                 then trigger Reprocess Buffer with every distinct
+                                 company touched batched into one call (same tool as
+                                 clicking it manually, just one companies=A,B,C call
+                                 instead of one call per company).
       status "lines_missing" -> trigger Sync from Cloud SQL, scoped to exactly these
-                                 PO refs via po_ref_numbers (one call per company, so
-                                 a multi-row align doesn't trip the 30s-per-path rate
-                                 limiter on /customerpoul/sync-inserted-orders).
+                                 PO refs via po_ref_numbers, with every company
+                                 similarly batched into one call.
       anything else           -> reported back with no action taken (already aligned,
                                  or there's genuinely nothing safe to automate yet).
+
+    Both triggers are each a single HTTP call regardless of how many companies are
+    involved — /customerpoul/reprocess-buffer and /customerpoul/sync-inserted-orders
+    are rate-limited per endpoint path (30s cooldown, not per company — see
+    rgmc-gcp-api's rate_limiter.py), so looping per company here would 429 ("Endpoint
+    called too recently") as soon as a Quick Align batch spanned 2+ companies. Both
+    endpoints already accept a comma-separated companies list and publish one Pub/Sub
+    message that rgmc-worker-pool fans out per company itself, so batching here just
+    means one message doing in the worker pool what used to be several API calls.
     """
     data = request.get_json(silent=True) or {}
     headers = data.get("headers") or []
@@ -1742,44 +1752,66 @@ def api_bigquery_quick_align():
             _resolve_bc_company(h.get("company_name")) for h in not_in_bc_headers
             if _resolve_bc_company(h.get("company_name"))
         })
-        for company in companies_touched:
+        if companies_touched:
+            # One call covering every company touched, not one call per company —
+            # /customerpoul/reprocess-buffer is rate-limited per endpoint PATH (30s
+            # cooldown, see rgmc-gcp-api's rate_limiter.py), not per company, so a
+            # per-company loop here 429s ("called too recently") as soon as a Quick
+            # Align batch spans 2+ companies. "companies" already accepts a
+            # comma-separated list and the worker pool fans it out per company itself
+            # (so_import_worker.py's poul-so-reprocess-buffer handler), so one call —
+            # and one Pub/Sub message — batches the whole run safely.
             try:
-                resp = _gcp_api("POST", "/customerpoul/reprocess-buffer", params={"companies": company, **notify_params})
+                resp = _gcp_api("POST", "/customerpoul/reprocess-buffer", params={
+                    "companies": ",".join(companies_touched), **notify_params,
+                })
                 body, status_code = _proxy_json(resp)
                 ok = status_code == 200
-                detail = f"Reprocess Buffer triggered for {company}." if ok else (
-                    f"Reprocess Buffer failed for {company}: {body.get('detail') or body}")
+                detail = f"Reprocess Buffer triggered for {', '.join(companies_touched)}." if ok else (
+                    f"Reprocess Buffer failed: {body.get('detail') or body}")
                 if ok and body.get("run_id"):
-                    run_ids.append({"company": company, "action": "reprocess", "run_id": body["run_id"]})
+                    for company in companies_touched:
+                        run_ids.append({"company": company, "action": "reprocess", "run_id": body["run_id"]})
             except requests.RequestException as exc:
-                ok, detail = False, f"Reprocess Buffer request failed for {company}: {exc}"
-            results.append({
-                "po_ref": None, "company": company,
-                "action": "reprocess", "status": "triggered" if ok else "failed", "detail": detail,
-            })
+                ok, detail = False, f"Reprocess Buffer request failed: {exc}"
+            for company in companies_touched:
+                results.append({
+                    "po_ref": None, "company": company,
+                    "action": "reprocess", "status": "triggered" if ok else "failed", "detail": detail,
+                })
 
     lines_missing_by_company: dict = {}
     for r in rows:
         if r["status"] == "lines_missing" and r["company"]:
             lines_missing_by_company.setdefault(r["company"], []).append(r["po_ref_number"])
-    for company, po_refs in lines_missing_by_company.items():
+    if lines_missing_by_company:
+        # Same single-call batching as reprocess above, for the same reason —
+        # /customerpoul/sync-inserted-orders shares the identical per-path rate
+        # limiter. po_ref_numbers is a flat, cross-company filter that the worker
+        # pool re-scopes to each company internally (_run_sync_from_cloudsql builds
+        # company_headers by resolving each row's own companyName), so mixing refs
+        # from different companies into one po_ref_numbers list is safe.
+        all_companies = sorted(lines_missing_by_company)
+        all_po_refs = [ref for refs in lines_missing_by_company.values() for ref in refs]
         try:
             resp = _gcp_api("POST", "/customerpoul/sync-inserted-orders", params={
-                "companies": company, "po_ref_numbers": ",".join(po_refs), **notify_params,
+                "companies": ",".join(all_companies), "po_ref_numbers": ",".join(all_po_refs), **notify_params,
             })
             body, status_code = _proxy_json(resp)
             ok = status_code == 200
-            detail = f"Sync from Cloud SQL triggered for {len(po_refs)} PO(s) in {company}." if ok else (
-                f"Sync from Cloud SQL failed for {company}: {body.get('detail') or body}")
+            detail = f"Sync from Cloud SQL triggered for {len(all_po_refs)} PO(s) across {', '.join(all_companies)}." if ok else (
+                f"Sync from Cloud SQL failed: {body.get('detail') or body}")
             if ok and body.get("run_id"):
-                run_ids.append({"company": company, "action": "sync", "run_id": body["run_id"]})
+                for company in all_companies:
+                    run_ids.append({"company": company, "action": "sync", "run_id": body["run_id"]})
         except requests.RequestException as exc:
-            ok, detail = False, f"Sync from Cloud SQL request failed for {company}: {exc}"
-        for po_ref in po_refs:
-            results.append({
-                "po_ref": po_ref, "company": company,
-                "action": "sync", "status": "triggered" if ok else "failed", "detail": detail,
-            })
+            ok, detail = False, f"Sync from Cloud SQL request failed: {exc}"
+        for company, po_refs in lines_missing_by_company.items():
+            for po_ref in po_refs:
+                results.append({
+                    "po_ref": po_ref, "company": company,
+                    "action": "sync", "status": "triggered" if ok else "failed", "detail": detail,
+                })
 
     for r in rows:
         if r["status"] not in ("not_in_bc", "lines_missing"):

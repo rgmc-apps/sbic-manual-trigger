@@ -2053,9 +2053,13 @@
   // Checks every currently-searched PO against all three data sources server-side
   // (BigQuery is always the source of truth) and runs whichever existing tool brings
   // MSSQL/BC up to match it — see /api/bigquery/quick-align. One batch call for the
-  // whole result set (not one call per row) so POs sharing a company get folded into
-  // a single Reprocess Buffer / Sync from Cloud SQL trigger instead of each row
-  // tripping the 30s-per-path rate limiter on its own.
+  // whole result set (not one call per row), and server-side that one call fans out
+  // into at most one Reprocess Buffer trigger and one Sync from Cloud SQL trigger
+  // TOTAL — every company touched is folded into a single companies=A,B,C call for
+  // each, processed as one batch on the worker pool, rather than one HTTP call per
+  // company, since /customerpoul/reprocess-buffer and /customerpoul/sync-inserted-
+  // orders are rate-limited per endpoint path (not per company) and would 429 on the
+  // second company otherwise.
   async function quickAlignAll() {
     if (!refreshGate()) {
       setBqStatus("Fill in your details above first.", true);
