@@ -7,9 +7,18 @@
   --success:     #16a34a;
   --success-bg:  #f0fdf4;
   --success-border: #bbf7d0;
+  /* --success as small text fails contrast (3.15:1 on --success-bg, 3.01:1 on --bg —
+     measured against accessibility.md's 4.5:1 minimum for text under 18pt). Use this
+     for small badge/status text instead; --success stays for fills/dots/large bold
+     text where it already clears 3:1. Mirrors --warn-text, which solved the same
+     problem for the warn pair already. */
+  --success-text: #15803d;
   --error:       #dc2626;
   --error-bg:    #fef2f2;
   --error-border: #fecaca;
+  /* Same reasoning as --success-text: #dc2626 on --error-bg measures 4.41:1, just
+     under the 4.5:1 minimum. Use for small badge/status text on --error-bg. */
+  --error-text:  #b91c1c;
   --warn-bg:     #fffbeb;
   --warn-border: #fde68a;
   --warn-text:   #92400e;

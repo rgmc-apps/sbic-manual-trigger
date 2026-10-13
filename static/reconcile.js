@@ -532,6 +532,26 @@
     );
   }
 
+  // A group with many POs (seen live: 37 for one UOM group) otherwise renders as one
+  // unbroken wall of comma-separated numbers that just duplicates the count already
+  // shown in the badge next to it — collapse past a threshold, same disclosure
+  // pattern as .btn-history-toggle elsewhere on the page.
+  const PO_REFS_PREVIEW_COUNT = 8;
+  function renderPoRefsList(el, poRefs) {
+    let expanded = poRefs.length <= PO_REFS_PREVIEW_COUNT;
+    function draw() {
+      const shown = expanded ? poRefs : poRefs.slice(0, PO_REFS_PREVIEW_COUNT);
+      const toggleLabel = expanded ? "Show less" : `+${poRefs.length - PO_REFS_PREVIEW_COUNT} more`;
+      el.innerHTML = `POs: ${escapeHtml(shown.join(", "))}${expanded ? "" : ", …"} ` +
+        (poRefs.length > PO_REFS_PREVIEW_COUNT
+          ? `<button class="btn-history-toggle btn-po-refs-toggle" type="button">${toggleLabel}</button>`
+          : "");
+      const btn = el.querySelector(".btn-po-refs-toggle");
+      if (btn) btn.addEventListener("click", () => { expanded = !expanded; draw(); });
+    }
+    draw();
+  }
+
   // ── One group row ────────────────────────────────────────────────────────
   function buildGroupRow(type, group) {
     const node = rowTemplate.content.cloneNode(true);
@@ -544,7 +564,7 @@
     }
     row.querySelector(".group-po-count").textContent =
       `${group.po_count} PO${group.po_count === 1 ? "" : "s"}`;
-    row.querySelector(".group-po-refs").textContent = "POs: " + group.po_refs.join(", ");
+    renderPoRefsList(row.querySelector(".group-po-refs"), group.po_refs);
 
     const resolvedBox = row.querySelector(".group-resolved");
     const linkPanel = row.querySelector(".group-link-panel");
@@ -840,6 +860,18 @@
     return hint;
   }
 
+  // Unresolved first, then by PO count descending — so the entries that actually need
+  // checking lead the list instead of being scattered among already-resolved ones. A
+  // copy, never state.groups[type] itself: several handlers (e.g. Mark Inactive, the
+  // SKU/UOM reactivate flow) look a group up in that array by identity via indexOf,
+  // which only works if its order/contents stay untouched by rendering.
+  function sortGroupsForDisplay(groups) {
+    return [...groups].sort((a, b) => {
+      if (!!a.resolved !== !!b.resolved) return a.resolved ? 1 : -1;
+      return (b.po_count || 0) - (a.po_count || 0);
+    });
+  }
+
   function renderGroupsPanel(type) {
     const panel = document.getElementById(`panel-${type}`);
     panel.innerHTML = "";
@@ -852,7 +884,7 @@
       panel.appendChild(empty);
       return;
     }
-    groups.forEach((g) => panel.appendChild(buildGroupRow(type, g)));
+    sortGroupsForDisplay(groups).forEach((g) => panel.appendChild(buildGroupRow(type, g)));
   }
 
   // ── Inactive Items tab — SKUs marked inactive, excluded from the SKU counts ──
@@ -887,8 +919,9 @@
       <div class="group-resolved inactive-marked-by">
         Marked inactive${group.inactive_marked_by ? ` by ${escapeHtml(group.inactive_marked_by)}` : ""}${group.inactive_marked_at ? ` (${escapeHtml(group.inactive_marked_at)})` : ""}
       </div>
-      <div class="group-po-refs">POs: ${escapeHtml(group.po_refs.join(", "))}</div>
+      <div class="group-po-refs"></div>
     `;
+    renderPoRefsList(row.querySelector(".group-po-refs"), group.po_refs);
     row.querySelector(".btn-reactivate").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;
@@ -976,7 +1009,14 @@
       panel.appendChild(empty);
       return;
     }
-    state.orders.forEach((order) => {
+    // Not-ready first, then by attempt_count descending — the orders that have been
+    // stuck the longest lead the list instead of being buried among resolved ones.
+    const sortedOrders = [...state.orders].sort((a, b) => {
+      const aReady = orderReadiness(a).ready, bReady = orderReadiness(b).ready;
+      if (aReady !== bReady) return aReady ? 1 : -1;
+      return (b.attempt_count || 0) - (a.attempt_count || 0);
+    });
+    sortedOrders.forEach((order) => {
       const header = order.header || {};
       const lines = order.lines || [];
       const r = orderReadiness(order);
@@ -2045,7 +2085,7 @@
     // worth a look, "unknown"/neutral styling for the common not-buffered case.
     row.querySelector(".bq-status-buffer").className =
       `bq-status-badge bq-status-buffer ${header.in_buffer ? "missing" : "unknown"}`;
-    row.querySelector(".bq-status-buffer").textContent = header.in_buffer ? "📋 In Buffer" : "Not buffered";
+    row.querySelector(".bq-status-buffer").textContent = header.in_buffer ? "In Buffer" : "Not buffered";
 
     const toggleBtn = row.querySelector(".bq-detail-toggle");
     const detailEl = row.querySelector(".bq-detail-lines");

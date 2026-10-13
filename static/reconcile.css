@@ -103,7 +103,7 @@
   font-size: .8375rem;
   color: var(--text);
 }
-.all-resolved-hint strong { color: var(--success); }
+.all-resolved-hint strong { color: var(--success-text); }
 .all-resolved-icon {
   flex-shrink: 0;
   width: 20px;
@@ -443,8 +443,8 @@
   border-radius: 6px;
   background: var(--bg);
 }
-.update-result-row.ok { color: var(--success); }
-.update-result-row.fail { color: var(--error); background: var(--error-bg); }
+.update-result-row.ok { color: var(--success-text); }
+.update-result-row.fail { color: var(--error-text); background: var(--error-bg); }
 .update-result-row.blocked { color: var(--warn-text); background: var(--warn-bg); }
 
 .btn-link-toggle, .btn-unlink, .btn-suggest, .btn-find-orders {
@@ -611,7 +611,7 @@
   border-radius: 999px;
   white-space: nowrap;
 }
-.order-badge.ready { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+.order-badge.ready { background: var(--success-bg); color: var(--success-text); border: 1px solid var(--success-border); }
 .order-badge.pending { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); }
 .order-detail { margin-top: 8px; font-size: .8125rem; color: var(--text-muted); }
 .recovered-badge {
@@ -636,11 +636,11 @@
   background: var(--bg);
   color: var(--text-muted);
 }
-.link-chip.ok { background: var(--success-bg); color: var(--success); border-color: var(--success-border); }
+.link-chip.ok { background: var(--success-bg); color: var(--success-text); border-color: var(--success-border); }
 .link-chip.pending { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
 
 /* ── Buffer-reconciliation history tab ── */
-.order-badge.failed { background: var(--error-bg); color: var(--error); border: 1px solid var(--error-border); }
+.order-badge.failed { background: var(--error-bg); color: var(--error-text); border: 1px solid var(--error-border); }
 .history-list { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
 .history-meta { margin-top: 6px; font-size: .76rem; color: var(--text-muted); }
 .history-row .btn-history-toggle { margin-top: 10px; display: inline-block; }
@@ -740,7 +740,7 @@
   background: var(--bg);
   color: var(--text-muted);
 }
-.bq-status-badge.ok { background: var(--success-bg); color: var(--success); border-color: var(--success-border); }
+.bq-status-badge.ok { background: var(--success-bg); color: var(--success-text); border-color: var(--success-border); }
 .bq-status-badge.missing { background: var(--warn-bg); color: var(--warn-text); border-color: var(--warn-border); }
 .bq-status-badge.unknown { background: var(--bg); color: var(--text-muted); border-color: var(--border); }
 .bq-row-actions { margin-top: 10px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
