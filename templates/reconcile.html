@@ -253,6 +253,17 @@
               <label class="form-label" for="bq-customer-input">Customer</label>
               <input class="form-input" type="text" id="bq-customer-input" placeholder="Substring (optional)" />
             </div>
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="bq-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="bq-company-select">
+                  <option value="">— All companies —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
             <div class="form-group">
               <label class="form-label" for="bq-date-from">From</label>
               <input class="form-input" type="date" id="bq-date-from" />
@@ -273,6 +284,10 @@
             <ul class="hint-list">
               <li>An exact PO ref search also checks <code>CustomerPOUL</code> for refs BigQuery never got at all (e.g.
                 legacy-app entries) — flagged "Not in BigQuery."</li>
+              <li><strong>Company</strong> filters results to one BC company, matched against BigQuery's free-text
+                company name field — recognizes known variants/abbreviations of a company's name (e.g. SBIC also
+                matches "Suncoast", "Suncoast Brands International Corp.", "Suncoast Brands Intl Corp."), not just
+                an exact string.</li>
               <li>The <strong>Buffer</strong> badge shows whether a PO is already sitting in the Firestore buffer,
                 waiting on reconciliation or a retry — not necessarily bad, but it means <strong>Quick Align All</strong>
                 will merge in missing lines and trigger Reprocess Buffer rather than inserting it fresh. Expand

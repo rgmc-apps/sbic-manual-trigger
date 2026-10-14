@@ -18,6 +18,7 @@
   const overrideRowTemplate    = document.getElementById("override-row-template");
   const bqPoRefInput      = document.getElementById("bq-po-ref-input");
   const bqCustomerInput   = document.getElementById("bq-customer-input");
+  const bqCompanySelect   = document.getElementById("bq-company-select");
   const bqDateFrom        = document.getElementById("bq-date-from");
   const bqDateTo          = document.getElementById("bq-date-to");
   const bqSearchBtn       = document.getElementById("bq-search-btn");
@@ -2653,8 +2654,10 @@
     const params = new URLSearchParams();
     const poRef = bqPoRefInput.value.trim();
     const customer = bqCustomerInput.value.trim();
+    const company = bqCompanySelect.value;
     if (poRef) params.set("po_ref_number", poRef);
     if (customer) params.set("customer_name", customer);
+    if (company) params.set("company", company);
     if (bqDateFrom.value) params.set("date_from", bqDateFrom.value);
     if (bqDateTo.value) params.set("date_to", bqDateTo.value);
 
@@ -2668,7 +2671,7 @@
       bqHeaders = data.headers || [];
       bqDetails = data.details || [];
       renderBqResults(bqHeaders);
-      setBqStatus(`Found ${bqHeaders.length} header(s) in BigQuery.`);
+      setBqStatus(`Found ${bqHeaders.length} header(s) in BigQuery${company ? ` for ${company}` : ""}.`);
     } catch (e) {
       setBqStatus("Error: " + e.message, true);
     } finally {
@@ -2699,6 +2702,7 @@
     const criteria = {
       po_ref_number: bqPoRefInput.value.trim(),
       customer_name: bqCustomerInput.value.trim(),
+      company: bqCompanySelect.value,
       date_from: bqDateFrom.value,
       date_to: bqDateTo.value,
     };

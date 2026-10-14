@@ -58,6 +58,41 @@ def _resolve_bc_company(source_company_name: str | None) -> str | None:
             return bc_company
     return None
 
+
+# Known acceptable raw company-name text variants per BC company, for the BigQuery
+# Lookup tab's Company filter (api_bigquery_document_ai_search's `company` param) —
+# an explicit, human-maintained allowlist of exact variants seen in BigQuery/
+# CustomerPOUL's free-text companyName field (abbreviations, "Intl" vs
+# "International", with/without "Corp.", etc.).
+#
+# Deliberately a SEPARATE table from _COMPANY_KEYWORD_MAP above, even though the two
+# overlap in spirit — that one drives auto-routing a header to a BC company during
+# insert/quick-align, a correctness-critical path; this one only narrows what the
+# Company filter shows. Keeping them apart means adding a filter variant here can
+# never accidentally change where an order actually gets imported.
+BQ_COMPANY_NAME_TERMS: dict[str, list[str]] = {
+    "SBIC": [
+        "SUNCOAST BRANDS",
+        "SUNCOAST",
+        "SUNCOAST BRANDS INTERNATIONAL CORP",
+        "SUNCOAST BRANDS INTL CORP",
+        "SUNCOAST BRANDS INTERNATIONAL",
+    ],
+}
+
+
+def _company_name_matches(raw_company_name: str | None, bc_company: str) -> bool:
+    """True if a BigQuery/CustomerPOUL row's raw companyName text looks like it
+    belongs to `bc_company`, per BQ_COMPANY_NAME_TERMS — case-insensitive substring
+    match against any of that company's known terms. False (never matches anything)
+    for a BC company with no terms registered yet, rather than silently falling back
+    to a different matching rule."""
+    terms = BQ_COMPANY_NAME_TERMS.get((bc_company or "").strip().upper())
+    if not terms:
+        return False
+    upper = (raw_company_name or "").strip().upper()
+    return any(term in upper for term in terms)
+
 # ---------------------------------------------------------------------------
 # Email configuration — override via environment variables
 # ---------------------------------------------------------------------------
@@ -1312,6 +1347,14 @@ def api_bigquery_document_ai_search():
         value = (request.args.get(key) or "").strip()
         if value:
             params[key] = value
+    # Not forwarded to rgmc-gcp-api — its BigQuery query has no companyName filter —
+    # applied below instead, against company_name's free text, once the full result
+    # set (BigQuery + any CustomerPOUL fallback) is assembled.
+    company_filter = (request.args.get("company") or "").strip().upper()
+    if company_filter and company_filter not in BQ_COMPANY_NAME_TERMS:
+        return jsonify({
+            "error": f"No known company-name terms for {company_filter!r} yet — add it to BQ_COMPANY_NAME_TERMS."
+        }), 400
     try:
         # Two live BigQuery query executions happen server-side for one of these calls
         # (header, then detail) — slower and far more variable than every other call
@@ -1344,6 +1387,11 @@ def api_bigquery_document_ai_search():
                     mssql_header["_source"] = "mssql"
                     headers.append(mssql_header)
                     details.extend(mssql_lines)
+
+        if company_filter:
+            headers = [h for h in headers if _company_name_matches(h.get("company_name"), company_filter)]
+            kept_refs = {h.get("po_ref_number") for h in headers}
+            details = [d for d in details if d.get("po_ref_number") in kept_refs]
 
         _enrich_document_ai_status(headers)
         _enrich_buffer_status(headers)
