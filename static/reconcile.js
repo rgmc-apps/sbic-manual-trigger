@@ -490,6 +490,31 @@
     }
   }
 
+  // Background pass — flags every Customers-tab group whose raw name matches more
+  // than one BC customer record, so direct linking is disabled (see
+  // applyAmbiguousState in buildGroupRow) before a human can accidentally save a
+  // blanket link for a name that's actually ambiguous. Checks every group, not just
+  // unresolved ones (unlike highlightHighConfidenceMatches) — an ALREADY-resolved
+  // group can still be wrong today if it was blanket-linked before this check
+  // existed, and flagging it lets a human notice and re-resolve it via Split instead.
+  async function flagAmbiguousCustomerGroups() {
+    if (!state) return;
+    const groups = state.groups.customer || [];
+    if (!groups.length) return;
+
+    let flaggedCount = 0;
+    // Sequential, not parallel — same reasoning as highlightHighConfidenceMatches:
+    // avoid hitting BC with one request per group simultaneously.
+    for (const group of groups) {
+      const ambiguous = await isCustomerNameAmbiguous(group.key);
+      if (ambiguous) {
+        group.ambiguousCustomerName = true;
+        flaggedCount++;
+      }
+    }
+    if (flaggedCount) renderGroupsPanel("customer");
+  }
+
   // ── Candidate list rendering ─────────────────────────────────────────────
   function renderCandidateList(container, type, candidates, onPick) {
     container.innerHTML = "";
@@ -653,6 +678,185 @@
     draw();
   }
 
+  // ── Customer group "Split…" — resolve a Customers-tab group's buffered POs to
+  // DIFFERENT BC customers instead of one blanket link for the whole raw customer
+  // name. Each sub-group gets its own "customer" override, scoped by branch
+  // ("{name}::{branch}") or by individual PO ("{name}::PO:{ref}") — same composite-key
+  // scheme applyLinkToGroup already uses for the automatic branch-link case, just
+  // picked explicitly here instead of only when ambiguity is auto-detected. ─────────
+
+  function customerGroupOrders(group) {
+    const ids = new Set(group.buffer_ids);
+    return (state.orders || []).filter((o) => ids.has(o.id));
+  }
+
+  // One bucket per distinct branch (mode "branch", the default — POs that really do
+  // share a branch almost always belong together) or one bucket per individual PO
+  // (mode "po" — the rarer escape hatch for when even two POs sharing the same raw
+  // branch text turn out to need different customers). Sorted by PO count descending
+  // so the highest-impact buckets lead, same convention as sortGroupsForDisplay.
+  function customerSplitBuckets(group, mode) {
+    const buckets = new Map();
+    customerGroupOrders(group).forEach((o) => {
+      const header = o.header || {};
+      const poRef = header.poRefNumber || o.id;
+      const bucketKey = mode === "po" ? o.id : (header.customerBranchName || "").trim().toUpperCase() || "(NO BRANCH)";
+      if (!buckets.has(bucketKey)) {
+        const label = mode === "po" ? poRef : ((header.customerBranchName || "").trim() || "(no branch on this PO)");
+        const scopeKey = mode === "po" ? `${group.key}::PO:${poRef}` : `${group.key}::${label}`;
+        buckets.set(bucketKey, { label, scopeKey, poRefs: [], bufferIds: [] });
+      }
+      const b = buckets.get(bucketKey);
+      b.poRefs.push(poRef);
+      b.bufferIds.push(o.id);
+    });
+    return Array.from(buckets.values()).sort((a, b) => b.poRefs.length - a.poRefs.length);
+  }
+
+  function buildSplitSubRow(sub) {
+    const row = document.createElement("div");
+    row.className = "split-sub-row";
+    row.innerHTML = `
+      <div class="split-sub-head">
+        <span class="split-sub-label">${escapeHtml(sub.label)}</span>
+        <span class="group-po-count">${sub.poRefs.length} PO${sub.poRefs.length === 1 ? "" : "s"}</span>
+        <button class="btn-link-toggle btn-split-link-toggle" type="button">Link…</button>
+      </div>
+      <div class="split-sub-po-refs">POs: ${escapeHtml(sub.poRefs.join(", "))}</div>
+      <div class="group-resolved hidden">
+        Linked to <strong class="resolved-text"></strong>
+        <button class="btn-unlink" type="button">Undo</button>
+      </div>
+      <div class="split-sub-link-panel hidden">
+        <div class="search-row"><input type="text" class="search-input" placeholder="Search existing BC customers…" /></div>
+        <div class="search-results"></div>
+      </div>
+    `;
+
+    const toggleBtn = row.querySelector(".btn-split-link-toggle");
+    const linkPanel = row.querySelector(".split-sub-link-panel");
+    const resolvedBox = row.querySelector(".group-resolved");
+    const unlinkBtn = row.querySelector(".btn-unlink");
+    const searchInput = row.querySelector(".search-input");
+    const searchResults = row.querySelector(".search-results");
+    let currentOverrideId = null;
+
+    toggleBtn.addEventListener("click", () => linkPanel.classList.toggle("hidden"));
+
+    function markOrdersResolved(value) {
+      const ids = new Set(sub.bufferIds);
+      (state.orders || []).forEach((o) => { if (ids.has(o.id)) o._splitCustomerResolved = value; });
+    }
+
+    async function saveSplitLink(candidate) {
+      toggleBtn.disabled = true;
+      try {
+        const resolvedBy = getEmployeeDetails().employee_name;
+        const resolved = resolvedPayload("customer", candidate);
+        const data = await saveOverride("customer", sub.scopeKey, resolved, resolvedBy, sub.bufferIds);
+        currentOverrideId = data.id;
+        resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(resolved);
+        resolvedBox.classList.remove("hidden");
+        linkPanel.classList.add("hidden");
+        toggleBtn.textContent = "Change…";
+        markOrdersResolved(true);
+        setStatus(`Linked "${sub.label}" (${sub.poRefs.length} PO${sub.poRefs.length === 1 ? "" : "s"}) to ${resolved.customerNo}.`);
+        refreshOtherGroupPanels("customer"); // branch/sku/uom blocked-notes may change; customer panel itself is skipped so this split panel survives
+        renderOrdersPanel();
+        renderSummary();
+      } catch (e) {
+        setStatus("Could not save split link: " + e.message, true);
+      } finally {
+        toggleBtn.disabled = false;
+      }
+    }
+
+    unlinkBtn.addEventListener("click", async () => {
+      if (!currentOverrideId) return;
+      unlinkBtn.disabled = true;
+      try {
+        await fetch(`/api/overrides/${encodeURIComponent(currentOverrideId)}`, { method: "DELETE" });
+        currentOverrideId = null;
+        resolvedBox.classList.add("hidden");
+        toggleBtn.textContent = "Link…";
+        markOrdersResolved(false);
+        setStatus(`Removed the split link for "${sub.label}".`);
+        refreshOtherGroupPanels("customer");
+        renderOrdersPanel();
+        renderSummary();
+      } catch (e) {
+        setStatus("Could not remove link: " + e.message, true);
+      } finally {
+        unlinkBtn.disabled = false;
+      }
+    });
+
+    let searchTimer = null;
+    searchInput.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      const term = searchInput.value.trim();
+      if (term.length < 2) { searchResults.innerHTML = ""; return; }
+      searchTimer = setTimeout(async () => {
+        searchResults.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
+        try {
+          const url = `/api/lookup/customers?search=${encodeURIComponent(term)}&company=${encodeURIComponent(state.company)}`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
+          if (searchInput.value.trim() !== term) return; // stale response guard
+          const candidates = normalizeCandidates("customer", data.data);
+          renderCandidateList(searchResults, "customer", candidates, saveSplitLink);
+        } catch (e) {
+          if (searchInput.value.trim() !== term) return;
+          searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+        }
+      }, 350);
+    });
+
+    return row;
+  }
+
+  function buildCustomerSplitPanel(container, group) {
+    container.innerHTML = "";
+    const hint = document.createElement("p");
+    hint.className = "search-hint";
+    hint.textContent =
+      "Link each branch (or, if needed, each individual PO) to its own BC customer — doesn't touch the blanket " +
+      "link above, and each save applies immediately. Switching mode rebuilds this list from scratch, so an " +
+      "already-linked row won't show as linked here afterward (it still is — check the Overrides tab for every " +
+      "link saved so far).";
+    container.appendChild(hint);
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "split-mode-toolbar";
+    toolbar.innerHTML =
+      `<span class="split-mode-label">Split by</span>` +
+      `<button class="split-mode-btn active" data-mode="branch" type="button">Ship-to / branch</button>` +
+      `<button class="split-mode-btn" data-mode="po" type="button">Individual PO</button>`;
+    container.appendChild(toolbar);
+
+    const list = document.createElement("div");
+    list.className = "split-sub-list";
+    container.appendChild(list);
+
+    let mode = "branch";
+    function renderSubGroups() {
+      list.innerHTML = "";
+      customerSplitBuckets(group, mode).forEach((sub) => list.appendChild(buildSplitSubRow(sub)));
+    }
+
+    toolbar.querySelectorAll(".split-mode-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.mode === mode) return;
+        mode = btn.dataset.mode;
+        toolbar.querySelectorAll(".split-mode-btn").forEach((b) => b.classList.toggle("active", b === btn));
+        renderSubGroups();
+      });
+    });
+
+    renderSubGroups();
+  }
+
   // ── One group row ────────────────────────────────────────────────────────
   function buildGroupRow(type, group) {
     const node = rowTemplate.content.cloneNode(true);
@@ -710,8 +914,49 @@
       });
     }
 
+    // Split… — lets a Customer group's buffered POs be linked to DIFFERENT BC
+    // customers instead of one blanket link for the whole raw customer name. Only
+    // meaningful with more than one PO (see buildCustomerSplitPanel).
+    const splitToggle = row.querySelector(".btn-split-toggle");
+    const splitPanel = row.querySelector(".group-split-panel");
+    if (type === "customer" && group.po_refs.length > 1) {
+      splitToggle.classList.remove("hidden");
+      splitToggle.addEventListener("click", () => {
+        const opening = splitPanel.classList.toggle("hidden") === false;
+        if (opening && !splitPanel.dataset.built) {
+          buildCustomerSplitPanel(splitPanel, group);
+          splitPanel.dataset.built = "1";
+        }
+      });
+    }
+
     const blockedNote = row.querySelector(".group-blocked-note");
     const confidenceBadge = row.querySelector(".group-confidence-badge");
+    const ambiguousNote = row.querySelector(".group-ambiguous-note");
+
+    // BC has more than one Customer record sharing this exact name (detected in the
+    // background — see flagAmbiguousCustomerGroups) — direct linking/relinking here
+    // always applies to every branch/PO sharing the name, which is exactly the wrong
+    // thing to do once that's ambiguous, so it's disabled outright rather than just
+    // warned about. Split… (when there's more than one PO) or the Customer Branches
+    // (Ship-To) tab are the ways to resolve it correctly instead.
+    function applyAmbiguousState(g) {
+      const ambiguous = type === "customer" && g.ambiguousCustomerName;
+      toggleBtn.disabled = ambiguous;
+      toggleBtn.title = ambiguous
+        ? "BC has multiple customers with this exact name — linking here would apply to every branch/PO sharing it. Use Split below, or the Customer Branches (Ship-To) tab, instead."
+        : "";
+      if (ambiguous) {
+        // No leading "⚠ " here — .group-ambiguous-note::before already renders one.
+        ambiguousNote.textContent = g.po_refs.length > 1
+          ? "BC has multiple customers sharing this exact name. Direct linking is disabled — use Split below to resolve per branch or PO instead."
+          : "BC has multiple customers sharing this exact name. Direct linking is disabled — link its one PO from the Customer Branches (Ship-To) tab instead.";
+        ambiguousNote.classList.remove("hidden");
+      } else {
+        ambiguousNote.classList.add("hidden");
+      }
+    }
+    applyAmbiguousState(group);
 
     function applyResolvedState(g) {
       if (g.resolved) {
@@ -1084,7 +1329,12 @@
     const header = order.header || {};
     const lines = order.lines || [];
     const branchOk = groupResolvedFor("branch", header.customerBranchName);
-    const customerOk = groupResolvedFor("customer", header.customerName);
+    // A per-branch/per-PO Split link (see buildCustomerSplitPanel) resolves this
+    // order's customer without ever touching the flat "customer" group's own
+    // resolved state (deliberately — see applyLinkToGroup) — order._splitCustomerResolved
+    // is set directly on the affected order(s) when that save succeeds, since
+    // groupResolvedFor has no way to see a scoped override by itself.
+    const customerOk = !!order._splitCustomerResolved || groupResolvedFor("customer", header.customerName);
     const skuKeys = [...new Set(lines.map((l) => {
       const sku = (l.customerSKUCode || "").trim();
       if (sku) return sku;
@@ -1280,6 +1530,9 @@
       // instead of clicking "Suggest" on every row. Not awaited, same as the
       // lines-recovery pass above.
       highlightHighConfidenceMatches();
+      // Background pass — flags any Customers-tab group whose raw name matches more
+      // than one BC customer, disabling direct linking for it (see buildGroupRow).
+      flagAmbiguousCustomerGroups();
     } catch (e) {
       setStatus("Error: " + e.message, true);
     } finally {
