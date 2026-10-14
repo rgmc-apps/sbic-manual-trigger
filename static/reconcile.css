@@ -149,6 +149,12 @@
 .toolbar-select { margin-bottom: 0; min-width: 220px; }
 .backfill-toolbar { margin-top: 14px; }
 .backfill-toolbar .form-group { margin-bottom: 0; }
+/* From/To here are plain .form-group (no .toolbar-select — a date input doesn't need
+   its 220px min-width), which left them carrying the page-wide 20px bottom margin
+   while every .toolbar-select sibling (PO Ref/Customer/Company) overrides it to 0 —
+   inside align-items: flex-end, that mismatch is exactly what reads as misaligned.
+   Same fix .backfill-toolbar already applies above, for the identical reason. */
+.bq-toolbar .form-group { margin-bottom: 0; }
 
 .btn-reprocess {
   display: inline-flex;
