@@ -306,10 +306,38 @@
   function resolvedDisplay(resolved) {
     if (!resolved) return "";
     if (resolved.itemNo) return `${resolved.itemNo} — ${resolved.description || ""}`;
-    if (resolved.shipToCode) return `${resolved.shipToCode} (${resolved.customerNo}) — ${resolved.name || ""}`;
     if (resolved.uomCode) return `${resolved.uomCode} — ${resolved.description || ""}`;
+    // "customer" (displayName present, even "") vs "branch" ({customerNo, shipToCode,
+    // name}, no displayName key at all) — check displayName first since a "customer"
+    // override can now also carry shipToCode/shipToName (reference metadata captured
+    // from the branch link it came from) and would otherwise be misrouted into the
+    // "branch" formatting below.
+    if (resolved.customerNo && resolved.displayName !== undefined) {
+      const base = `${resolved.customerNo} — ${resolved.displayName || ""}`;
+      return resolved.shipToCode
+        ? `${base} (ship-to: ${resolved.shipToCode}${resolved.shipToName ? " — " + resolved.shipToName : ""})`
+        : base;
+    }
+    if (resolved.shipToCode) return `${resolved.shipToCode} (${resolved.customerNo}) — ${resolved.name || ""}`;
     if (resolved.customerNo) return `${resolved.customerNo} — ${resolved.displayName || ""}`;
     return JSON.stringify(resolved);
+  }
+
+  // A "customer" override's key is flat ("{name}") for the common case, or composite
+  // ("{name}::{branch}") when BC has more than one Customer record sharing that exact
+  // name — mirrors rgmc-bc-api's so_buffer_service._customer_key_parts exactly (same
+  // split, same meaning). Used to render a scoped override's key readably on the
+  // Overrides tab instead of showing the raw "NAME::BRANCH" string.
+  function customerKeyParts(key) {
+    const sep = (key || "").indexOf("::");
+    if (sep === -1) return { name: key || "", branch: "" };
+    return { name: key.slice(0, sep), branch: key.slice(sep + 2) };
+  }
+
+  function overrideKeyDisplay(ov) {
+    if (ov.type !== "customer") return ov.key;
+    const { name, branch } = customerKeyParts(ov.key);
+    return branch ? `${name} — branch: ${branch}` : name;
   }
 
   // ── Suggestion fetch + link-apply (shared by the manual "Suggest" button and
@@ -334,33 +362,82 @@
     return normalizeCandidates(type, raw);
   }
 
+  // True when BC has more than one Customer record sharing this EXACT name — e.g. a
+  // retail chain set up as a separate Customer master per store/branch, all under the
+  // identical Name field. Best-effort: fails open (false) on any error, since the
+  // fallback is simply today's blanket-link behavior, not a blocked save.
+  async function isCustomerNameAmbiguous(name) {
+    if (!name || !state) return false;
+    try {
+      const res = await fetch(`/api/customer-name-matches?name=${encodeURIComponent(name)}&company=${encodeURIComponent(state.company)}`);
+      if (!res.ok) return false;
+      const data = await res.json();
+      return (data.data || []).length > 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Saves `candidate` as the resolved link for `group` and mutates `group` in place
   // (resolved/resolved_by/resolved_at/override_id) — no DOM access, so this is usable
   // both from a row's own "pick a candidate" handler and from a background pass with
   // no row rendered yet. A ship-to address belongs to a specific BC customer —
   // selecting one tells us that customer too, so the matching "customer" group is
   // auto-linked alongside it instead of making the user resolve the same information
-  // twice. Returns { customerLinkError } rather than throwing on that secondary save,
-  // since the branch link itself still succeeded.
+  // twice.
+  //
+  // That auto-link used to always write the FLAT customer-name override — correct only
+  // when every branch sharing that raw customer name really does belong to the same BC
+  // Customer record. When BC has split the name across multiple Customer records (one
+  // per branch/ship-to), writing the flat override from just ONE branch's resolution
+  // would silently misroute every OTHER branch sharing that name on its next
+  // reprocess, with no error. isCustomerNameAmbiguous checks for that live; when true,
+  // the customer link is saved scoped to this one branch ("{name}::{branch}", see
+  // so_buffer_service._customer_key_parts) instead of touching the shared flat link —
+  // the Overrides tab flags a scoped link distinctly (overrideKeyDisplay) so a human
+  // auditing it later can tell at a glance which overrides are blanket vs. per-branch.
+  //
+  // Returns { customerLinkError, customerScopedToBranch } rather than throwing on the
+  // secondary save, since the branch link itself still succeeded either way.
   async function applyLinkToGroup(type, group, candidate, resolvedBy) {
     const resolved = resolvedPayload(type, candidate);
     const data = await saveOverride(type, group.key, resolved, resolvedBy, group.buffer_ids);
     applyResolvedFields(group, resolved, data);
 
     let customerLinkError = null;
+    let customerScopedToBranch = false;
     if (type === "branch" && group.customer_name && candidate.extra) {
-      const custResolved = { customerNo: candidate.extra, displayName: candidate.customerName || candidate.extra };
+      const custResolved = {
+        customerNo: candidate.extra,
+        displayName: candidate.customerName || candidate.extra,
+        // Reference metadata — the exact ship-to this customer link came from, shown
+        // on the Overrides tab (resolvedDisplay) and used by rgmc-worker-pool as a
+        // fallback ship-to when this override is used without a parallel branch link.
+        shipToCode: candidate.code || "",
+        shipToName: candidate.name || "",
+      };
       try {
-        const custGroup = findGroup("customer", group.customer_name);
-        const custData = await saveOverride(
-          "customer", group.customer_name, custResolved, resolvedBy, custGroup ? custGroup.buffer_ids : []
-        );
-        if (custGroup) applyResolvedFields(custGroup, custResolved, custData);
+        const ambiguous = await isCustomerNameAmbiguous(group.customer_name);
+        customerScopedToBranch = ambiguous;
+        if (ambiguous) {
+          const custKey = `${group.customer_name}::${group.key}`;
+          await saveOverride("customer", custKey, custResolved, resolvedBy, group.buffer_ids);
+          // Deliberately NOT applied to the flat "customer" group's state here — that
+          // group stays whatever it was (likely unresolved), since a blanket link for
+          // this ambiguous name still isn't correct. The scoped link just saved covers
+          // this branch's own buffered orders directly via group.buffer_ids.
+        } else {
+          const custGroup = findGroup("customer", group.customer_name);
+          const custData = await saveOverride(
+            "customer", group.customer_name, custResolved, resolvedBy, custGroup ? custGroup.buffer_ids : []
+          );
+          if (custGroup) applyResolvedFields(custGroup, custResolved, custData);
+        }
       } catch (e) {
         customerLinkError = e.message;
       }
     }
-    return { customerLinkError };
+    return { customerLinkError, customerScopedToBranch };
   }
 
   // ── Highlight high-confidence suggestions ─────────────────────────────────
@@ -451,6 +528,30 @@
       list.appendChild(item);
     });
     container.appendChild(list);
+  }
+
+  // Warns above the candidate list when two or more customer candidates share the
+  // exact same name (not just a substring match) — resolving the Customers tab's
+  // group directly saves ONE blanket link for the whole raw customer name, so if the
+  // chosen candidate is one of several sharing that name, every OTHER branch sharing
+  // the name would silently get routed to it too on its next reprocess, whether or not
+  // that's actually correct for them. Suggests the branch-level Link instead, which
+  // scopes the customer link to just that one branch automatically (see
+  // applyLinkToGroup/isCustomerNameAmbiguous) — informational, never blocks the save.
+  function warnIfAmbiguousCandidates(container, candidates) {
+    const counts = {};
+    candidates.forEach((c) => {
+      const key = (c.name || "").trim().toUpperCase();
+      if (key) counts[key] = (counts[key] || 0) + 1;
+    });
+    if (!Object.values(counts).some((n) => n > 1)) return;
+    const warn = document.createElement("div");
+    warn.className = "search-hint override-scope-note";
+    warn.textContent =
+      "⚠ More than one BC customer shares this exact name. Linking here applies to every branch sharing the " +
+      "name — if they use different ship-to addresses, resolve each branch instead (Customer Branches tab), " +
+      "which scopes the customer link to just that branch automatically.";
+    container.insertBefore(warn, container.firstChild);
   }
 
   function escapeHtml(s) {
@@ -673,13 +774,18 @@
       linkPanel.classList.add("is-saving");
       try {
         const resolvedBy = getEmployeeDetails().employee_name;
-        const { customerLinkError } = await applyLinkToGroup(type, group, candidate, resolvedBy);
+        const { customerLinkError, customerScopedToBranch } = await applyLinkToGroup(type, group, candidate, resolvedBy);
         applyResolvedState(group);
         resolvedBox.classList.add("pop-in");
         resolvedBox.addEventListener("animationend", () => resolvedBox.classList.remove("pop-in"), { once: true });
         linkPanel.classList.remove("is-open");
         if (customerLinkError) {
           setStatus("Branch linked, but auto-linking the customer failed: " + customerLinkError, true);
+        } else if (customerScopedToBranch) {
+          setStatus(
+            `Branch linked. BC has multiple customers named "${group.customer_name}", so the customer link was ` +
+            `scoped to this branch only (see the Overrides tab) — other branches sharing that name still need their own link.`
+          );
         }
 
         refreshOtherGroupPanels(type); // other groups' blocked-notes may change now that this one resolved (also covers the auto-linked customer group, if any)
@@ -783,7 +889,9 @@
             // Stale response guard — the debounce already waits 350ms, but a slow BC
             // round-trip can still resolve after the user has typed something newer.
             if (searchInput.value.trim() !== term) return;
-            renderCandidateList(searchResults, type, normalizeCandidates(type, data.data), saveLink);
+            const candidates = normalizeCandidates(type, data.data);
+            renderCandidateList(searchResults, type, candidates, saveLink);
+            if (type === "customer") warnIfAmbiguousCandidates(searchResults, candidates);
           } catch (e) {
             if (searchInput.value.trim() !== term) return;
             searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
@@ -1806,7 +1914,17 @@
     const findResultsEl = row.querySelector(".override-find-orders-results");
 
     row.querySelector(".override-type-badge").textContent = OVERRIDE_TYPE_LABEL[ov.type] || ov.type;
-    row.querySelector(".group-key").textContent = ov.key;
+    row.querySelector(".group-key").textContent = overrideKeyDisplay(ov);
+    // Flags a branch-scoped customer override distinctly from a blanket one — BC has
+    // more than one Customer record sharing this exact name, so this link only applies
+    // to buffered orders from that one branch, never the others sharing the name. See
+    // isCustomerNameAmbiguous/applyLinkToGroup, which is what creates these.
+    const descEl = row.querySelector(".group-desc");
+    const scopedToBranch = ov.type === "customer" && customerKeyParts(ov.key).branch;
+    descEl.textContent = scopedToBranch
+      ? "⚠ Scoped to this branch only — BC has multiple customers named this; other branches need their own link."
+      : "";
+    descEl.classList.toggle("override-scope-note", !!scopedToBranch);
     resolvedBox.querySelector(".resolved-text").textContent = resolvedDisplay(ov.resolved);
     resolvedBox.querySelector(".resolved-by").textContent =
       ov.resolved_by ? `(by ${ov.resolved_by}, ${ov.resolved_at || ""})` : "";
@@ -1938,7 +2056,9 @@
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
           if (searchInput.value.trim() !== term) return; // stale response guard
-          renderCandidateList(searchResults, ov.type, normalizeCandidates(ov.type, data.data), pickCandidate);
+          const candidates = normalizeCandidates(ov.type, data.data);
+          renderCandidateList(searchResults, ov.type, candidates, pickCandidate);
+          if (ov.type === "customer") warnIfAmbiguousCandidates(searchResults, candidates);
         } catch (e) {
           if (searchInput.value.trim() !== term) return;
           searchResults.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;

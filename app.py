@@ -703,6 +703,30 @@ def api_lookup_customers():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/customer-name-matches")
+def api_customer_name_matches():
+    """Every BC Customer record sharing one EXACT name — used to detect when a raw
+    customerName from a buffered PO has been split across more than one Customer
+    record in BC (e.g. a retail chain set up as a separate customer per store/branch,
+    all under the identical Name field). `name eq` (exact), not `contains` (substring)
+    — the Overrides tab / branch-link flow uses this count, not the full-text one
+    /api/lookup/customers already does, to decide whether a customer override needs to
+    be scoped to one branch instead of applying to every buffered order sharing this
+    customer name — see reconcile.js's isCustomerNameAmbiguous.
+    """
+    company = request.args.get("company", "")
+    name = (request.args.get("name") or "").strip()
+    if not name or not company:
+        return jsonify({"data": []})
+    try:
+        esc = name.replace("'", "''").upper()
+        resp = _bc_api("GET", "/bc/custom/v2/customers", params={"company": company, "filter": f"name eq '{esc}'"})
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/lookup/uom")
 def api_lookup_uom():
     """Valid units of measure for one item, via rgmc-bc-api's Item Unit of Measure

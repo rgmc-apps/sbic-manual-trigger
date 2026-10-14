@@ -424,6 +424,7 @@
   padding: 2px 9px;
 }
 .override-row .group-resolved { margin-top: 8px; }
+.override-scope-note { color: var(--warn-text); font-weight: 600; }
 .override-find-orders-status { margin-top: 8px; font-size: .8125rem; color: var(--text-muted); }
 .override-find-orders-status.error { color: var(--error); }
 .override-find-orders-results { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
