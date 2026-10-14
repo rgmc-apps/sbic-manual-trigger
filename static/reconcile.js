@@ -690,6 +690,18 @@
     return (state.orders || []).filter((o) => ids.has(o.id));
   }
 
+  // The resolved ship-to for a raw branch name, if the Customer Branches (Ship-To) tab
+  // already has a link for it — {customerNo, shipToCode, name}, or null if that branch
+  // isn't linked yet. Shown on each split sub-row so a human picking which BC customer
+  // this branch/PO belongs to can see what the branch is already tied to, instead of
+  // guessing from the name alone.
+  function branchShipToInfo(branchName) {
+    if (!branchName) return null;
+    const upper = branchName.trim().toUpperCase();
+    const g = (state.groups.branch || []).find((x) => x.key.trim().toUpperCase() === upper);
+    return (g && g.resolved) ? g.resolved : null;
+  }
+
   // One bucket per distinct branch (mode "branch", the default — POs that really do
   // share a branch almost always belong together) or one bucket per individual PO
   // (mode "po" — the rarer escape hatch for when even two POs sharing the same raw
@@ -700,11 +712,12 @@
     customerGroupOrders(group).forEach((o) => {
       const header = o.header || {};
       const poRef = header.poRefNumber || o.id;
-      const bucketKey = mode === "po" ? o.id : (header.customerBranchName || "").trim().toUpperCase() || "(NO BRANCH)";
+      const branchName = (header.customerBranchName || "").trim();
+      const bucketKey = mode === "po" ? o.id : (branchName.toUpperCase() || "(NO BRANCH)");
       if (!buckets.has(bucketKey)) {
-        const label = mode === "po" ? poRef : ((header.customerBranchName || "").trim() || "(no branch on this PO)");
+        const label = mode === "po" ? poRef : (branchName || "(no branch on this PO)");
         const scopeKey = mode === "po" ? `${group.key}::PO:${poRef}` : `${group.key}::${label}`;
-        buckets.set(bucketKey, { label, scopeKey, poRefs: [], bufferIds: [] });
+        buckets.set(bucketKey, { label, scopeKey, poRefs: [], bufferIds: [], shipTo: branchShipToInfo(branchName) });
       }
       const b = buckets.get(bucketKey);
       b.poRefs.push(poRef);
@@ -716,12 +729,17 @@
   function buildSplitSubRow(sub) {
     const row = document.createElement("div");
     row.className = "split-sub-row";
+    const shipToLine = sub.shipTo
+      ? `<div class="split-sub-shipto">Ship-to on file: <strong>${escapeHtml(sub.shipTo.shipToCode || "")}</strong>` +
+        `${sub.shipTo.name ? " — " + escapeHtml(sub.shipTo.name) : ""} (customer ${escapeHtml(sub.shipTo.customerNo || "")})</div>`
+      : "";
     row.innerHTML = `
       <div class="split-sub-head">
         <span class="split-sub-label">${escapeHtml(sub.label)}</span>
         <span class="group-po-count">${sub.poRefs.length} PO${sub.poRefs.length === 1 ? "" : "s"}</span>
         <button class="btn-link-toggle btn-split-link-toggle" type="button">Link…</button>
       </div>
+      ${shipToLine}
       <div class="split-sub-po-refs">POs: ${escapeHtml(sub.poRefs.join(", "))}</div>
       <div class="group-resolved hidden">
         Linked to <strong class="resolved-text"></strong>
@@ -822,9 +840,10 @@
     hint.className = "search-hint";
     hint.textContent =
       "Link each branch (or, if needed, each individual PO) to its own BC customer — doesn't touch the blanket " +
-      "link above, and each save applies immediately. Switching mode rebuilds this list from scratch, so an " +
-      "already-linked row won't show as linked here afterward (it still is — check the Overrides tab for every " +
-      "link saved so far).";
+      "link above, and each save applies immediately. A row showing \"Ship-to on file\" already has a link saved " +
+      "on the Customer Branches (Ship-To) tab — that's the customer its orders actually belong to. Switching " +
+      "mode rebuilds this list from scratch, so an already-linked row won't show as linked here afterward (it " +
+      "still is — check the Overrides tab for every link saved so far).";
     container.appendChild(hint);
 
     const toolbar = document.createElement("div");

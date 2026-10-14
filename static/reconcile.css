@@ -558,6 +558,8 @@
 .split-sub-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .split-sub-label { font-weight: 700; font-size: .84rem; flex: 1; min-width: 0; word-break: break-word; }
 .split-sub-po-refs { margin-top: 4px; font-size: .72rem; color: var(--text-muted); word-break: break-word; }
+.split-sub-shipto { margin-top: 4px; font-size: .76rem; color: var(--brand-dark); word-break: break-word; }
+.split-sub-shipto strong { font-weight: 700; }
 .split-sub-link-panel { margin-top: 10px; }
 
 /* Auto-height reveal via grid-template-rows — no explicit height math, layout-safe. */
