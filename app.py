@@ -660,6 +660,85 @@ def _enrich_customer_names(candidates: list, company: str) -> None:
             c["customerName"] = name_by_no[no]
 
 
+def _branch_override_shipto(branch_name: str) -> dict | None:
+    """The already-saved "branch" override's ship-to for this exact customerBranchName,
+    if one exists — a human already vetted this exact branch via the Buffer tab, so it
+    should outrank a fresh fuzzy guess, not just sit alongside it unused."""
+    if not branch_name:
+        return None
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides", params={"type": "branch"})
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException:
+        return None
+    if status_code != 200:
+        return None
+    target = branch_name.strip().upper()
+    for ov in body.get("data") or []:
+        if (ov.get("key") or "").strip().upper() != target:
+            continue
+        resolved = ov.get("resolved") or {}
+        if resolved.get("shipToCode"):
+            return {
+                "code": resolved["shipToCode"], "name": resolved.get("name") or "",
+                "customerNumber": resolved.get("customerNo") or "",
+                "source": "saved branch override",
+            }
+    return None
+
+
+def _customer_override_shipto(customer_name: str, branch_name: str, po_ref: str) -> dict | None:
+    """The already-saved "customer" override's ship-to reference for this PO, if one
+    exists — checked PO-scoped > branch-scoped > flat, the exact precedence
+    rgmc-worker-pool's _create_order uses (see so_buffer_service._customer_key_parts).
+    A "customer" override only carries shipToCode as reference metadata (the ship-to its
+    customer link was captured from, not a guaranteed match for THIS PO's own branch),
+    so it's checked only when no branch override matched."""
+    if not customer_name:
+        return None
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides", params={"type": "customer"})
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException:
+        return None
+    if status_code != 200:
+        return None
+    by_key = {(ov.get("key") or "").strip().upper(): ov for ov in body.get("data") or []}
+    name_u = customer_name.strip().upper()
+    candidate_keys = []
+    if po_ref:
+        candidate_keys.append(f"{name_u}::PO:{po_ref.strip().upper()}")
+    if branch_name:
+        candidate_keys.append(f"{name_u}::{branch_name.strip().upper()}")
+    candidate_keys.append(name_u)
+    for key in candidate_keys:
+        ov = by_key.get(key)
+        if not ov:
+            continue
+        resolved = ov.get("resolved") or {}
+        if resolved.get("shipToCode"):
+            return {
+                "code": resolved["shipToCode"], "name": resolved.get("shipToName") or "",
+                "customerNumber": resolved.get("customerNo") or "",
+                "source": "saved customer override",
+            }
+    return None
+
+
+def _find_shipto_override(po_ref: str, branch_name: str) -> dict | None:
+    """An already-saved override that resolves this PO's ship-to, if any — surfaced
+    ahead of fresh fuzzy matching so a human's already-vetted decision (made via the
+    Buffer tab, or the Customers tab's Split action) is reused instead of asking them to
+    re-decide the same branch/customer from scratch. See _branch_override_shipto /
+    _customer_override_shipto for the precedence between the two override types."""
+    branch_hit = _branch_override_shipto(branch_name)
+    if branch_hit:
+        return branch_hit
+    header, _ = _fetch_from_customerpoul(po_ref)
+    customer_name = (header or {}).get("customer_name")
+    return _customer_override_shipto(customer_name, branch_name, po_ref)
+
+
 @app.route("/api/suggest/shipto/<po_ref>")
 def api_suggest_shipto(po_ref):
     """Fuzzy BC ship-to suggestions for one PO, via rgmc-gcp-api (Cloud SQL + BC).
@@ -680,6 +759,10 @@ def api_suggest_shipto(po_ref):
             if body.get("exactCodeMatch"):
                 candidates.append(body["exactCodeMatch"])
             _enrich_customer_names(candidates, body.get("bcCompany"))
+            override_match = _find_shipto_override(po_ref, body.get("customerBranchName"))
+            if override_match:
+                _enrich_customer_names([override_match], body.get("bcCompany"))
+            body["overrideMatch"] = override_match
         return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
@@ -993,20 +1076,46 @@ def api_sales_orders_missing_shipto():
         return jsonify({"error": str(exc)}), 502
 
 
-@app.route("/api/sales-orders/update-shipto", methods=["POST"])
-def api_update_sales_order_shipto():
-    """Link one already-created BC Sales Order (missing its Ship-to Code) to an
-    existing BC ship-to address — PATCHes just that one order's header. Re-queries
-    Business Central fresh server-side via _find_orders_missing_shipto rather than
-    trusting the client-supplied order_id for anything but WHICH result to act on, so
-    the submittedBy/status/shipToCode-blank safety filter stays authoritative — an
-    order_id that didn't come back from that fresh query (already fixed by someone
-    else, or no longer Open) is rejected rather than silently PATCHed.
+@app.route("/api/sales-orders/shipto-fixes", methods=["GET"])
+def api_list_shipto_fixes():
+    """Queued/attempted Ship-to Code fixes — lets the Missing Ship-To tab show which
+    rows already have a fix queued (and its outcome, once an Apply run has tried it)
+    without re-deriving that from the BC search itself."""
+    params = {}
+    company = (request.args.get("company") or "").strip()
+    if company:
+        params["company"] = company
+    applied = (request.args.get("applied") or "").strip()
+    if applied:
+        params["applied"] = applied
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/shipto-fixes", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/shipto-fixes", methods=["POST"])
+def api_queue_shipto_fix():
+    """Queue a Ship-to Code fix for one already-created BC Sales Order — does NOT touch
+    BC. Applying is a separate, explicit, batched step (POST /api/apply-shipto-fixes),
+    same two-step shape as the Buffer tab's overrides + Reprocess Buffer: a saved link
+    here is cheap and instant, writing to BC happens only on an explicit Apply trigger,
+    processed by rgmc-worker-pool in batch.
+
+    Re-queries Business Central fresh server-side via _find_orders_missing_shipto
+    rather than trusting the client-supplied order_id for anything but WHICH result to
+    act on, so the submittedBy/status/shipToCode-blank safety filter stays
+    authoritative — an order_id that didn't come back from that fresh query (already
+    fixed by someone else, or no longer Open) is rejected rather than silently queued.
     """
     data = request.get_json(silent=True) or {}
     company = (data.get("company") or "").strip()
     order_id = (data.get("order_id") or "").strip()
     ship_to_code = (data.get("ship_to_code") or "").strip()
+    ship_to_name = (data.get("ship_to_name") or "").strip()
+    source = (data.get("source") or "").strip()
 
     if not company:
         return jsonify({"error": "company is required"}), 400
@@ -1028,19 +1137,60 @@ def api_update_sales_order_shipto():
         }), 409
 
     try:
-        resp = _bc_api(
-            "PATCH", f"/bc/custom/v2/sales-orders/{order_id}",
-            params={"company": company}, json={"shipToCode": ship_to_code},
-        )
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/shipto-fixes", json={
+            "company": company,
+            "order_id": order_id,
+            "order_no": order.get("number") or "",
+            "po_ref": order.get("externalDocumentNo") or "",
+            "ship_to_code": ship_to_code,
+            "ship_to_name": ship_to_name,
+            "resolved_by": (data.get("resolved_by") or "").strip(),
+            "source": source,
+        })
         body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
-    if status_code not in (200, 201):
-        detail = body.get("detail") or body.get("error") or f"BC returned {status_code}"
-        return jsonify({"error": str(detail)[:300]}), 502
 
-    return jsonify({"ok": True, "number": order.get("number"), "shipToCode": ship_to_code})
+@app.route("/api/sales-orders/shipto-fixes/<fix_id>", methods=["DELETE"])
+def api_cancel_shipto_fix(fix_id):
+    """Cancel a queued Ship-to Code fix before an Apply run has picked it up."""
+    try:
+        resp = _bc_api("DELETE", f"/bc/custom/v2/so-buffer/shipto-fixes/{fix_id}")
+        if resp.status_code == 204:
+            return "", 204
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/apply-shipto-fixes", methods=["POST"])
+def api_apply_shipto_fixes():
+    """Trigger the same async pipeline as Reprocess Buffer (rgmc-gcp-api -> Pub/Sub ->
+    rgmc-worker-pool), but for queued Ship-to Code fixes instead of buffered orders:
+    the worker pulls every pending fix for the given company, re-validates each against
+    BC fresh, and PATCHes shipToCode — see rgmc-worker-pool's
+    _run_shipto_fixes_batch. Same run_id/status-polling shape as /api/reprocess
+    (GET /api/reprocess-status/<run_id>, already generic across job types).
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip().upper()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+
+    notify_params, err = _employee_notify_params(data)
+    if err:
+        return err
+
+    params = {"companies": company, **notify_params}
+    try:
+        resp = _gcp_api("POST", "/customerpoul/apply-shipto-fixes", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
 
 
 @app.route("/api/sales-orders")

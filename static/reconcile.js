@@ -35,6 +35,14 @@
   const missingShiptoSearchBtn     = document.getElementById("missing-shipto-search-btn");
   const missingShiptoStatusLine    = document.getElementById("missing-shipto-status-line");
   const missingShiptoResultsList   = document.getElementById("missing-shipto-results-list");
+  const shiptoFixesAction          = document.getElementById("shipto-fixes-action");
+  const shiptoFixesQueuedCount     = document.getElementById("shipto-fixes-queued-count");
+  const shiptoFixesApplyBtn        = document.getElementById("shipto-fixes-apply-btn");
+  const shiptoFixesStatusEl        = document.getElementById("shipto-fixes-status");
+  const shiptoFixesStatusTitleEl   = document.getElementById("shipto-fixes-status-title");
+  const shiptoFixesStatusDetailEl  = document.getElementById("shipto-fixes-status-detail");
+  const shiptoFixesElapsedEl       = document.getElementById("shipto-fixes-elapsed");
+  const shiptoFixesStopWatchingBtn = document.getElementById("shipto-fixes-stop-watching-btn");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
   const soUpdateModalTbody     = document.getElementById("so-update-modal-tbody");
@@ -260,6 +268,7 @@
           score: c.score, extra: c.customerNumber, customerName: c.customerName || null,
           lookupCode: c.lookupCode || null,
           extraLabel: c.lookupCode ? `${custLabel} · lookup: ${c.lookupCode}` : custLabel,
+          source: c.source || null,
           raw: c,
         };
       }
@@ -534,7 +543,7 @@
     list.className = "candidate-list";
     candidates.forEach((c) => {
       const item = document.createElement("div");
-      item.className = "candidate-item";
+      item.className = "candidate-item" + (c.source ? " candidate-item-override" : "");
       const main = document.createElement("div");
       main.className = "candidate-main";
       // Customer candidates show address inline ("name (address)") to help tell apart
@@ -545,6 +554,7 @@
         ? `${escapeHtml(c.name || "")} (${escapeHtml(c.address)})`
         : `${escapeHtml(c.name || "")}${extraLabel ? " · " + escapeHtml(extraLabel) : ""}`;
       main.innerHTML =
+        (c.source ? `<div class="candidate-source">✓ ${escapeHtml(c.source)}</div>` : "") +
         `<div class="candidate-code">${escapeHtml(c.code || "")}</div>` +
         `<div class="candidate-name">${nameLine}</div>`;
       item.appendChild(main);
@@ -2702,7 +2712,7 @@
   // match, if any) against BC's live Ship-to Addresses for the order's company — the
   // same mechanism the Buffer tab's branch-suggestion already uses (fetchSuggestionCandidates),
   // just driven by an already-created order's externalDocumentNo instead of a buffered PO.
-  function buildMissingShiptoRow(order, company) {
+  function buildMissingShiptoRow(order, company, pendingFix) {
     const row = document.createElement("div");
     row.className = "order-row";
     const poRef = order.externalDocumentNo || "";
@@ -2719,7 +2729,8 @@
         Order date: ${escapeHtml(order.orderDate || "—")}
       </div>
       <div class="group-resolved hidden">
-        Linked to ship-to <strong class="resolved-text"></strong>
+        Queued ship-to <strong class="resolved-text"></strong>
+        <button class="btn-unlink" type="button">Cancel</button>
       </div>
       <div class="shipto-link-panel hidden">
         <div class="search-hint shipto-branch-context"></div>
@@ -2733,11 +2744,39 @@
     const badge = row.querySelector(".order-badge");
     const panel = row.querySelector(".shipto-link-panel");
     const resolvedBox = row.querySelector(".group-resolved");
+    const unlinkBtn = row.querySelector(".btn-unlink");
     const branchContext = row.querySelector(".shipto-branch-context");
     const suggestionsEl = row.querySelector(".shipto-suggestions");
     const searchInput = row.querySelector(".search-input");
     const manualResultsEl = row.querySelector(".shipto-manual-results");
+    let currentFixId = pendingFix ? pendingFix.id : null;
 
+    function showQueued(codeAndName) {
+      resolvedBox.querySelector(".resolved-text").textContent =
+        `${codeAndName.ship_to_code}${codeAndName.ship_to_name ? " — " + codeAndName.ship_to_name : ""}`;
+      resolvedBox.classList.remove("hidden");
+      panel.classList.add("hidden");
+      toggleBtn.textContent = "Change…";
+      badge.textContent = "Queued";
+      badge.classList.remove("failed");
+      badge.classList.add("pending");
+    }
+
+    function showUnqueued() {
+      resolvedBox.classList.add("hidden");
+      toggleBtn.textContent = "Link Ship-To…";
+      badge.textContent = "No Ship-To";
+      badge.classList.remove("pending");
+      badge.classList.add("failed");
+    }
+
+    if (pendingFix) showQueued(pendingFix);
+
+    // Only QUEUES the fix (rgmc-bc-api's so_shipto_fixes_{env} — see _find_orders_missing_shipto
+    // in app.py for the re-validation this goes through server-side first). Never
+    // writes to BC directly — the "Apply Ship-To Fixes" button below is the one real
+    // write, batched via the same trigger -> Pub/Sub -> rgmc-worker-pool pipeline
+    // Reprocess Buffer uses (see so_import_worker.py's _run_shipto_fixes_batch).
     async function applyShipTo(candidate) {
       if (!refreshGate()) {
         setMissingShiptoStatus("Fill in your details above first.", true);
@@ -2745,28 +2784,43 @@
       }
       toggleBtn.disabled = true;
       try {
-        const res = await fetch("/api/sales-orders/update-shipto", {
+        const res = await fetch("/api/sales-orders/shipto-fixes", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ company, order_id: order.id, ship_to_code: candidate.code }),
+          body: JSON.stringify({
+            company, order_id: order.id, ship_to_code: candidate.code,
+            ship_to_name: candidate.name || "", source: candidate.source || "",
+            resolved_by: getEmployeeDetails().employee_name,
+          }),
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || data.detail || "Link failed");
-        resolvedBox.querySelector(".resolved-text").textContent =
-          `${candidate.code}${candidate.name ? " — " + candidate.name : ""}`;
-        resolvedBox.classList.remove("hidden");
-        panel.classList.add("hidden");
-        toggleBtn.textContent = "Change…";
-        badge.textContent = "Linked";
-        badge.classList.remove("failed");
-        badge.classList.add("ready");
-        setMissingShiptoStatus(`Linked ${order.number} to ship-to ${candidate.code}.`);
+        if (!res.ok) throw new Error(data.error || data.detail || "Queue failed");
+        currentFixId = data.id;
+        showQueued({ ship_to_code: candidate.code, ship_to_name: candidate.name || "" });
+        setMissingShiptoStatus(`Queued ${order.number} for ship-to ${candidate.code} — click Apply Ship-To Fixes below to write it to BC.`);
+        refreshShiptoFixesQueueCount(company);
       } catch (e) {
-        setMissingShiptoStatus(`Could not link ${order.number}: ${e.message}`, true);
+        setMissingShiptoStatus(`Could not queue a fix for ${order.number}: ${e.message}`, true);
       } finally {
         toggleBtn.disabled = false;
       }
     }
+
+    unlinkBtn.addEventListener("click", async () => {
+      if (!currentFixId) return;
+      unlinkBtn.disabled = true;
+      try {
+        await fetch(`/api/sales-orders/shipto-fixes/${encodeURIComponent(currentFixId)}`, { method: "DELETE" });
+        currentFixId = null;
+        showUnqueued();
+        setMissingShiptoStatus(`Cancelled the queued fix for ${order.number}.`);
+        refreshShiptoFixesQueueCount(company);
+      } catch (e) {
+        setMissingShiptoStatus(`Could not cancel: ${e.message}`, true);
+      } finally {
+        unlinkBtn.disabled = false;
+      }
+    });
 
     async function loadSuggestions() {
       if (!poRef) {
@@ -2783,10 +2837,17 @@
         branchContext.textContent = data.customerBranchName
           ? `PO's branch on file: "${data.customerBranchName}"${data.customerBranchLookUpCode ? ` (lookup code: ${data.customerBranchLookUpCode})` : ""}`
           : "No customer branch name found for this PO in BigQuery/CustomerPOUL — use the search box below.";
+        // overrideMatch (an already-saved branch/customer override resolving this PO's
+        // ship-to — see _find_shipto_override in app.py) is shown first and flagged
+        // distinctly (renderCandidateList's "✓ saved ... override" tag) since it's a
+        // human's already-vetted decision, not a fresh guess — still just a candidate
+        // to click, never auto-applied.
+        const seen = new Set();
         const raw = [];
-        if (data.exactCodeMatch) raw.push(data.exactCodeMatch);
-        (data.fuzzyMatches || []).forEach((m) => {
-          if (!data.exactCodeMatch || m.code !== data.exactCodeMatch.code) raw.push(m);
+        [data.overrideMatch, data.exactCodeMatch, ...(data.fuzzyMatches || [])].forEach((m) => {
+          if (!m || !m.code || seen.has(m.code)) return;
+          seen.add(m.code);
+          raw.push(m);
         });
         renderCandidateList(suggestionsEl, "branch", normalizeCandidates("branch", raw), applyShipTo);
       } catch (e) {
@@ -2826,16 +2887,42 @@
     return row;
   }
 
-  function renderMissingShiptoResults(orders, company) {
+  async function fetchPendingShiptoFixes(company) {
+    try {
+      const res = await fetch(`/api/sales-orders/shipto-fixes?company=${encodeURIComponent(company)}&applied=false`);
+      const data = await res.json();
+      if (!res.ok) return {};
+      const map = {};
+      (data.data || []).forEach((f) => { map[f.order_id] = f; });
+      return map;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  async function refreshShiptoFixesQueueCount(company) {
+    try {
+      const res = await fetch(`/api/sales-orders/shipto-fixes?company=${encodeURIComponent(company)}&applied=false`);
+      const data = await res.json();
+      const n = res.ok ? (data.data || []).length : 0;
+      shiptoFixesQueuedCount.textContent = n ? `${n} fix${n === 1 ? "" : "es"} queued, not yet applied.` : "";
+      shiptoFixesAction.classList.toggle("hidden", n === 0);
+    } catch (e) { /* best-effort */ }
+  }
+
+  async function renderMissingShiptoResults(orders, company) {
     missingShiptoResultsList.innerHTML = "";
     if (!orders.length) {
       const empty = document.createElement("div");
       empty.className = "tab-empty";
       empty.textContent = "No Open Sales Orders with a missing Ship-to Code found.";
       missingShiptoResultsList.appendChild(empty);
+      shiptoFixesAction.classList.add("hidden");
       return;
     }
-    orders.forEach((o) => missingShiptoResultsList.appendChild(buildMissingShiptoRow(o, company)));
+    const pendingByOrderId = await fetchPendingShiptoFixes(company);
+    orders.forEach((o) => missingShiptoResultsList.appendChild(buildMissingShiptoRow(o, company, pendingByOrderId[o.id] || null)));
+    refreshShiptoFixesQueueCount(company);
   }
 
   async function searchMissingShipto() {
@@ -2852,7 +2939,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
       const orders = data.data || [];
-      renderMissingShiptoResults(orders, company);
+      await renderMissingShiptoResults(orders, company);
       setMissingShiptoStatus(`Found ${orders.length} Open Sales Order(s) in ${company} with no Ship-to Code.`);
     } catch (e) {
       setMissingShiptoStatus("Error: " + e.message, true);
@@ -2863,6 +2950,123 @@
   }
 
   missingShiptoSearchBtn.addEventListener("click", searchMissingShipto);
+
+  // ── Apply Ship-To Fixes — same trigger -> Pub/Sub -> rgmc-worker-pool -> batch
+  // BC-write pipeline as Reprocess Buffer (see /api/apply-shipto-fixes in app.py and
+  // so_import_worker.py's _run_shipto_fixes_batch), just for queued Ship-to Code fixes
+  // instead of buffered orders. A self-contained watcher, not the Buffer tab's
+  // startWatching/stopWatching (those are entangled with the Buffer tab's own
+  // state/buffer-count fallback) — reuses only the already job-agnostic
+  // GET /api/reprocess-status/<run_id> polling endpoint and the shared RUN_POLL_MS/
+  // MAX_WATCH_MS/formatElapsed constants.
+  let shiptoFixesWatcher = null;
+
+  function stopWatchingShiptoFixes(finalMessage, variant, detailMessage) {
+    if (!shiptoFixesWatcher) return;
+    clearInterval(shiptoFixesWatcher.tickTimer);
+    clearTimeout(shiptoFixesWatcher.pollTimer);
+    shiptoFixesWatcher = null;
+    if (finalMessage) {
+      shiptoFixesStatusEl.classList.remove("is-success", "is-error", "is-stopped");
+      if (variant) shiptoFixesStatusEl.classList.add(variant);
+      shiptoFixesStatusTitleEl.textContent = finalMessage;
+      shiptoFixesStatusDetailEl.textContent = detailMessage || "";
+      shiptoFixesStopWatchingBtn.classList.add("hidden");
+    } else {
+      shiptoFixesStatusEl.classList.add("hidden");
+    }
+  }
+
+  function summarizeShiptoFixesRun(summary) {
+    if (!summary) return "";
+    const parts = [`${summary.fixes_applied || 0} fix(es) applied`];
+    if (summary.fixes_skipped) parts.push(`${summary.fixes_skipped} skipped (no longer eligible)`);
+    if (summary.fixes_failed) parts.push(`${summary.fixes_failed} failed`);
+    return parts.join(", ") + ".";
+  }
+
+  async function pollShiptoFixesRunStatusOnce(company) {
+    if (!shiptoFixesWatcher) return;
+    try {
+      const res = await fetch(`/api/reprocess-status/${encodeURIComponent(shiptoFixesWatcher.runId)}`);
+      const data = await res.json();
+      if (!shiptoFixesWatcher || !res.ok) return;
+
+      if (data.status === "done") {
+        stopWatchingShiptoFixes("Apply done.", "is-success", summarizeShiptoFixesRun(data.summary));
+        searchMissingShipto(); // re-run the search — applied rows drop off (shipToCode no longer blank)
+        return;
+      }
+      if (data.status === "error") {
+        stopWatchingShiptoFixes("Apply failed.", "is-error", data.error || "Unknown error.");
+        return;
+      }
+      shiptoFixesStatusTitleEl.textContent = data.status === "queued"
+        ? "Apply triggered — waiting for the worker to pick it up…"
+        : "Applying…";
+      if (Date.now() - shiptoFixesWatcher.startedAt >= MAX_WATCH_MS) {
+        stopWatchingShiptoFixes("Stopped auto-checking after 10 minutes — reload to see the latest.", "is-stopped");
+        return;
+      }
+      shiptoFixesWatcher.pollTimer = setTimeout(() => pollShiptoFixesRunStatusOnce(company), RUN_POLL_MS);
+    } catch (e) {
+      if (shiptoFixesWatcher) shiptoFixesWatcher.pollTimer = setTimeout(() => pollShiptoFixesRunStatusOnce(company), RUN_POLL_MS);
+    }
+  }
+
+  function startWatchingShiptoFixes(runId, company) {
+    stopWatchingShiptoFixes();
+    shiptoFixesWatcher = { startedAt: Date.now(), runId, pollTimer: null, tickTimer: null };
+    shiptoFixesStatusEl.classList.remove("hidden", "is-success", "is-error", "is-stopped");
+    shiptoFixesStatusTitleEl.textContent = "Apply triggered — watching for results…";
+    shiptoFixesStatusDetailEl.textContent = `You'll also get an email at ${employeeFields.email.value.trim()}.`;
+    shiptoFixesStopWatchingBtn.classList.remove("hidden");
+    shiptoFixesElapsedEl.textContent = "0:00";
+    shiptoFixesWatcher.tickTimer = setInterval(() => {
+      if (shiptoFixesWatcher) shiptoFixesElapsedEl.textContent = formatElapsed(Date.now() - shiptoFixesWatcher.startedAt);
+    }, 1000);
+    shiptoFixesWatcher.pollTimer = setTimeout(() => pollShiptoFixesRunStatusOnce(company), RUN_POLL_MS);
+  }
+
+  shiptoFixesStopWatchingBtn.addEventListener("click", () => stopWatchingShiptoFixes());
+
+  shiptoFixesApplyBtn.addEventListener("click", async () => {
+    const company = missingShiptoCompanySelect.value;
+    if (!company) {
+      setMissingShiptoStatus("Select a company above first.", true);
+      return;
+    }
+    if (!refreshGate()) {
+      setMissingShiptoStatus("Fill in your details above first.", true);
+      return;
+    }
+    if (!confirm(`Apply every queued Ship-to Code fix for ${company}? This writes directly to Business Central. You'll get an email at ${employeeFields.email.value.trim()} with the result.`)) {
+      return;
+    }
+    shiptoFixesApplyBtn.disabled = true;
+    setBtnLoading("shipto-fixes-apply-spinner", "shipto-fixes-apply-btn-label", true, "Applying…");
+    setMissingShiptoStatus("Triggering Apply Ship-To Fixes…");
+    try {
+      const res = await fetch("/api/apply-shipto-fixes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company, ...getEmployeeDetails() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Apply trigger failed");
+      setMissingShiptoStatus(`Apply triggered for ${company}.`);
+      if (data.run_id) {
+        startWatchingShiptoFixes(data.run_id, company);
+      } else {
+        setMissingShiptoStatus(`Apply triggered for ${company} — check back shortly.`);
+      }
+    } catch (e) {
+      setMissingShiptoStatus("Error: " + e.message, true);
+    } finally {
+      setBtnLoading("shipto-fixes-apply-spinner", "shipto-fixes-apply-btn-label", false);
+      shiptoFixesApplyBtn.disabled = false;
+    }
+  });
   bqCustomerInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchDocumentAi(); });
   // bq-po-ref-input is a textarea now (multiple PO refs, one-per-line or comma-separated)
   // — plain Enter has to stay a newline; Ctrl/Cmd+Enter triggers the search instead.

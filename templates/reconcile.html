@@ -355,9 +355,31 @@
             SO-import pipeline created (<code>submittedBy = "SBIC AI Uploading"</code>) that have no
             <strong>Ship-to Code</strong> saved — these will block or misroute delivery and need a Ship-to address
             added directly in BC.
+            <ul class="hint-list">
+              <li>Picking a candidate under <strong>Link Ship-To…</strong> only <strong>queues</strong> the fix — it
+                never writes to BC directly. Click <strong>Apply Ship-To Fixes</strong> below to actually patch every
+                queued order, the same trigger → worker-pool → batch-update-BC pipeline Reprocess Buffer uses.</li>
+            </ul>
           </div>
           <p class="status-line" id="missing-shipto-status-line"></p>
           <div class="order-list" id="missing-shipto-results-list"></div>
+          <div class="bq-insert-action hidden" id="shipto-fixes-action">
+            <span class="status-line" id="shipto-fixes-queued-count"></span>
+            <button class="btn-reprocess" id="shipto-fixes-apply-btn" type="button">
+              <span class="btn-spinner hidden" id="shipto-fixes-apply-spinner"></span>
+              <span id="shipto-fixes-apply-btn-label">Apply Ship-To Fixes</span>
+            </button>
+          </div>
+          <!-- Live status for an in-flight Apply Ship-To Fixes run -->
+          <div class="reprocess-status hidden" id="shipto-fixes-status" role="status" aria-live="polite">
+            <span class="live-dot" aria-hidden="true"></span>
+            <div class="reprocess-status-text">
+              <strong id="shipto-fixes-status-title">Apply triggered — watching for results…</strong>
+              <span id="shipto-fixes-status-detail"></span>
+            </div>
+            <span class="reprocess-elapsed" id="shipto-fixes-elapsed">0:00</span>
+            <button class="btn-stop-watching" id="shipto-fixes-stop-watching-btn" type="button">Stop watching</button>
+          </div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->

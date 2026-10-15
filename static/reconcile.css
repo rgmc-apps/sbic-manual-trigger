@@ -596,7 +596,10 @@
 }
 .candidate-item:hover { border-color: var(--brand); background: #f8faff; }
 .candidate-item:active { transform: scale(.98); }
+.candidate-item-override { border-color: var(--success-border); background: var(--success-bg); }
+.candidate-item-override:hover { border-color: var(--success-border); background: var(--success-bg); filter: brightness(0.97); }
 .candidate-main { min-width: 0; }
+.candidate-source { font-size: .7rem; font-weight: 700; color: var(--success-text); margin-bottom: 2px; }
 .candidate-code { font-weight: 700; }
 .candidate-name { color: var(--text-muted); font-size: .78rem; }
 .candidate-score {
