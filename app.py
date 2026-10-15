@@ -993,6 +993,56 @@ def api_sales_orders_missing_shipto():
         return jsonify({"error": str(exc)}), 502
 
 
+@app.route("/api/sales-orders/update-shipto", methods=["POST"])
+def api_update_sales_order_shipto():
+    """Link one already-created BC Sales Order (missing its Ship-to Code) to an
+    existing BC ship-to address — PATCHes just that one order's header. Re-queries
+    Business Central fresh server-side via _find_orders_missing_shipto rather than
+    trusting the client-supplied order_id for anything but WHICH result to act on, so
+    the submittedBy/status/shipToCode-blank safety filter stays authoritative — an
+    order_id that didn't come back from that fresh query (already fixed by someone
+    else, or no longer Open) is rejected rather than silently PATCHed.
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip()
+    order_id = (data.get("order_id") or "").strip()
+    ship_to_code = (data.get("ship_to_code") or "").strip()
+
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    if not order_id:
+        return jsonify({"error": "order_id is required"}), 400
+    if not ship_to_code:
+        return jsonify({"error": "ship_to_code is required"}), 400
+
+    try:
+        orders = _find_orders_missing_shipto(company)
+    except (requests.RequestException, RuntimeError) as exc:
+        return jsonify({"error": f"Could not search Business Central: {exc}"}), 502
+
+    order = next((o for o in orders if o.get("id") == order_id), None)
+    if not order:
+        return jsonify({
+            "error": "This order no longer matches (it may already have a Ship-to Code, a "
+                     "different status, or have changed since the lookup ran) — refresh and try again."
+        }), 409
+
+    try:
+        resp = _bc_api(
+            "PATCH", f"/bc/custom/v2/sales-orders/{order_id}",
+            params={"company": company}, json={"shipToCode": ship_to_code},
+        )
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+    if status_code not in (200, 201):
+        detail = body.get("detail") or body.get("error") or f"BC returned {status_code}"
+        return jsonify({"error": str(detail)[:300]}), 502
+
+    return jsonify({"ok": True, "number": order.get("number"), "shipToCode": ship_to_code})
+
+
 @app.route("/api/sales-orders")
 def api_sales_orders():
     """Look up existing BC Sales Orders by customer number — used by the Overrides

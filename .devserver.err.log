@@ -1,0 +1,9 @@
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8099
+ * Running on http://192.168.90.128:8099
+Press CTRL+C to quit
+127.0.0.1 - - [15/Oct/2026 15:00:36] "GET /reconcile HTTP/1.1" 200 -
+127.0.0.1 - - [15/Oct/2026 15:00:51] "GET /api/suggest/shipto/PO407026100205196?company=SBIC HTTP/1.1" 200 -
+127.0.0.1 - - [15/Oct/2026 15:01:12] "POST /api/sales-orders/update-shipto HTTP/1.1" 409 -
+127.0.0.1 - - [15/Oct/2026 15:01:21] "GET /reconcile HTTP/1.1" 200 -

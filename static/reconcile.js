@@ -2695,7 +2695,138 @@
     missingShiptoStatusLine.classList.toggle("error", !!isError);
   }
 
-  function renderMissingShiptoResults(orders) {
+  // One Missing-Ship-To row, with an inline "Link Ship-To…" panel — mirrors
+  // buildSplitSubRow's toggle/suggest/search-fallback shape. Suggestions come from
+  // rgmc-gcp-api's /customerpoul/{po_ref}/shipto-match, which fuzzy-matches this PO's
+  // BigQuery/CustomerPOUL-sourced customerBranchName (and an exact customerBranchLookUpCode
+  // match, if any) against BC's live Ship-to Addresses for the order's company — the
+  // same mechanism the Buffer tab's branch-suggestion already uses (fetchSuggestionCandidates),
+  // just driven by an already-created order's externalDocumentNo instead of a buffered PO.
+  function buildMissingShiptoRow(order, company) {
+    const row = document.createElement("div");
+    row.className = "order-row";
+    const poRef = order.externalDocumentNo || "";
+    row.innerHTML = `
+      <div class="order-row-head">
+        <span class="order-ref">${escapeHtml(order.number || "—")}</span>
+        <span class="order-badge failed">No Ship-To</span>
+        <button class="btn-link-toggle btn-missing-shipto-toggle" type="button">Link Ship-To…</button>
+      </div>
+      <div class="order-detail">
+        Customer: ${escapeHtml(order.sellToCustomerName || order.sellToCustomerNo || "—")}
+        (${escapeHtml(order.sellToCustomerNo || "—")}) &middot;
+        PO ref: ${escapeHtml(poRef || "—")} &middot;
+        Order date: ${escapeHtml(order.orderDate || "—")}
+      </div>
+      <div class="group-resolved hidden">
+        Linked to ship-to <strong class="resolved-text"></strong>
+      </div>
+      <div class="shipto-link-panel hidden">
+        <div class="search-hint shipto-branch-context"></div>
+        <div class="shipto-suggestions search-results"></div>
+        <div class="search-row"><input type="text" class="search-input" placeholder="Or search existing BC ship-to addresses…" /></div>
+        <div class="search-results shipto-manual-results"></div>
+      </div>
+    `;
+
+    const toggleBtn = row.querySelector(".btn-missing-shipto-toggle");
+    const badge = row.querySelector(".order-badge");
+    const panel = row.querySelector(".shipto-link-panel");
+    const resolvedBox = row.querySelector(".group-resolved");
+    const branchContext = row.querySelector(".shipto-branch-context");
+    const suggestionsEl = row.querySelector(".shipto-suggestions");
+    const searchInput = row.querySelector(".search-input");
+    const manualResultsEl = row.querySelector(".shipto-manual-results");
+
+    async function applyShipTo(candidate) {
+      if (!refreshGate()) {
+        setMissingShiptoStatus("Fill in your details above first.", true);
+        return;
+      }
+      toggleBtn.disabled = true;
+      try {
+        const res = await fetch("/api/sales-orders/update-shipto", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ company, order_id: order.id, ship_to_code: candidate.code }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.detail || "Link failed");
+        resolvedBox.querySelector(".resolved-text").textContent =
+          `${candidate.code}${candidate.name ? " — " + candidate.name : ""}`;
+        resolvedBox.classList.remove("hidden");
+        panel.classList.add("hidden");
+        toggleBtn.textContent = "Change…";
+        badge.textContent = "Linked";
+        badge.classList.remove("failed");
+        badge.classList.add("ready");
+        setMissingShiptoStatus(`Linked ${order.number} to ship-to ${candidate.code}.`);
+      } catch (e) {
+        setMissingShiptoStatus(`Could not link ${order.number}: ${e.message}`, true);
+      } finally {
+        toggleBtn.disabled = false;
+      }
+    }
+
+    async function loadSuggestions() {
+      if (!poRef) {
+        suggestionsEl.innerHTML = `<div class="search-hint">No PO ref on this order — use the search box below.</div>`;
+        return;
+      }
+      suggestionsEl.innerHTML =
+        `<div class="search-hint search-loading"><span class="btn-spinner"></span> ` +
+        `Looking up this PO's branch in BigQuery/CustomerPOUL and fuzzy-matching it against BC ship-to addresses…</div>`;
+      try {
+        const res = await fetch(`/api/suggest/shipto/${encodeURIComponent(poRef)}?company=${encodeURIComponent(company)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.detail || "Lookup failed");
+        branchContext.textContent = data.customerBranchName
+          ? `PO's branch on file: "${data.customerBranchName}"${data.customerBranchLookUpCode ? ` (lookup code: ${data.customerBranchLookUpCode})` : ""}`
+          : "No customer branch name found for this PO in BigQuery/CustomerPOUL — use the search box below.";
+        const raw = [];
+        if (data.exactCodeMatch) raw.push(data.exactCodeMatch);
+        (data.fuzzyMatches || []).forEach((m) => {
+          if (!data.exactCodeMatch || m.code !== data.exactCodeMatch.code) raw.push(m);
+        });
+        renderCandidateList(suggestionsEl, "branch", normalizeCandidates("branch", raw), applyShipTo);
+      } catch (e) {
+        suggestionsEl.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    toggleBtn.addEventListener("click", () => {
+      const opening = panel.classList.toggle("hidden") === false;
+      if (opening && !panel.dataset.loaded) {
+        panel.dataset.loaded = "1";
+        loadSuggestions();
+      }
+    });
+
+    let searchTimer = null;
+    searchInput.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      const term = searchInput.value.trim();
+      if (term.length < 2) { manualResultsEl.innerHTML = ""; return; }
+      searchTimer = setTimeout(async () => {
+        manualResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
+        try {
+          const url = `/api/lookup/ship-to?search=${encodeURIComponent(term)}&company=${encodeURIComponent(company)}`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || data.error || "Search failed");
+          if (searchInput.value.trim() !== term) return; // stale response guard
+          renderCandidateList(manualResultsEl, "branch", normalizeCandidates("branch", data.data), applyShipTo);
+        } catch (e) {
+          if (searchInput.value.trim() !== term) return;
+          manualResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+        }
+      }, 350);
+    });
+
+    return row;
+  }
+
+  function renderMissingShiptoResults(orders, company) {
     missingShiptoResultsList.innerHTML = "";
     if (!orders.length) {
       const empty = document.createElement("div");
@@ -2704,20 +2835,7 @@
       missingShiptoResultsList.appendChild(empty);
       return;
     }
-    missingShiptoResultsList.innerHTML = orders.map((o) => `
-      <div class="order-row">
-        <div class="order-row-head">
-          <span class="order-ref">${escapeHtml(o.number || "—")}</span>
-          <span class="order-badge failed">No Ship-To</span>
-        </div>
-        <div class="order-detail">
-          Customer: ${escapeHtml(o.sellToCustomerName || o.sellToCustomerNo || "—")}
-          (${escapeHtml(o.sellToCustomerNo || "—")}) &middot;
-          PO ref: ${escapeHtml(o.externalDocumentNo || "—")} &middot;
-          Order date: ${escapeHtml(o.orderDate || "—")}
-        </div>
-      </div>
-    `).join("");
+    orders.forEach((o) => missingShiptoResultsList.appendChild(buildMissingShiptoRow(o, company)));
   }
 
   async function searchMissingShipto() {
@@ -2734,7 +2852,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
       const orders = data.data || [];
-      renderMissingShiptoResults(orders);
+      renderMissingShiptoResults(orders, company);
       setMissingShiptoStatus(`Found ${orders.length} Open Sales Order(s) in ${company} with no Ship-to Code.`);
     } catch (e) {
       setMissingShiptoStatus("Error: " + e.message, true);
