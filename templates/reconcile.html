@@ -357,12 +357,18 @@
             added directly in BC.
             <ul class="hint-list">
               <li>Picking a candidate under <strong>Link Ship-To…</strong> only <strong>queues</strong> the fix — it
-                never writes to BC directly. Click <strong>Apply Ship-To Fixes</strong> below to actually patch every
-                queued order, the same trigger → worker-pool → batch-update-BC pipeline Reprocess Buffer uses.</li>
+                never writes to BC directly. Click <strong>Apply Ship-To Fixes</strong> above the results to actually
+                patch every queued order, the same trigger → worker-pool → batch-update-BC pipeline Reprocess Buffer
+                uses.</li>
+              <li>Results are split into <strong>✅ Queued</strong> (will be patched by the next Apply) and
+                <strong>Not yet linked</strong> — a queued row also gets a highlighted left border, so it's clear at a
+                glance which orders are actually included.</li>
+              <li>An order successfully updated in BC is automatically removed from this list on the next search
+                (its Ship-to Code is no longer blank). One that was skipped or failed stays under
+                <strong>✅ Queued</strong> with the reason shown, ready to retry on the next Apply.</li>
             </ul>
           </div>
           <p class="status-line" id="missing-shipto-status-line"></p>
-          <div class="order-list" id="missing-shipto-results-list"></div>
           <div class="bq-insert-action hidden" id="shipto-fixes-action">
             <span class="status-line" id="shipto-fixes-queued-count"></span>
             <button class="btn-reprocess" id="shipto-fixes-apply-btn" type="button">
@@ -380,6 +386,7 @@
             <span class="reprocess-elapsed" id="shipto-fixes-elapsed">0:00</span>
             <button class="btn-stop-watching" id="shipto-fixes-stop-watching-btn" type="button">Stop watching</button>
           </div>
+          <div class="order-list" id="missing-shipto-results-list"></div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->

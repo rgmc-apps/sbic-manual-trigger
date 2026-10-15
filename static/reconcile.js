@@ -2712,7 +2712,7 @@
   // match, if any) against BC's live Ship-to Addresses for the order's company — the
   // same mechanism the Buffer tab's branch-suggestion already uses (fetchSuggestionCandidates),
   // just driven by an already-created order's externalDocumentNo instead of a buffered PO.
-  function buildMissingShiptoRow(order, company, pendingFix) {
+  function buildMissingShiptoRow(order, company, pendingFix, placeRow) {
     const row = document.createElement("div");
     row.className = "order-row";
     const poRef = order.externalDocumentNo || "";
@@ -2728,9 +2728,13 @@
         PO ref: ${escapeHtml(poRef || "—")} &middot;
         Order date: ${escapeHtml(order.orderDate || "—")}
       </div>
+      <div class="search-hint search-loading shipto-queuing-status hidden">
+        <span class="btn-spinner"></span> <span class="queuing-text"></span>
+      </div>
       <div class="group-resolved hidden">
         Queued ship-to <strong class="resolved-text"></strong>
         <button class="btn-unlink" type="button">Cancel</button>
+        <div class="shipto-fix-error hidden"></div>
       </div>
       <div class="shipto-link-panel hidden">
         <div class="search-hint shipto-branch-context"></div>
@@ -2743,31 +2747,74 @@
     const toggleBtn = row.querySelector(".btn-missing-shipto-toggle");
     const badge = row.querySelector(".order-badge");
     const panel = row.querySelector(".shipto-link-panel");
+    const queuingStatus = row.querySelector(".shipto-queuing-status");
+    const queuingText = row.querySelector(".queuing-text");
     const resolvedBox = row.querySelector(".group-resolved");
     const unlinkBtn = row.querySelector(".btn-unlink");
+    const fixErrorEl = row.querySelector(".shipto-fix-error");
     const branchContext = row.querySelector(".shipto-branch-context");
     const suggestionsEl = row.querySelector(".shipto-suggestions");
     const searchInput = row.querySelector(".search-input");
     const manualResultsEl = row.querySelector(".shipto-manual-results");
     let currentFixId = pendingFix ? pendingFix.id : null;
+    let lastQueued = pendingFix || null; // last confirmed {ship_to_code, ship_to_name} — used to revert the UI if a cancel fails mid-flight
+
+    // In-flight state between "pick a candidate"/"Cancel" and the server actually
+    // confirming it — without this, the row jumped straight from the candidate list to
+    // "Queued" with nothing shown during the network round trip, making the click feel
+    // unresponsive. badge text doubles as the row's own status label throughout.
+    // row.classList "is-queued"/"is-loading" give the row itself a visible accent (see
+    // reconcile.css) so it's obvious at a glance — without reading any text — which
+    // rows are actually included in the next Apply Ship-To Fixes run, independent of
+    // the Queued/Not-queued section headers renderMissingShiptoResults groups them into.
+    function showQueuing(text) {
+      panel.classList.add("hidden");
+      resolvedBox.classList.add("hidden");
+      queuingText.textContent = text;
+      queuingStatus.classList.remove("hidden");
+      badge.textContent = "Queuing…";
+      badge.classList.remove("failed", "pending");
+      badge.classList.add("loading");
+      row.classList.remove("is-queued");
+      row.classList.add("is-loading");
+    }
 
     function showQueued(codeAndName) {
+      lastQueued = codeAndName;
+      queuingStatus.classList.add("hidden");
       resolvedBox.querySelector(".resolved-text").textContent =
         `${codeAndName.ship_to_code}${codeAndName.ship_to_name ? " — " + codeAndName.ship_to_name : ""}`;
+      // A fix left queued (applied still false) after a failed/skipped Apply attempt
+      // carries the reason on .error — shown here so it doesn't look identical to a
+      // freshly-queued, never-attempted fix (both would otherwise just say "Queued").
+      if (codeAndName.error) {
+        fixErrorEl.textContent = `⚠ Last Apply attempt: ${codeAndName.error}`;
+        fixErrorEl.classList.remove("hidden");
+      } else {
+        fixErrorEl.classList.add("hidden");
+      }
       resolvedBox.classList.remove("hidden");
       panel.classList.add("hidden");
       toggleBtn.textContent = "Change…";
-      badge.textContent = "Queued";
-      badge.classList.remove("failed");
+      badge.textContent = codeAndName.error ? "Queued (retry)" : "Queued";
+      badge.classList.remove("failed", "loading");
       badge.classList.add("pending");
+      row.classList.remove("is-loading");
+      row.classList.add("is-queued");
+      if (placeRow) placeRow(row, true); // moves the row into the "Queued" section, if not already there
     }
 
     function showUnqueued() {
+      lastQueued = null;
+      queuingStatus.classList.add("hidden");
       resolvedBox.classList.add("hidden");
+      fixErrorEl.classList.add("hidden");
       toggleBtn.textContent = "Link Ship-To…";
       badge.textContent = "No Ship-To";
-      badge.classList.remove("pending");
+      badge.classList.remove("pending", "loading");
       badge.classList.add("failed");
+      row.classList.remove("is-queued", "is-loading");
+      if (placeRow) placeRow(row, false); // moves the row into the "Not yet linked" section
     }
 
     if (pendingFix) showQueued(pendingFix);
@@ -2783,6 +2830,7 @@
         return;
       }
       toggleBtn.disabled = true;
+      showQueuing(`Queuing ship-to ${candidate.code}…`);
       try {
         const res = await fetch("/api/sales-orders/shipto-fixes", {
           method: "POST",
@@ -2800,6 +2848,10 @@
         setMissingShiptoStatus(`Queued ${order.number} for ship-to ${candidate.code} — click Apply Ship-To Fixes below to write it to BC.`);
         refreshShiptoFixesQueueCount(company);
       } catch (e) {
+        queuingStatus.classList.add("hidden");
+        // Revert to whatever was true before this attempt — already-queued (Change…
+        // failed, the old fix is still the current one) or never-queued.
+        if (lastQueued) { showQueued(lastQueued); } else { showUnqueued(); panel.classList.remove("hidden"); }
         setMissingShiptoStatus(`Could not queue a fix for ${order.number}: ${e.message}`, true);
       } finally {
         toggleBtn.disabled = false;
@@ -2809,13 +2861,17 @@
     unlinkBtn.addEventListener("click", async () => {
       if (!currentFixId) return;
       unlinkBtn.disabled = true;
+      const wasQueued = lastQueued;
+      showQueuing("Cancelling queued fix…");
       try {
-        await fetch(`/api/sales-orders/shipto-fixes/${encodeURIComponent(currentFixId)}`, { method: "DELETE" });
+        const res = await fetch(`/api/sales-orders/shipto-fixes/${encodeURIComponent(currentFixId)}`, { method: "DELETE" });
+        if (!res.ok && res.status !== 404) throw new Error(`Cancel failed (${res.status})`);
         currentFixId = null;
         showUnqueued();
         setMissingShiptoStatus(`Cancelled the queued fix for ${order.number}.`);
         refreshShiptoFixesQueueCount(company);
       } catch (e) {
+        showQueued(wasQueued);
         setMissingShiptoStatus(`Could not cancel: ${e.message}`, true);
       } finally {
         unlinkBtn.disabled = false;
@@ -2910,6 +2966,55 @@
     } catch (e) { /* best-effort */ }
   }
 
+  // Queued rows are split into their own headed section, ahead of the not-yet-linked
+  // ones — reuses the BigQuery Lookup tab's .bq-group-heading/.bq-group-count styling.
+  // This is the "what's actually included if I click Apply Ship-To Fixes right now"
+  // view; the per-row .is-queued/.is-loading accent (see buildMissingShiptoRow) then
+  // reinforces the same distinction at a glance even if the sections scroll apart.
+  //
+  // Both group headings/bodies are always present in the DOM (hidden via class when
+  // empty) rather than rebuilt per search, so a single row settling into Queued/
+  // Not-queued (via the placeRow callback passed into buildMissingShiptoRow) can just
+  // move its own existing DOM node into the other body — every OTHER row's open
+  // panel/in-flight state survives untouched, instead of the whole list re-rendering
+  // from scratch on every pick/cancel.
+  function renderMissingShiptoGroups(orders, pendingByOrderId) {
+    missingShiptoResultsList.innerHTML = `
+      <div class="bq-group-heading hidden" data-group="queued">
+        <span>✅ Queued — included in the next Apply Ship-To Fixes</span><span class="bq-group-count"></span>
+      </div>
+      <div class="shipto-group-body" data-group-body="queued"></div>
+      <div class="bq-group-heading hidden" data-group="not-queued">
+        <span>Not yet linked — won't be touched by Apply</span><span class="bq-group-count"></span>
+      </div>
+      <div class="shipto-group-body" data-group-body="not-queued"></div>
+    `;
+    const queuedHeading = missingShiptoResultsList.querySelector('[data-group="queued"]');
+    const notQueuedHeading = missingShiptoResultsList.querySelector('[data-group="not-queued"]');
+    const queuedBody = missingShiptoResultsList.querySelector('[data-group-body="queued"]');
+    const notQueuedBody = missingShiptoResultsList.querySelector('[data-group-body="not-queued"]');
+
+    function updateGroupHeadings() {
+      const qn = queuedBody.children.length;
+      const nn = notQueuedBody.children.length;
+      queuedHeading.classList.toggle("hidden", qn === 0);
+      queuedHeading.querySelector(".bq-group-count").textContent = qn;
+      notQueuedHeading.classList.toggle("hidden", nn === 0);
+      notQueuedHeading.querySelector(".bq-group-count").textContent = nn;
+    }
+
+    function placeRow(rowEl, isQueued) {
+      (isQueued ? queuedBody : notQueuedBody).appendChild(rowEl);
+      updateGroupHeadings();
+    }
+
+    orders.forEach((o) => {
+      const pendingFix = pendingByOrderId[o.id] || null;
+      const row = buildMissingShiptoRow(o, missingShiptoCompanySelect.value, pendingFix, placeRow);
+      placeRow(row, !!pendingFix);
+    });
+  }
+
   async function renderMissingShiptoResults(orders, company) {
     missingShiptoResultsList.innerHTML = "";
     if (!orders.length) {
@@ -2921,7 +3026,7 @@
       return;
     }
     const pendingByOrderId = await fetchPendingShiptoFixes(company);
-    orders.forEach((o) => missingShiptoResultsList.appendChild(buildMissingShiptoRow(o, company, pendingByOrderId[o.id] || null)));
+    renderMissingShiptoGroups(orders, pendingByOrderId);
     refreshShiptoFixesQueueCount(company);
   }
 
@@ -2979,9 +3084,9 @@
 
   function summarizeShiptoFixesRun(summary) {
     if (!summary) return "";
-    const parts = [`${summary.fixes_applied || 0} fix(es) applied`];
-    if (summary.fixes_skipped) parts.push(`${summary.fixes_skipped} skipped (no longer eligible)`);
-    if (summary.fixes_failed) parts.push(`${summary.fixes_failed} failed`);
+    const parts = [`${summary.fixes_applied || 0} fix(es) applied and removed from the list below`];
+    if (summary.fixes_skipped) parts.push(`${summary.fixes_skipped} skipped (no longer eligible) — still shown as Queued, with the reason, below`);
+    if (summary.fixes_failed) parts.push(`${summary.fixes_failed} failed — still shown as Queued for the next Apply attempt`);
     return parts.join(", ") + ".";
   }
 

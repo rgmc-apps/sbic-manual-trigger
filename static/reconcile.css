@@ -664,9 +664,31 @@
 }
 .order-badge.ready { background: var(--success-bg); color: var(--success-text); border: 1px solid var(--success-border); }
 .order-badge.pending { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); }
+.order-badge.loading {
+  background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border);
+  animation: badge-pulse 1.1s ease-in-out infinite;
+}
+@keyframes badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
 .order-detail { margin-top: 8px; font-size: .8125rem; color: var(--text-muted); }
 .order-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
 .shipto-link-panel { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.shipto-queuing-status { margin-top: 10px; }
+.shipto-fix-error { margin-top: 6px; font-size: .76rem; color: var(--error-text); }
+
+/* Row-level accent so it's obvious at a glance — without reading any badge text —
+   which Missing Ship-To rows are actually included in the next Apply Ship-To Fixes
+   run, on top of the Queued/Not-queued section headers (see renderMissingShiptoResults
+   / bq-group-heading reuse). Compensates its own left padding so the border-left
+   doesn't visually shift the row's content relative to an unaccented row. */
+.order-row.is-queued, .order-row.is-loading {
+  border-left: 4px solid var(--warn-text);
+  background: var(--warn-bg);
+  padding-left: 12px;
+}
+.order-row.is-loading { opacity: .85; }
+.order-list > .bq-group-heading:first-child { margin-top: 0; }
+.shipto-group-body { display: flex; flex-direction: column; gap: 10px; }
+.shipto-group-body:empty { display: none; }
 .shipto-branch-context { margin-bottom: 6px; }
 .recovered-badge {
   display: inline-block;
