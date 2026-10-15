@@ -660,21 +660,28 @@ def _enrich_customer_names(candidates: list, company: str) -> None:
             c["customerName"] = name_by_no[no]
 
 
-def _branch_override_shipto(branch_name: str) -> dict | None:
-    """The already-saved "branch" override's ship-to for this exact customerBranchName,
-    if one exists — a human already vetted this exact branch via the Buffer tab, so it
-    should outrank a fresh fuzzy guess, not just sit alongside it unused."""
-    if not branch_name:
-        return None
+def _fetch_overrides_by_type(override_type: str) -> list:
+    """Every current override of one type, as raw {id, type, key, resolved, ...} dicts
+    — fetched once and reused in-memory by a caller that needs to match MANY POs
+    against the same override set (e.g. api_apply_known_overrides), instead of each one
+    doing its own round trip to rgmc-bc-api."""
     try:
-        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides", params={"type": "branch"})
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides", params={"type": override_type})
         body, status_code = _proxy_json(resp)
     except requests.RequestException:
-        return None
-    if status_code != 200:
+        return []
+    return (body.get("data") or []) if status_code == 200 else []
+
+
+def _match_branch_override(branch_overrides: list, branch_name: str) -> dict | None:
+    """The already-saved "branch" override's ship-to for this exact customerBranchName,
+    if one exists in `branch_overrides` (see _fetch_overrides_by_type) — a human already
+    vetted this exact branch via the Buffer tab, so it should outrank a fresh fuzzy
+    guess, not just sit alongside it unused."""
+    if not branch_name:
         return None
     target = branch_name.strip().upper()
-    for ov in body.get("data") or []:
+    for ov in branch_overrides:
         if (ov.get("key") or "").strip().upper() != target:
             continue
         resolved = ov.get("resolved") or {}
@@ -687,23 +694,16 @@ def _branch_override_shipto(branch_name: str) -> dict | None:
     return None
 
 
-def _customer_override_shipto(customer_name: str, branch_name: str, po_ref: str) -> dict | None:
+def _match_customer_override(customer_overrides_by_key: dict, customer_name: str, branch_name: str, po_ref: str) -> dict | None:
     """The already-saved "customer" override's ship-to reference for this PO, if one
-    exists — checked PO-scoped > branch-scoped > flat, the exact precedence
-    rgmc-worker-pool's _create_order uses (see so_buffer_service._customer_key_parts).
+    exists in `customer_overrides_by_key` (key upper -> raw override doc, see
+    _fetch_overrides_by_type) — checked PO-scoped > branch-scoped > flat, the exact
+    precedence rgmc-worker-pool's _create_order uses (so_buffer_service._customer_key_parts).
     A "customer" override only carries shipToCode as reference metadata (the ship-to its
     customer link was captured from, not a guaranteed match for THIS PO's own branch),
     so it's checked only when no branch override matched."""
     if not customer_name:
         return None
-    try:
-        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/overrides", params={"type": "customer"})
-        body, status_code = _proxy_json(resp)
-    except requests.RequestException:
-        return None
-    if status_code != 200:
-        return None
-    by_key = {(ov.get("key") or "").strip().upper(): ov for ov in body.get("data") or []}
     name_u = customer_name.strip().upper()
     candidate_keys = []
     if po_ref:
@@ -712,7 +712,7 @@ def _customer_override_shipto(customer_name: str, branch_name: str, po_ref: str)
         candidate_keys.append(f"{name_u}::{branch_name.strip().upper()}")
     candidate_keys.append(name_u)
     for key in candidate_keys:
-        ov = by_key.get(key)
+        ov = customer_overrides_by_key.get(key)
         if not ov:
             continue
         resolved = ov.get("resolved") or {}
@@ -729,14 +729,17 @@ def _find_shipto_override(po_ref: str, branch_name: str) -> dict | None:
     """An already-saved override that resolves this PO's ship-to, if any — surfaced
     ahead of fresh fuzzy matching so a human's already-vetted decision (made via the
     Buffer tab, or the Customers tab's Split action) is reused instead of asking them to
-    re-decide the same branch/customer from scratch. See _branch_override_shipto /
-    _customer_override_shipto for the precedence between the two override types."""
-    branch_hit = _branch_override_shipto(branch_name)
+    re-decide the same branch/customer from scratch. Fetches each override type fresh —
+    fine for this single-PO call site (api_suggest_shipto); a bulk caller fetches once
+    via _fetch_overrides_by_type and calls _match_branch_override/_match_customer_override
+    directly instead (see api_apply_known_overrides)."""
+    branch_hit = _match_branch_override(_fetch_overrides_by_type("branch"), branch_name)
     if branch_hit:
         return branch_hit
     header, _ = _fetch_from_customerpoul(po_ref)
     customer_name = (header or {}).get("customer_name")
-    return _customer_override_shipto(customer_name, branch_name, po_ref)
+    customer_overrides_by_key = {(ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("customer")}
+    return _match_customer_override(customer_overrides_by_key, customer_name, branch_name, po_ref)
 
 
 @app.route("/api/suggest/shipto/<po_ref>")
@@ -1166,6 +1169,26 @@ def api_cancel_shipto_fix(fix_id):
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/sales-orders/shipto-fix-history")
+def api_shipto_fix_history():
+    """Search the append-only Ship-to Code fix attempt history — every Apply Ship-To
+    Fixes attempt (applied/skipped/failed), by PO ref or order number, so a human can
+    find what was actually applied to a PO and when, to track down and correct a wrong
+    link after the fact. All filters optional; omit everything to list the most recent
+    attempts across every company."""
+    params = {}
+    for key in ("po_ref", "order_no", "company", "outcome"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/shipto-fix-history", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/apply-shipto-fixes", methods=["POST"])
 def api_apply_shipto_fixes():
     """Trigger the same async pipeline as Reprocess Buffer (rgmc-gcp-api -> Pub/Sub ->
@@ -1191,6 +1214,114 @@ def api_apply_shipto_fixes():
         return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
+def _fetch_customerpoul_branch_info(po_ref: str) -> tuple:
+    """(customerName, customerBranchName) from CustomerPOUL's latest row for this PO
+    ref, or (None, None) if not found / the lookup failed — header only, no detail
+    lines, since api_apply_known_overrides calls this once per candidate order and
+    doesn't need the lines."""
+    try:
+        resp = _gcp_api("GET", f"/customerpoul/{po_ref}")
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException:
+        return None, None
+    rows = body.get("data") or []
+    if status_code != 200 or not rows:
+        return None, None
+    row = rows[0]
+    return row.get("customerName"), row.get("customerBranchName")
+
+
+@app.route("/api/sales-orders/apply-known-overrides", methods=["POST"])
+def api_apply_known_overrides():
+    """Bulk-queue a Ship-to Code fix for every Missing-Ship-To order (company-wide —
+    not just whatever page of results the browser currently has rendered) that already
+    has a saved branch/customer override covering its branch: an already-vetted human
+    decision, reused here the same way rgmc-worker-pool already reuses it during a
+    normal reprocess — just applied to orders already sitting in BC instead of the
+    Firestore buffer. Orders with no matching override are left completely untouched,
+    for manual review via each row's own Link Ship-To….
+
+    Only QUEUES — never writes to BC directly. Apply Ship-To Fixes is still the one
+    real write, same as a manually-picked candidate; this just saves the trouble of
+    clicking Link Ship-To… one-by-one for every order whose answer is already known.
+
+    Branch/customer overrides are each fetched ONCE (not per-order) and every
+    candidate's CustomerPOUL branch lookup runs concurrently — see
+    _fetch_overrides_by_type/_fetch_customerpoul_branch_info — since this can cover
+    hundreds of orders in one call.
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip()
+    resolved_by = (data.get("resolved_by") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+
+    try:
+        orders = _find_orders_missing_shipto(company)
+    except (requests.RequestException, RuntimeError) as exc:
+        return jsonify({"error": f"Could not search Business Central: {exc}"}), 502
+
+    if not orders:
+        return jsonify({"data": [], "total": 0, "queued": 0, "already_queued": 0, "no_override_match": 0})
+
+    try:
+        existing_resp = _bc_api("GET", "/bc/custom/v2/so-buffer/shipto-fixes", params={"company": company, "applied": "false"})
+        existing_body, existing_status = _proxy_json(existing_resp)
+        already_queued_ids = {f.get("order_id") for f in (existing_body.get("data") or [])} if existing_status == 200 else set()
+    except requests.RequestException:
+        already_queued_ids = set()
+
+    branch_overrides = _fetch_overrides_by_type("branch")
+    customer_overrides_by_key = {(ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("customer")}
+    candidates = [o for o in orders if o.get("id") not in already_queued_ids]
+
+    def _resolve_one(order):
+        po_ref = order.get("externalDocumentNo") or ""
+        customer_name, branch_name = _fetch_customerpoul_branch_info(po_ref) if po_ref else (None, None)
+        match = _match_branch_override(branch_overrides, branch_name)
+        if not match:
+            match = _match_customer_override(customer_overrides_by_key, customer_name, branch_name, po_ref)
+        return order, match
+
+    results = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(20, len(candidates))) as ex:
+            resolved_pairs = list(ex.map(_resolve_one, candidates))
+        for order, match in resolved_pairs:
+            if not match:
+                continue
+            try:
+                queue_resp = _bc_api("POST", "/bc/custom/v2/so-buffer/shipto-fixes", json={
+                    "company": company,
+                    "order_id": order.get("id"),
+                    "order_no": order.get("number") or "",
+                    "po_ref": order.get("externalDocumentNo") or "",
+                    "ship_to_code": match["code"],
+                    "ship_to_name": match.get("name") or "",
+                    "resolved_by": resolved_by or "Apply Known Overrides",
+                    "source": match.get("source") or "saved override",
+                })
+                qbody, qstatus = _proxy_json(queue_resp)
+                if qstatus in (200, 201):
+                    results.append({"number": order.get("number"), "ship_to_code": match["code"], "ok": True})
+                else:
+                    results.append({
+                        "number": order.get("number"), "ok": False,
+                        "detail": str(qbody.get("detail") or qbody.get("error") or f"BC returned {qstatus}")[:300],
+                    })
+            except requests.RequestException as exc:
+                results.append({"number": order.get("number"), "ok": False, "detail": f"Request failed: {exc}"})
+
+    queued = sum(1 for r in results if r["ok"])
+    return jsonify({
+        "data": results,
+        "total": len(orders),
+        "already_queued": len(already_queued_ids),
+        "queued": queued,
+        "no_override_match": len(candidates) - len(results),
+    })
 
 
 @app.route("/api/sales-orders")

@@ -349,6 +349,11 @@
               <span class="btn-spinner hidden" id="missing-shipto-search-spinner"></span>
               <span id="missing-shipto-search-btn-label">Search</span>
             </button>
+            <button class="btn-reprocess btn-apply-known-overrides" id="apply-known-overrides-btn" type="button">
+              <span class="btn-spinner hidden" id="apply-known-overrides-spinner"></span>
+              <span id="apply-known-overrides-btn-label">⚡ Apply Known Overrides</span>
+            </button>
+            <button class="btn-link-toggle" id="shipto-history-toggle-btn" type="button">🕘 Link History</button>
           </div>
           <div class="details-hint sync-hint">
             Queries Business Central directly (not the buffer) for <strong>Open</strong> Sales Orders this app's own
@@ -360,6 +365,11 @@
                 never writes to BC directly. Click <strong>Apply Ship-To Fixes</strong> above the results to actually
                 patch every queued order, the same trigger → worker-pool → batch-update-BC pipeline Reprocess Buffer
                 uses.</li>
+              <li><strong>⚡ Apply Known Overrides</strong> auto-queues every result whose branch/customer already has
+                a saved override (from the Buffer tab or Customers tab's Split action) — same already-vetted links
+                rgmc-worker-pool itself reuses, just applied to orders already sitting in BC. It only queues, never
+                writes to BC — click <strong>Apply Ship-To Fixes</strong> afterward to actually patch them. Orders
+                with no matching override are left untouched for manual review.</li>
               <li>Results are split into <strong>✅ Queued</strong> (will be patched by the next Apply) and
                 <strong>Not yet linked</strong> — a queued row also gets a highlighted left border, so it's clear at a
                 glance which orders are actually included.</li>
@@ -387,6 +397,30 @@
             <button class="btn-stop-watching" id="shipto-fixes-stop-watching-btn" type="button">Stop watching</button>
           </div>
           <div class="order-list" id="missing-shipto-results-list"></div>
+
+          <!-- Ship-To Link History: lets a human search the append-only record of every
+               Apply Ship-To Fixes attempt (applied/skipped/failed) by PO ref or order
+               number, to find and correct a wrong link after the fact. -->
+          <div class="shipto-history-panel hidden" id="shipto-history-panel">
+            <h3 class="shipto-history-title">Ship-To Link History</h3>
+            <p class="details-hint">
+              Every Apply Ship-To Fixes attempt ever made, searchable by PO ref or BC order number — including ones
+              that were skipped or failed, with the reason. Use this to find what ship-to was applied to a PO and
+              correct it (via <strong>Link Ship-To…</strong> above) if it turns out to be wrong.
+            </p>
+            <div class="toolbar">
+              <div class="form-group toolbar-select">
+                <label class="form-label" for="shipto-history-search-input">PO ref or order number</label>
+                <input class="form-input" type="text" id="shipto-history-search-input" placeholder="e.g. PO407026100205196 or SBSO260125" />
+              </div>
+              <button class="btn-reprocess" id="shipto-history-search-btn" type="button">
+                <span class="btn-spinner hidden" id="shipto-history-search-spinner"></span>
+                <span id="shipto-history-search-btn-label">Search</span>
+              </button>
+            </div>
+            <p class="status-line" id="shipto-history-status-line"></p>
+            <div class="history-list" id="shipto-history-results-list"></div>
+          </div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->

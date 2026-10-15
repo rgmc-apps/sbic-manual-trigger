@@ -35,6 +35,13 @@
   const missingShiptoSearchBtn     = document.getElementById("missing-shipto-search-btn");
   const missingShiptoStatusLine    = document.getElementById("missing-shipto-status-line");
   const missingShiptoResultsList   = document.getElementById("missing-shipto-results-list");
+  const applyKnownOverridesBtn     = document.getElementById("apply-known-overrides-btn");
+  const shiptoHistoryToggleBtn     = document.getElementById("shipto-history-toggle-btn");
+  const shiptoHistoryPanel         = document.getElementById("shipto-history-panel");
+  const shiptoHistorySearchInput   = document.getElementById("shipto-history-search-input");
+  const shiptoHistorySearchBtn     = document.getElementById("shipto-history-search-btn");
+  const shiptoHistoryStatusLine    = document.getElementById("shipto-history-status-line");
+  const shiptoHistoryResultsList   = document.getElementById("shipto-history-results-list");
   const shiptoFixesAction          = document.getElementById("shipto-fixes-action");
   const shiptoFixesQueuedCount     = document.getElementById("shipto-fixes-queued-count");
   const shiptoFixesApplyBtn        = document.getElementById("shipto-fixes-apply-btn");
@@ -3055,6 +3062,130 @@
   }
 
   missingShiptoSearchBtn.addEventListener("click", searchMissingShipto);
+
+  // ── Apply Known Overrides — bulk-queues (never writes to BC) every Missing-Ship-To
+  // order whose branch/customer already has a saved override, via the server-side
+  // /api/sales-orders/apply-known-overrides (see app.py for the matching precedence).
+  // A search must have run first so there's something to report against.
+  applyKnownOverridesBtn.addEventListener("click", async () => {
+    const company = missingShiptoCompanySelect.value;
+    if (!company) {
+      setMissingShiptoStatus("Select a company above first.", true);
+      return;
+    }
+    if (!refreshGate()) {
+      setMissingShiptoStatus("Fill in your details above first.", true);
+      return;
+    }
+    if (!confirm(`Auto-queue a Ship-to Code fix for every Open Sales Order in ${company} whose branch/customer already has a saved override? This only queues — nothing is written to BC until you click Apply Ship-To Fixes.`)) {
+      return;
+    }
+    applyKnownOverridesBtn.disabled = true;
+    setBtnLoading("apply-known-overrides-spinner", "apply-known-overrides-btn-label", true, "Checking overrides…");
+    setMissingShiptoStatus(`Checking ${company}'s Missing Ship-To orders against saved overrides…`);
+    try {
+      const res = await fetch("/api/sales-orders/apply-known-overrides", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company, resolved_by: getEmployeeDetails().employee_name }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Apply Known Overrides failed");
+      const failed = (data.data || []).filter((r) => !r.ok);
+      let msg = `Queued ${data.queued} of ${data.total} order(s) from saved overrides in ${company}`;
+      if (data.already_queued) msg += ` (${data.already_queued} were already queued)`;
+      if (data.no_override_match) msg += `, ${data.no_override_match} had no matching override — link those manually`;
+      msg += ".";
+      if (failed.length) msg += ` ${failed.length} queue attempt(s) failed — see ${failed.map((f) => f.number).join(", ")}.`;
+      await searchMissingShipto(); // re-render first so newly-queued orders move into the ✅ Queued section…
+      setMissingShiptoStatus(msg, failed.length > 0 && data.queued === 0); // …then overwrite its "Found N" status with this summary
+    } catch (e) {
+      setMissingShiptoStatus("Error: " + e.message, true);
+    } finally {
+      setBtnLoading("apply-known-overrides-spinner", "apply-known-overrides-btn-label", false);
+      applyKnownOverridesBtn.disabled = false;
+    }
+  });
+
+  // ── Ship-To Link History — searchable, append-only record of every Apply Ship-To
+  // Fixes attempt (applied/skipped/failed), by PO ref or order number, so a human can
+  // find what ship-to was actually applied to a PO and correct it if it was wrong. See
+  // api_shipto_fix_history in app.py / shipto_fix_history.py (rgmc-worker-pool) for
+  // where each record comes from.
+  shiptoHistoryToggleBtn.addEventListener("click", () => {
+    shiptoHistoryPanel.classList.toggle("hidden");
+  });
+
+  function setShiptoHistoryStatus(msg, isError) {
+    shiptoHistoryStatusLine.textContent = msg || "";
+    shiptoHistoryStatusLine.classList.toggle("error", !!isError);
+  }
+
+  function renderShiptoHistory(records) {
+    shiptoHistoryResultsList.innerHTML = "";
+    if (!records.length) {
+      const empty = document.createElement("div");
+      empty.className = "tab-empty";
+      empty.textContent = "No link-history records found.";
+      shiptoHistoryResultsList.appendChild(empty);
+      return;
+    }
+    shiptoHistoryResultsList.innerHTML = records.map((r) => `
+      <div class="shipto-history-row">
+        <div class="shipto-history-row-head">
+          <span class="order-ref">${escapeHtml(r.order_no || "—")}</span>
+          <span class="shipto-history-outcome ${escapeHtml(r.outcome || "")}">${escapeHtml((r.outcome || "—").toUpperCase())}</span>
+        </div>
+        <div class="order-detail">
+          PO ref: ${escapeHtml(r.po_ref || "—")} &middot;
+          Company: ${escapeHtml(r.company || "—")} &middot;
+          Ship-to: ${escapeHtml(r.ship_to_code || "—")}${r.ship_to_name ? " — " + escapeHtml(r.ship_to_name) : ""} &middot;
+          By: ${escapeHtml(r.resolved_by || "—")} &middot;
+          ${r.attempted_at ? escapeHtml(new Date(r.attempted_at).toLocaleString()) : "—"}
+        </div>
+        ${r.detail ? `<div class="shipto-history-detail">${escapeHtml(r.detail)}</div>` : ""}
+      </div>
+    `).join("");
+  }
+
+  async function searchShiptoHistory() {
+    const term = shiptoHistorySearchInput.value.trim();
+    if (!term) {
+      setShiptoHistoryStatus("Enter a PO ref or order number first.", true);
+      return;
+    }
+    shiptoHistorySearchBtn.disabled = true;
+    setBtnLoading("shipto-history-search-spinner", "shipto-history-search-btn-label", true, "Searching…");
+    setShiptoHistoryStatus("Searching link history…");
+    try {
+      // Try as a PO ref and as an order number in parallel — a user may paste either
+      // one, and the two filters are mutually exclusive server-side (api_shipto_fix_history).
+      const [poRes, orderRes] = await Promise.all([
+        fetch(`/api/sales-orders/shipto-fix-history?po_ref=${encodeURIComponent(term)}`),
+        fetch(`/api/sales-orders/shipto-fix-history?order_no=${encodeURIComponent(term)}`),
+      ]);
+      const [poData, orderData] = await Promise.all([poRes.json(), orderRes.json()]);
+      if (!poRes.ok && !orderRes.ok) throw new Error(poData.error || orderData.error || "Search failed");
+      const seen = new Set();
+      const records = [];
+      [...(poData.data || []), ...(orderData.data || [])].forEach((r) => {
+        if (seen.has(r.id)) return;
+        seen.add(r.id);
+        records.push(r);
+      });
+      records.sort((a, b) => (b.attempted_at || "").localeCompare(a.attempted_at || ""));
+      renderShiptoHistory(records);
+      setShiptoHistoryStatus(`Found ${records.length} record(s) for "${term}".`);
+    } catch (e) {
+      setShiptoHistoryStatus("Error: " + e.message, true);
+    } finally {
+      shiptoHistorySearchBtn.disabled = false;
+      setBtnLoading("shipto-history-search-spinner", "shipto-history-search-btn-label", false);
+    }
+  }
+
+  shiptoHistorySearchBtn.addEventListener("click", searchShiptoHistory);
+  shiptoHistorySearchInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchShiptoHistory(); });
 
   // ── Apply Ship-To Fixes — same trigger -> Pub/Sub -> rgmc-worker-pool -> batch
   // BC-write pipeline as Reprocess Buffer (see /api/apply-shipto-fixes in app.py and
