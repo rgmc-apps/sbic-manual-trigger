@@ -79,6 +79,7 @@
           <button class="action-tab-btn" data-action-tab="history" type="button">History</button>
           <button class="action-tab-btn" data-action-tab="overrides" type="button">Overrides</button>
           <button class="action-tab-btn" data-action-tab="bigquery" type="button">BigQuery Lookup</button>
+          <button class="action-tab-btn" data-action-tab="missing-shipto" type="button">Missing Ship-To</button>
         </div>
 
         <div class="action-tab-panel" id="action-panel-buffer">
@@ -329,6 +330,34 @@
             </select>
           </div>
           <div class="bq-results-list" id="bq-results-list"></div>
+        </div>
+
+        <div class="action-tab-panel hidden" id="action-panel-missing-shipto">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="missing-shipto-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="missing-shipto-company-select">
+                  <option value="">— Select a company —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <button class="btn-reprocess" id="missing-shipto-search-btn" type="button">
+              <span class="btn-spinner hidden" id="missing-shipto-search-spinner"></span>
+              <span id="missing-shipto-search-btn-label">Search</span>
+            </button>
+          </div>
+          <div class="details-hint sync-hint">
+            Queries Business Central directly (not the buffer) for <strong>Open</strong> Sales Orders this app's own
+            SO-import pipeline created (<code>submittedBy = "SBIC AI Uploading"</code>) that have no
+            <strong>Ship-to Code</strong> saved — these will block or misroute delivery and need a Ship-to address
+            added directly in BC.
+          </div>
+          <p class="status-line" id="missing-shipto-status-line"></p>
+          <div class="order-list" id="missing-shipto-results-list"></div>
         </div>
 
         <!-- Skeleton — shown only while the very first buffer fetch is in flight -->

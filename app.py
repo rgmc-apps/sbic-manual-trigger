@@ -954,6 +954,45 @@ def _find_orders_by_customer(company: str, customer_no: str) -> list:
     return body.get("data") or []
 
 
+# Open Sales Orders with a blank Ship-to Code — the worker's customer-resolution
+# fallback (a flat customer override, or the denormalized header.resolvedCustomer
+# patch) can leave shipToCode unset when no scoped override supplied one, which the
+# Customers tab's Split action doesn't catch after the fact since it only acts on
+# buffered POs, not orders already created in BC. Restricted to submittedBy ==
+# _SBIC_AI_SUBMITTED_BY and status == Open for the same reason as _find_orders_by_customer.
+_SHIPTO_MISSING_FILTER = f"shipToCode eq '' and status eq 'Open' and submittedBy eq '{_SBIC_AI_SUBMITTED_BY}'"
+
+
+def _find_orders_missing_shipto(company: str) -> list:
+    """Open Sales Orders with no Ship-to Code, restricted to submittedBy == _SBIC_AI_SUBMITTED_BY.
+
+    Same entity set as _find_orders_by_customer — see its docstring.
+    """
+    resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={"company": company, "filter": _SHIPTO_MISSING_FILTER})
+    body, status_code = _proxy_json(resp)
+    if status_code != 200:
+        raise RuntimeError(body.get("detail") or body.get("error") or f"BC returned {status_code}")
+    return body.get("data") or []
+
+
+@app.route("/api/sales-orders/missing-shipto")
+def api_sales_orders_missing_shipto():
+    """Open BC Sales Orders with a blank Ship-to Code — surfaces SO-import orders that
+    landed in BC without a ship-to address, for manual review/correction in BC. Read-only:
+    nothing here ever changes an existing Sales Order. Restricted to
+    submittedBy == "SBIC AI Uploading" and status == Open — see _find_orders_missing_shipto."""
+    company = (request.args.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    try:
+        orders = _find_orders_missing_shipto(company)
+        return jsonify({"data": orders, "total": len(orders)})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
 @app.route("/api/sales-orders")
 def api_sales_orders():
     """Look up existing BC Sales Orders by customer number — used by the Overrides

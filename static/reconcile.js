@@ -31,6 +31,10 @@
   const bqGroupToolbar    = document.getElementById("bq-group-toolbar");
   const bqGroupSelect     = document.getElementById("bq-group-select");
   const documentAiRowTemplate = document.getElementById("document-ai-row-template");
+  const missingShiptoCompanySelect = document.getElementById("missing-shipto-company-select");
+  const missingShiptoSearchBtn     = document.getElementById("missing-shipto-search-btn");
+  const missingShiptoStatusLine    = document.getElementById("missing-shipto-status-line");
+  const missingShiptoResultsList   = document.getElementById("missing-shipto-results-list");
   const soUpdateModalOverlay   = document.getElementById("so-update-modal-overlay");
   const soUpdateModalSubtitle  = document.getElementById("so-update-modal-subtitle");
   const soUpdateModalTbody     = document.getElementById("so-update-modal-tbody");
@@ -2681,6 +2685,66 @@
   }
 
   bqSearchBtn.addEventListener("click", searchDocumentAi);
+
+  // ── Missing Ship-To tab ───────────────────────────────────────────────────
+  // Queries BC directly (not the buffer) for Open Sales Orders this app's own
+  // SO-import pipeline created that have no Ship-to Code saved. Read-only — see
+  // _find_orders_missing_shipto in app.py for the exact server-side filter.
+  function setMissingShiptoStatus(msg, isError) {
+    missingShiptoStatusLine.textContent = msg || "";
+    missingShiptoStatusLine.classList.toggle("error", !!isError);
+  }
+
+  function renderMissingShiptoResults(orders) {
+    missingShiptoResultsList.innerHTML = "";
+    if (!orders.length) {
+      const empty = document.createElement("div");
+      empty.className = "tab-empty";
+      empty.textContent = "No Open Sales Orders with a missing Ship-to Code found.";
+      missingShiptoResultsList.appendChild(empty);
+      return;
+    }
+    missingShiptoResultsList.innerHTML = orders.map((o) => `
+      <div class="order-row">
+        <div class="order-row-head">
+          <span class="order-ref">${escapeHtml(o.number || "—")}</span>
+          <span class="order-badge failed">No Ship-To</span>
+        </div>
+        <div class="order-detail">
+          Customer: ${escapeHtml(o.sellToCustomerName || o.sellToCustomerNo || "—")}
+          (${escapeHtml(o.sellToCustomerNo || "—")}) &middot;
+          PO ref: ${escapeHtml(o.externalDocumentNo || "—")} &middot;
+          Order date: ${escapeHtml(o.orderDate || "—")}
+        </div>
+      </div>
+    `).join("");
+  }
+
+  async function searchMissingShipto() {
+    const company = missingShiptoCompanySelect.value;
+    if (!company) {
+      setMissingShiptoStatus("Select a company above first.", true);
+      return;
+    }
+    missingShiptoSearchBtn.disabled = true;
+    setBtnLoading("missing-shipto-search-spinner", "missing-shipto-search-btn-label", true, "Searching…");
+    setMissingShiptoStatus(`Searching ${company} for Open Sales Orders with no Ship-to Code (submittedBy = "SBIC AI Uploading")…`);
+    try {
+      const res = await fetch(`/api/sales-orders/missing-shipto?company=${encodeURIComponent(company)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
+      const orders = data.data || [];
+      renderMissingShiptoResults(orders);
+      setMissingShiptoStatus(`Found ${orders.length} Open Sales Order(s) in ${company} with no Ship-to Code.`);
+    } catch (e) {
+      setMissingShiptoStatus("Error: " + e.message, true);
+    } finally {
+      missingShiptoSearchBtn.disabled = false;
+      setBtnLoading("missing-shipto-search-spinner", "missing-shipto-search-btn-label", false);
+    }
+  }
+
+  missingShiptoSearchBtn.addEventListener("click", searchMissingShipto);
   bqCustomerInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchDocumentAi(); });
   // bq-po-ref-input is a textarea now (multiple PO refs, one-per-line or comma-separated)
   // — plain Enter has to stay a newline; Ctrl/Cmd+Enter triggers the search instead.
