@@ -3135,7 +3135,7 @@
       <div class="shipto-history-row">
         <div class="shipto-history-row-head">
           <span class="order-ref">${escapeHtml(r.order_no || "—")}</span>
-          <span class="shipto-history-outcome ${escapeHtml(r.outcome || "")}">${escapeHtml((r.outcome || "—").toUpperCase())}</span>
+          <span class="shipto-history-outcome ${escapeHtml(r.outcome || "")}">${escapeHtml((r.outcome || "—").replace(/_/g, " ").toUpperCase())}</span>
         </div>
         <div class="order-detail">
           PO ref: ${escapeHtml(r.po_ref || "—")} &middot;
@@ -3217,6 +3217,7 @@
   function summarizeShiptoFixesRun(summary) {
     if (!summary) return "";
     const parts = [`${summary.fixes_applied || 0} fix(es) applied and removed from the list below`];
+    if (summary.fixes_already_resolved) parts.push(`${summary.fixes_already_resolved} already had a ship-to set another way — also removed, nothing more to do`);
     if (summary.fixes_skipped) parts.push(`${summary.fixes_skipped} skipped (no longer eligible) — still shown as Queued, with the reason, below`);
     if (summary.fixes_failed) parts.push(`${summary.fixes_failed} failed — still shown as Queued for the next Apply attempt`);
     return parts.join(", ") + ".";

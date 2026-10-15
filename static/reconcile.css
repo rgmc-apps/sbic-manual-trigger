@@ -695,6 +695,7 @@
 .shipto-history-row-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 .shipto-history-outcome { font-size: .7rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
 .shipto-history-outcome.applied { background: var(--success-bg); color: var(--success-text); border: 1px solid var(--success-border); }
+.shipto-history-outcome.already_resolved { background: #eef4ff; color: var(--brand-dark); border: 1px solid var(--brand); }
 .shipto-history-outcome.skipped { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); }
 .shipto-history-outcome.failed { background: var(--error-bg); color: var(--error-text); border: 1px solid var(--error-border); }
 .shipto-history-detail { margin-top: 6px; font-size: .8125rem; color: var(--text-muted); }
