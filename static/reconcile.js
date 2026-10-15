@@ -2844,8 +2844,8 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             company, order_id: order.id, ship_to_code: candidate.code,
-            ship_to_name: candidate.name || "", source: candidate.source || "",
-            resolved_by: getEmployeeDetails().employee_name,
+            ship_to_name: candidate.name || "", ship_to_customer_no: candidate.extra || "",
+            source: candidate.source || "", resolved_by: getEmployeeDetails().employee_name,
           }),
         });
         const data = await res.json();
@@ -3095,6 +3095,7 @@
       let msg = `Queued ${data.queued} of ${data.total} order(s) from saved overrides in ${company}`;
       if (data.already_queued) msg += ` (${data.already_queued} were already queued)`;
       if (data.no_override_match) msg += `, ${data.no_override_match} had no matching override — link those manually`;
+      if (data.customer_mismatch) msg += `, ${data.customer_mismatch} matched an override for a DIFFERENT customer and were skipped (BC would reject them) — link those manually`;
       msg += ".";
       if (failed.length) msg += ` ${failed.length} queue attempt(s) failed — see ${failed.map((f) => f.number).join(", ")}.`;
       await searchMissingShipto(); // re-render first so newly-queued orders move into the ✅ Queued section…

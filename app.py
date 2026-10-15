@@ -1112,12 +1112,25 @@ def api_queue_shipto_fix():
     act on, so the submittedBy/status/shipToCode-blank safety filter stays
     authoritative — an order_id that didn't come back from that fresh query (already
     fixed by someone else, or no longer Open) is rejected rather than silently queued.
+
+    ship_to_customer_no (the ship-to address's OWN customerNumber in BC — every
+    candidate shape in this app carries it) must match the order's existing
+    sellToCustomerNo: BC's Ship-to Address table is scoped per customer, so patching in
+    a ship-to that belongs to a DIFFERENT customer than the order's own Sell-to
+    Customer No. is guaranteed to fail at Apply time with a 404
+    Internal_InvalidTableRelation — rejected here instead, immediately, with a clear
+    reason, rather than silently queuing something that can never actually apply. This
+    mismatch is real: BC sometimes splits one raw customer name across more than one
+    Customer record (e.g. ME001/ME002 both "METRO RETAIL STORES GROUP, INC."), so a
+    branch/customer override saved against one of them can still fuzzy- or
+    override-match a ship-to that belongs to the OTHER.
     """
     data = request.get_json(silent=True) or {}
     company = (data.get("company") or "").strip()
     order_id = (data.get("order_id") or "").strip()
     ship_to_code = (data.get("ship_to_code") or "").strip()
     ship_to_name = (data.get("ship_to_name") or "").strip()
+    ship_to_customer_no = (data.get("ship_to_customer_no") or "").strip()
     source = (data.get("source") or "").strip()
 
     if not company:
@@ -1139,6 +1152,15 @@ def api_queue_shipto_fix():
                      "different status, or have changed since the lookup ran) — refresh and try again."
         }), 409
 
+    order_customer_no = (order.get("sellToCustomerNo") or "").strip()
+    if ship_to_customer_no and ship_to_customer_no.upper() != order_customer_no.upper():
+        return jsonify({
+            "error": f"Ship-to {ship_to_code} belongs to customer {ship_to_customer_no}, but this order's "
+                     f"Sell-to Customer No. is {order_customer_no!r} — Business Central will reject this "
+                     "(Ship-to Address is scoped per customer). Pick a ship-to that belongs to this order's "
+                     "own customer instead."
+        }), 409
+
     try:
         resp = _bc_api("POST", "/bc/custom/v2/so-buffer/shipto-fixes", json={
             "company": company,
@@ -1147,6 +1169,7 @@ def api_queue_shipto_fix():
             "po_ref": order.get("externalDocumentNo") or "",
             "ship_to_code": ship_to_code,
             "ship_to_name": ship_to_name,
+            "ship_to_customer_no": ship_to_customer_no,
             "resolved_by": (data.get("resolved_by") or "").strip(),
             "source": source,
         })
@@ -1283,13 +1306,32 @@ def api_apply_known_overrides():
         match = _match_branch_override(branch_overrides, branch_name)
         if not match:
             match = _match_customer_override(customer_overrides_by_key, customer_name, branch_name, po_ref)
-        return order, match
+        if not match:
+            return order, None, None
+        # BC's Ship-to Address table is scoped per customer — an override's ship-to is
+        # only valid for THIS order if it belongs to the same customer BC already has on
+        # the order's own header. BC sometimes splits one raw customer name across more
+        # than one Customer record (e.g. ME001/ME002 both "METRO RETAIL STORES GROUP,
+        # INC."), so a branch/customer override saved against one of them can still
+        # match a branch name that another order — resolved to the OTHER record at
+        # import time — also shares. Applying it anyway would 404 at Apply time
+        # (Internal_InvalidTableRelation) — rejected here instead, before it's ever
+        # queued.
+        order_customer_no = (order.get("sellToCustomerNo") or "").strip().upper()
+        match_customer_no = (match.get("customerNumber") or "").strip().upper()
+        if match_customer_no and order_customer_no and match_customer_no != order_customer_no:
+            return order, None, f"Matched override belongs to customer {match['customerNumber']}, not this order's {order.get('sellToCustomerNo')!r}"
+        return order, match, None
 
     results = []
+    mismatches = []
     if candidates:
         with ThreadPoolExecutor(max_workers=min(20, len(candidates))) as ex:
-            resolved_pairs = list(ex.map(_resolve_one, candidates))
-        for order, match in resolved_pairs:
+            resolved_triples = list(ex.map(_resolve_one, candidates))
+        for order, match, mismatch_reason in resolved_triples:
+            if mismatch_reason:
+                mismatches.append({"number": order.get("number"), "reason": mismatch_reason})
+                continue
             if not match:
                 continue
             try:
@@ -1300,6 +1342,7 @@ def api_apply_known_overrides():
                     "po_ref": order.get("externalDocumentNo") or "",
                     "ship_to_code": match["code"],
                     "ship_to_name": match.get("name") or "",
+                    "ship_to_customer_no": match.get("customerNumber") or "",
                     "resolved_by": resolved_by or "Apply Known Overrides",
                     "source": match.get("source") or "saved override",
                 })
@@ -1317,10 +1360,12 @@ def api_apply_known_overrides():
     queued = sum(1 for r in results if r["ok"])
     return jsonify({
         "data": results,
+        "mismatches": mismatches,
         "total": len(orders),
         "already_queued": len(already_queued_ids),
         "queued": queued,
-        "no_override_match": len(candidates) - len(results),
+        "customer_mismatch": len(mismatches),
+        "no_override_match": len(candidates) - len(results) - len(mismatches),
     })
 
 
