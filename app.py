@@ -72,11 +72,22 @@ def _resolve_bc_company(source_company_name: str | None) -> str | None:
 # never accidentally change where an order actually gets imported.
 BQ_COMPANY_NAME_TERMS: dict[str, list[str]] = {
     "SBIC": [
+        "SBIC",
         "SUNCOAST BRANDS",
         "SUNCOAST",
         "SUNCOAST BRANDS INTERNATIONAL CORP",
+        "SUNCOAST BRANDS INTERNATIONAL CORPORATION",
         "SUNCOAST BRANDS INTL CORP",
+        "SUNCOAST BRANDS INTL",
         "SUNCOAST BRANDS INTERNATIONAL",
+    ],
+    # MTC never routes to BC (see RECONCILE_COMPANIES above — BC Production has no MTC
+    # company) but int_document_ai still tags plenty of rows with Manila Taste Curators'
+    # own free-text company name, so the Upload Dashboard's company filter needs this
+    # entry even though no BC-facing action will ever use it.
+    "MTC": [
+        "MTC",
+        "MANILA TASTE CURATORS",
     ],
 }
 
@@ -440,6 +451,11 @@ def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = No
 # ---------------------------------------------------------------------------
 
 @app.route("/")
+def dashboard_page():
+    return render_template("dashboard.html", companies=sorted(BQ_COMPANY_NAME_TERMS.keys()))
+
+
+@app.route("/trigger")
 def index():
     return render_template("index.html", processes=PROCESSES)
 
@@ -2957,6 +2973,211 @@ def trigger():
             html_body=_error_email_body(process, name, department, timestamp, "Exception", msg),
         )
         return jsonify({"ok": False, "error": msg, "process_name": process["name"], "timestamp": timestamp}), 500
+
+
+# ---------------------------------------------------------------------------
+# Upload Monitoring Dashboard ("/") — browse every uploaded file across all three
+# Document AI pipelines, drill into its PO/RA refs, their detail lines, MSSQL/BC
+# status, and (PO + SBIC only) add a not-yet-in-BC PO to the buffer. See
+# plans/upload_dashboard_plan.md for the full design.
+# ---------------------------------------------------------------------------
+
+# upload_type -> BigQuery header/detail table names + the detail table's join column —
+# mirrors rgmc-gcp-api's own UPLOAD_TYPE_TABLES (bigquery_routes.py); duplicated here
+# only so this proxy layer can validate upload_type itself rather than trusting
+# whatever a client sends straight through to a generic table-name parameter.
+DASHBOARD_UPLOAD_TYPES = {
+    "po": {
+        "header_table": "int_document_ai", "detail_table": "int_document_ai_detail",
+        "ref_column": "po_ref_number", "mssql_header_table": "CustomerPOULBQ",
+        "mssql_detail_table": "CustomerPOULDetailBQ",
+    },
+    "ra": {
+        "header_table": "int_document_ai_ra", "detail_table": "int_document_ai_ra_detail",
+        "ref_column": "ra_ref_number", "mssql_header_table": "CustomerRABQ",
+        "mssql_detail_table": "CustomerRADetailBQ",
+    },
+    "ra_xml": {
+        "header_table": "int_document_ai_ra_xml", "detail_table": "int_document_ai_ra_xml_detail",
+        "ref_column": "ra_ref_number", "mssql_header_table": "CustomerRABQ",
+        "mssql_detail_table": "CustomerRADetailBQ",
+    },
+}
+
+
+@app.route("/api/dashboard/files")
+def api_dashboard_files():
+    """Distinct uploaded file names for one upload type, grouped with counts — the
+    dashboard's top-level search result."""
+    upload_type = (request.args.get("upload_type") or "").strip().lower()
+    if upload_type not in DASHBOARD_UPLOAD_TYPES:
+        return jsonify({"error": f"upload_type must be one of {sorted(DASHBOARD_UPLOAD_TYPES)}"}), 400
+
+    params = {"upload_type": upload_type}
+    company = (request.args.get("company") or "").strip().upper()
+    if company:
+        if upload_type != "po":
+            return jsonify({"error": "company filtering is only supported for upload_type=po"}), 400
+        terms = BQ_COMPANY_NAME_TERMS.get(company)
+        if not terms:
+            return jsonify({"error": f"No known company-name terms for {company!r} yet."}), 400
+        params["company_terms"] = ",".join(terms)
+    for key in ("date_from", "date_to"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+
+    try:
+        resp = _gcp_api("GET", "/bigquery_routes/upload-dashboard/files", params=params, timeout=60)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
+@app.route("/api/dashboard/file-records")
+def api_dashboard_file_records():
+    """Every header row (one per PO/RA ref) sharing one uploaded file_name — the
+    Expand action's data."""
+    upload_type = (request.args.get("upload_type") or "").strip().lower()
+    file_name = request.args.get("file_name") or ""
+    config_ = DASHBOARD_UPLOAD_TYPES.get(upload_type)
+    if not config_:
+        return jsonify({"error": f"upload_type must be one of {sorted(DASHBOARD_UPLOAD_TYPES)}"}), 400
+    if not file_name:
+        return jsonify({"error": "file_name is required"}), 400
+
+    try:
+        resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
+            "table_name": config_["header_table"], "where_column": "file_name", "where_value": file_name,
+        }, timeout=60)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
+@app.route("/api/dashboard/detail-records")
+def api_dashboard_detail_records():
+    """Detail lines for one PO/RA ref — the More Details action's data."""
+    upload_type = (request.args.get("upload_type") or "").strip().lower()
+    ref_value = request.args.get("ref_value") or ""
+    config_ = DASHBOARD_UPLOAD_TYPES.get(upload_type)
+    if not config_:
+        return jsonify({"error": f"upload_type must be one of {sorted(DASHBOARD_UPLOAD_TYPES)}"}), 400
+    if not ref_value:
+        return jsonify({"error": "ref_value is required"}), 400
+
+    try:
+        resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
+            "table_name": config_["detail_table"], "where_column": config_["ref_column"], "where_value": ref_value,
+        }, timeout=60)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
+@app.route("/api/dashboard/mssql-status")
+def api_dashboard_mssql_status():
+    """Whether this PO/RA ref's header and detail rows have already been copied into
+    the MSSQL _BQ staging tables (CustomerPOULBQ/CustomerPOULDetailBQ for PO,
+    CustomerRABQ/CustomerRADetailBQ for RA and RA(xml)) — not the promoted
+    CustomerPOUL/CustomerRA tables, per the dashboard's own spec."""
+    upload_type = (request.args.get("upload_type") or "").strip().lower()
+    ref_value = request.args.get("ref_value") or ""
+    config_ = DASHBOARD_UPLOAD_TYPES.get(upload_type)
+    if not config_:
+        return jsonify({"error": f"upload_type must be one of {sorted(DASHBOARD_UPLOAD_TYPES)}"}), 400
+    if not ref_value:
+        return jsonify({"error": "ref_value is required"}), 400
+
+    def _count(table_name):
+        try:
+            resp = _gcp_api("GET", "/sbic/by_table/value", params={
+                "table_name": table_name, "where_column": config_["ref_column"], "where_value": ref_value,
+            }, timeout=30)
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                return body.get("record_count") or 0
+            return None
+        except requests.RequestException:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        header_future = ex.submit(_count, config_["mssql_header_table"])
+        detail_future = ex.submit(_count, config_["mssql_detail_table"])
+        header_count = header_future.result()
+        detail_count = detail_future.result()
+
+    return jsonify({
+        "header_in_mssql": header_count is not None and header_count > 0,
+        "detail_count_in_mssql": detail_count,
+        "check_failed": header_count is None or detail_count is None,
+    })
+
+
+@app.route("/api/dashboard/bc-status")
+def api_dashboard_bc_status():
+    """Whether a PO ref already has a Sales Order in Business Central — PO + SBIC only,
+    same scope every other BC-facing action in this app uses (BC Production has no MTC
+    company — see RECONCILE_COMPANIES)."""
+    upload_type = (request.args.get("upload_type") or "").strip().lower()
+    po_ref = request.args.get("ref_value") or ""
+    company = (request.args.get("company") or "").strip().upper()
+    if upload_type != "po":
+        return jsonify({"error": "Business Central status is only available for upload_type=po"}), 400
+    if company != "SBIC":
+        return jsonify({"error": "Business Central status is only available for company=SBIC"}), 400
+    if not po_ref:
+        return jsonify({"error": "ref_value is required"}), 400
+
+    try:
+        safe_ref = po_ref.replace("'", "''")
+        resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={
+            "company": company, "filter": f"externalDocumentNo eq '{safe_ref}'",
+        }, timeout=30)
+        body, status_code = _proxy_json(resp)
+        if status_code != 200:
+            return jsonify(body), status_code
+        orders = body.get("data") or []
+        return jsonify({"in_bc": len(orders) > 0, "orders": orders})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/dashboard/add-to-buffer", methods=["POST"])
+def api_dashboard_add_to_buffer():
+    """Add a PO (not yet in Business Central) to the SO-import buffer — thin wrapper
+    around the same _insert_and_buffer the BigQuery Lookup tab's Quick Align already
+    uses, given one already-fetched header + its detail lines straight from this
+    dashboard's own file-records/detail-records calls."""
+    data = request.get_json(silent=True) or {}
+    header = data.get("header")
+    details = data.get("details") or []
+    employee = data.get("employee") or {}
+    if not header:
+        return jsonify({"error": "header is required"}), 400
+    header = {**header, "_source": "bigquery"}
+    return jsonify(_insert_and_buffer([header], details, employee))
+
+
+@app.route("/api/dashboard/source-file")
+def api_dashboard_source_file():
+    """Signed URL to the original uploaded file behind a Document AI file_name — the
+    View File action."""
+    upload_type = (request.args.get("upload_type") or "po").strip().lower()
+    file_name = request.args.get("file_name") or ""
+    if not file_name:
+        return jsonify({"error": "file_name is required"}), 400
+    try:
+        resp = _gcp_api("GET", "/bigquery_routes/document-ai/source-file", params={
+            "file_name": file_name, "upload_type": upload_type,
+        }, timeout=30)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
 
 
 if __name__ == "__main__":

@@ -1,0 +1,101 @@
+/* Upload Monitoring Dashboard — a collapsible 3-level tree (file -> ref -> detail
+   panel). Reuses style.css's design tokens and reconcile.css's existing component
+   vocabulary (.card, .toolbar, .btn-reprocess, .btn-history-toggle, .btn-link-toggle,
+   .status-line, .details-hint, .search-hint, .order-ref, .order-detail, .tab-empty,
+   .btn-spinner) rather than inventing a parallel visual language — only the
+   dashboard-specific layout/indentation below is new. */
+
+.dash-file-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+
+.dash-file-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  background: var(--card);
+}
+
+.dash-file-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dash-file-name-wrap { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+
+.dash-file-name {
+  font-weight: 700;
+  font-size: .875rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 560px;
+}
+
+.dash-file-meta { font-size: .78rem; color: var(--text-muted); }
+
+.dash-file-actions { display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+
+/* Level 2 — refs within one file, indented and left-bordered the same way the Missing
+   Items tab indents its sub-list under each order, so the nesting reads clearly without
+   drawing actual tree-line graphics. */
+.dash-refs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-left: 18px;
+  border-left: 2px solid var(--border);
+}
+
+.dash-ref-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: var(--bg);
+}
+
+.dash-ref-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+/* Level 3 — detail lines + MSSQL/BC/buffer actions, indented one step further. */
+.dash-detail-panel {
+  margin-top: 10px;
+  padding: 12px 14px;
+  padding-left: 18px;
+  border-left: 2px solid var(--border);
+}
+
+.dash-detail-table-wrap { overflow-x: auto; }
+
+.dash-detail-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.dash-detail-table th, .dash-detail-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.dash-detail-table th { color: var(--text-muted); font-weight: 600; text-transform: capitalize; }
+
+.dash-action-row {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dash-check-result { font-size: .8125rem; font-weight: 600; }
+.dash-check-result.ok { color: var(--success-text); }
+.dash-check-result.missing { color: var(--error-text); }
+.dash-check-result.warn { color: var(--warn-text); }
+
+.dash-buffer-action { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dash-buffer-result { font-size: .8125rem; font-weight: 600; }
+.dash-buffer-result.ok { color: var(--success-text); }
+.dash-buffer-result.warn { color: var(--error-text); }
+
+@media (max-width: 720px) {
+  .dash-file-name { max-width: 100%; }
+}

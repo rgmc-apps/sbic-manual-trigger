@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SBIC Upload Monitoring Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/reconcile.css" />
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="logo-mark">
+        <img src="/static/logo.png" alt="SBIC Logo" class="site-logo" />
+      </div>
+      <div>
+        <h1 class="site-title">Upload Monitoring Dashboard</h1>
+        <p class="site-subtitle">Browse BigQuery uploads across the PO, RA, and RA (xml) pipelines</p>
+      </div>
+      <nav class="site-nav">
+        <a class="nav-link" href="/trigger">Manual Trigger</a>
+        <a class="nav-link" href="/reconcile">Buffer Reconciliation</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="main main-wide">
+
+    <section class="card">
+      <div class="toolbar">
+        <div class="form-group toolbar-select">
+          <label class="form-label" for="dash-upload-type">Upload Type</label>
+          <div class="select-wrapper">
+            <select class="form-select" id="dash-upload-type">
+              <option value="po">PO Upload</option>
+              <option value="ra">RA Upload</option>
+              <option value="ra_xml">RA Upload (xml)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group toolbar-select">
+          <label class="form-label" for="dash-company">Company</label>
+          <div class="select-wrapper">
+            <select class="form-select" id="dash-company">
+              <option value="">— All companies —</option>
+              {% for c in companies %}
+              <option value="{{ c }}">{{ c }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="dash-date-from">Date from</label>
+          <input class="form-input" type="date" id="dash-date-from" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="dash-date-to">Date to</label>
+          <input class="form-input" type="date" id="dash-date-to" />
+        </div>
+        <button class="btn-reprocess" id="dash-search-btn" type="button">
+          <span class="btn-spinner hidden" id="dash-search-spinner"></span>
+          <span id="dash-search-btn-label">Search</span>
+        </button>
+      </div>
+
+      <p class="details-hint hidden" id="dash-company-hint"></p>
+      <p class="status-line" id="dash-status-line"></p>
+      <div class="dash-file-list" id="dash-file-list"></div>
+    </section>
+
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
