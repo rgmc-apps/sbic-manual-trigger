@@ -271,7 +271,7 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || data.detail || "Check failed");
         if (data.check_failed) {
-          resultEl.textContent = "⚠ Could not confirm MSSQL status (lookup failed) — try again.";
+          resultEl.textContent = `⚠ Could not confirm MSSQL status${data.error ? ": " + data.error : ""} — try again.`;
           resultEl.className = "dash-check-result warn";
         } else {
           resultEl.textContent = data.header_in_mssql
@@ -295,7 +295,12 @@
         bufferActionEl.classList.add("hidden");
         bufferActionEl.innerHTML = "";
         try {
-          const url = `/api/dashboard/bc-status?upload_type=${encodeURIComponent(uploadType)}&ref_value=${encodeURIComponent(ref)}&company=${encodeURIComponent(headerRow.company_name || "SBIC")}`;
+          // Always "SBIC" here, never headerRow.company_name's raw free text (e.g.
+          // "SUNCOAST BRANDS INTERNATIONAL CORP") -- this button only ever renders when
+          // isSbicPo already matched that text against SBIC/SUNCOAST, and the backend
+          // only supports the real BC company code "SBIC" anyway (see RECONCILE_COMPANIES
+          // in app.py — BC Production has no company matching the raw text verbatim).
+          const url = `/api/dashboard/bc-status?upload_type=${encodeURIComponent(uploadType)}&ref_value=${encodeURIComponent(ref)}&company=SBIC`;
           const res = await fetch(url);
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || data.detail || "Check failed");

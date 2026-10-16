@@ -2991,16 +2991,21 @@ DASHBOARD_UPLOAD_TYPES = {
         "header_table": "int_document_ai", "detail_table": "int_document_ai_detail",
         "ref_column": "po_ref_number", "mssql_header_table": "CustomerPOULBQ",
         "mssql_detail_table": "CustomerPOULDetailBQ",
+        # MSSQL's _BQ staging tables use camelCase columns, not BigQuery's snake_case —
+        # confirmed live (ProgrammingError: "Invalid column name 'po_ref_number'") that
+        # reusing ref_column here 500s every MSSQL check. See rgmc-gcp-api's
+        # mappings.py table_mappings['customerpoulbq']/['customerradetailbq'].
+        "mssql_ref_column": "poRefNumber",
     },
     "ra": {
         "header_table": "int_document_ai_ra", "detail_table": "int_document_ai_ra_detail",
         "ref_column": "ra_ref_number", "mssql_header_table": "CustomerRABQ",
-        "mssql_detail_table": "CustomerRADetailBQ",
+        "mssql_detail_table": "CustomerRADetailBQ", "mssql_ref_column": "raRefNumber",
     },
     "ra_xml": {
         "header_table": "int_document_ai_ra_xml", "detail_table": "int_document_ai_ra_xml_detail",
         "ref_column": "ra_ref_number", "mssql_header_table": "CustomerRABQ",
-        "mssql_detail_table": "CustomerRADetailBQ",
+        "mssql_detail_table": "CustomerRADetailBQ", "mssql_ref_column": "raRefNumber",
     },
 }
 
@@ -3093,27 +3098,33 @@ def api_dashboard_mssql_status():
         return jsonify({"error": "ref_value is required"}), 400
 
     def _count(table_name):
+        """Returns (count, error) — error is None on success, or a short diagnostic
+        string on failure, so a bad column/table name shows up in the response instead
+        of a generic "lookup failed" (see api.py git history: a prior version of this
+        reused the BigQuery snake_case ref_column here, 500ing every call with
+        "Invalid column name 'po_ref_number'" — MSSQL's _BQ tables use camelCase)."""
         try:
             resp = _gcp_api("GET", "/sbic/by_table/value", params={
-                "table_name": table_name, "where_column": config_["ref_column"], "where_value": ref_value,
+                "table_name": table_name, "where_column": config_["mssql_ref_column"], "where_value": ref_value,
             }, timeout=30)
             body, status_code = _proxy_json(resp)
             if status_code == 200:
-                return body.get("record_count") or 0
-            return None
-        except requests.RequestException:
-            return None
+                return body.get("record_count") or 0, None
+            return None, str(body.get("detail") or body.get("error") or f"HTTP {status_code}")[:200]
+        except requests.RequestException as exc:
+            return None, f"Could not reach rgmc-gcp-api: {exc}"
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         header_future = ex.submit(_count, config_["mssql_header_table"])
         detail_future = ex.submit(_count, config_["mssql_detail_table"])
-        header_count = header_future.result()
-        detail_count = detail_future.result()
+        header_count, header_error = header_future.result()
+        detail_count, detail_error = detail_future.result()
 
     return jsonify({
         "header_in_mssql": header_count is not None and header_count > 0,
         "detail_count_in_mssql": detail_count,
         "check_failed": header_count is None or detail_count is None,
+        "error": header_error or detail_error,
     })
 
 
