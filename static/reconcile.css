@@ -155,6 +155,9 @@
    inside align-items: flex-end, that mismatch is exactly what reads as misaligned.
    Same fix .backfill-toolbar already applies above, for the identical reason. */
 .bq-toolbar .form-group { margin-bottom: 0; }
+/* Same fix again for the Upload Dashboard's toolbar (dashboard.html/dashboard.css) —
+   Date from/Date to are plain .form-group there too. */
+.dash-toolbar .form-group { margin-bottom: 0; }
 
 .btn-reprocess {
   display: inline-flex;
