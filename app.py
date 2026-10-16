@@ -1398,9 +1398,64 @@ def _sku_key_for_line(line: dict) -> str:
     return f"__NOSKU__::{(desc or '(no SKU code, no description)').upper()}"
 
 
+def _fetch_expected_lines_batch(po_refs: list) -> dict:
+    """po_ref -> list of Document-AI-extracted lines (camelCase, same shape
+    _recover_lines_for_order's BigQuery branch returns), for MANY POs in a handful of
+    BigQuery calls instead of one call per PO.
+
+    _find_missing_items originally called _recover_lines_for_order (Cloud SQL, then
+    BigQuery fallback) once per matched BC order via a 20-worker thread pool — fine for
+    the handful of orders the Buffer tab recovers lines for, but a broad company+date
+    search here can match hundreds of orders with no per-order concurrency cap on the
+    network itself, which is exactly what produced a real 504 in production (Cloud
+    Run's own 300s request timeout, confirmed via Cloud Logging: the underlying BC
+    search took 4s, the ~300 fanned-out recovery calls took the rest). Chunking into
+    batched int_document_ai_detail queries (the same IN UNNEST(...) search
+    search_document_ai already does for multiple po_refs in one call) turns that into
+    O(refs/100) BigQuery calls total regardless of how many orders matched, at the cost
+    of skipping the Cloud SQL-first preference — acceptable here since every PO in this
+    list already exists in BC, meaning it already made it through BigQuery upstream of
+    that, unlike the Buffer tab's buffered-and-failed orders this helper doesn't touch.
+    """
+    unique_refs = sorted({r for r in po_refs if r})
+    if not unique_refs:
+        return {}
+    chunks = [unique_refs[i:i + 100] for i in range(0, len(unique_refs), 100)]
+
+    def _fetch_chunk(chunk):
+        try:
+            resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params={
+                "po_ref_number": ",".join(chunk),
+            }, timeout=90)
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                return body.get("detail_data") or []
+        except requests.RequestException:
+            pass
+        return []
+
+    by_ref: dict = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(chunks))) as ex:
+        for rows in ex.map(_fetch_chunk, chunks):
+            for r in rows:
+                ref = r.get("po_ref_number")
+                if not ref:
+                    continue
+                by_ref.setdefault(ref, []).append({
+                    "customerSKUCode": r.get("customer_sku_code"),
+                    "customerSKUDesc": r.get("customer_sku_desc"),
+                    "poQty": r.get("po_qty"),
+                    "poQtyPcs": r.get("po_qty_pcs"),
+                    "unitOfMeasurement": r.get("unit_of_measurement"),
+                    "unitPrice": r.get("unit_price"),
+                    "netPrice": r.get("net_price"),
+                })
+    return by_ref
+
+
 def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_to: str) -> list:
     """For every BC Sales Order matching the given filters, compare its current lines
-    against the Document-AI-extracted lines for the same PO (via _recover_lines_for_order)
+    against the Document-AI-extracted lines for the same PO (via _fetch_expected_lines_batch)
     and report any expected line with no matching current BC line.
 
     "Missing" determination (known limitation, accepted for v1 — see
@@ -1418,7 +1473,7 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
     params = {"company": company, "expand": "salesOrderLines"}
     if odata_filter:
         params["filter"] = odata_filter
-    resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params=params)
+    resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params=params, timeout=60)
     body, status_code = _proxy_json(resp)
     if status_code != 200:
         raise RuntimeError(body.get("detail") or body.get("error") or f"BC returned {status_code}")
@@ -1430,16 +1485,12 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
         (ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("sku")
     }
 
-    def _expected_lines(order):
-        po_ref = order.get("externalDocumentNo") or ""
-        lines, _source = _recover_lines_for_order(po_ref) if po_ref else ([], None)
-        return order, lines
-
-    with ThreadPoolExecutor(max_workers=min(20, len(orders))) as ex:
-        order_line_pairs = list(ex.map(_expected_lines, orders))
+    po_refs = [order.get("externalDocumentNo") for order in orders if order.get("externalDocumentNo")]
+    expected_by_ref = _fetch_expected_lines_batch(po_refs)
 
     results = []
-    for order, expected_lines in order_line_pairs:
+    for order in orders:
+        expected_lines = expected_by_ref.get(order.get("externalDocumentNo") or "", [])
         current_numbers = {
             (l.get("number") or "").strip().upper()
             for l in (order.get("salesOrderLines") or [])
