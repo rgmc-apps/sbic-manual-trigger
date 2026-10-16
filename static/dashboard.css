@@ -57,6 +57,18 @@
   background: var(--bg);
 }
 
+/* A ref-number search highlights every matching row this way — brand-colored left
+   border + tinted background, consistent with how .order-row.is-queued already uses a
+   colored left border elsewhere in this app to flag "this is the one that matters"
+   inside an otherwise plain list. */
+.dash-ref-row.is-highlighted {
+  border-color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 8%, var(--bg));
+  border-left: 4px solid var(--brand);
+  padding-left: 12px;
+}
+.dash-ref-row.is-highlighted .order-ref { color: var(--brand-dark); }
+
 .dash-ref-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 
 /* Level 3 — detail lines + MSSQL/BC/buffer actions, indented one step further. */

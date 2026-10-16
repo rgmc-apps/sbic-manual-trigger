@@ -2,6 +2,8 @@
   "use strict";
 
   const uploadTypeSelect = document.getElementById("dash-upload-type");
+  const refInput         = document.getElementById("dash-ref-input");
+  const refLabel         = document.getElementById("dash-ref-label");
   const companySelect    = document.getElementById("dash-company");
   const companyHint      = document.getElementById("dash-company-hint");
   const dateFromInput    = document.getElementById("dash-date-from");
@@ -48,6 +50,16 @@
   uploadTypeSelect.addEventListener("change", updateCompanyFilterAvailability);
   updateCompanyFilterAvailability();
 
+  function updateRefFieldLabel() {
+    const isPo = uploadTypeSelect.value === "po";
+    refLabel.textContent = isPo ? "PO Ref Number(s)" : "RA Ref Number(s)";
+    refInput.placeholder = isPo
+      ? "e.g. PO414226100110212 (comma-separated for multiple)"
+      : "e.g. 0197984 (comma-separated for multiple)";
+  }
+  uploadTypeSelect.addEventListener("change", updateRefFieldLabel);
+  updateRefFieldLabel();
+
   function fmtDate(value) {
     if (!value) return "—";
     try {
@@ -58,13 +70,23 @@
   }
 
   // ── File list (top level) ────────────────────────────────────────────────
+
+  // Comma/whitespace-separated ref numbers, normalized for case-insensitive exact-match
+  // highlighting — mirrors _split_po_refs' splitting convention server-side.
+  function parseRefInput(raw) {
+    return (raw || "").split(/[,\s]+/).map((r) => r.trim()).filter(Boolean);
+  }
+
   async function searchFiles() {
     const uploadType = uploadTypeSelect.value;
+    const refs = parseRefInput(refInput.value);
+    const highlightRefs = new Set(refs.map((r) => r.toUpperCase()));
     searchBtn.disabled = true;
     setBtnLoading("dash-search-spinner", "dash-search-btn-label", true, "Searching…");
-    setStatus("Searching BigQuery for uploaded files…");
+    setStatus(refs.length ? `Searching for file(s) containing ${refs.length} ref number(s)…` : "Searching BigQuery for uploaded files…");
     try {
       const params = new URLSearchParams({ upload_type: uploadType });
+      if (refs.length) params.set("ref_values", refs.join(","));
       if (companySelect.value) params.set("company", companySelect.value);
       if (dateFromInput.value) params.set("date_from", dateFromInput.value);
       if (dateToInput.value) params.set("date_to", dateToInput.value);
@@ -72,8 +94,12 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
       const files = data.data || [];
-      renderFileList(files, uploadType);
-      setStatus(`Found ${files.length} uploaded file(s).`);
+      renderFileList(files, uploadType, highlightRefs);
+      setStatus(
+        refs.length
+          ? `Found ${files.length} file(s) containing the searched ref number(s).`
+          : `Found ${files.length} uploaded file(s).`
+      );
     } catch (e) {
       fileListEl.innerHTML = "";
       setStatus("Error: " + e.message, true);
@@ -83,8 +109,9 @@
     }
   }
   searchBtn.addEventListener("click", searchFiles);
+  refInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchFiles(); });
 
-  function renderFileList(files, uploadType) {
+  function renderFileList(files, uploadType, highlightRefs) {
     fileListEl.innerHTML = "";
     if (!files.length) {
       const empty = document.createElement("div");
@@ -93,10 +120,10 @@
       fileListEl.appendChild(empty);
       return;
     }
-    files.forEach((f) => fileListEl.appendChild(buildFileRow(f, uploadType)));
+    files.forEach((f) => fileListEl.appendChild(buildFileRow(f, uploadType, highlightRefs)));
   }
 
-  function buildFileRow(file, uploadType) {
+  function buildFileRow(file, uploadType, highlightRefs) {
     const row = document.createElement("div");
     row.className = "dash-file-row";
     const lastSegment = (file.file_name || "").split("/").pop() || file.file_name || "(unnamed file)";
@@ -145,23 +172,35 @@
       }
     });
 
-    expandBtn.addEventListener("click", async () => {
+    async function loadRefs() {
+      if (refsListEl.dataset.loaded) return;
+      refsListEl.dataset.loaded = "1";
+      refsListEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Loading…</div>`;
+      try {
+        const url = `/api/dashboard/file-records?upload_type=${encodeURIComponent(uploadType)}&file_name=${encodeURIComponent(file.file_name)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.detail || "Lookup failed");
+        renderRefsList(refsListEl, data.data || [], uploadType, highlightRefs);
+      } catch (e) {
+        refsListEl.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    expandBtn.addEventListener("click", () => {
       const opening = refsListEl.classList.toggle("hidden") === false;
       expandBtn.textContent = opening ? "Collapse ▴" : "Expand ▾";
-      if (opening && !refsListEl.dataset.loaded) {
-        refsListEl.dataset.loaded = "1";
-        refsListEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Loading…</div>`;
-        try {
-          const url = `/api/dashboard/file-records?upload_type=${encodeURIComponent(uploadType)}&file_name=${encodeURIComponent(file.file_name)}`;
-          const res = await fetch(url);
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || data.detail || "Lookup failed");
-          renderRefsList(refsListEl, data.data || [], uploadType);
-        } catch (e) {
-          refsListEl.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
-        }
-      }
+      if (opening) loadRefs();
     });
+
+    // A ref-number search is really asking "show me what's in the file(s) containing
+    // this ref" — auto-expanding every result (rather than requiring an extra click
+    // per file) gets straight to the highlighted row(s) the search was for.
+    if (highlightRefs && highlightRefs.size) {
+      refsListEl.classList.remove("hidden");
+      expandBtn.textContent = "Collapse ▴";
+      loadRefs();
+    }
 
     return row;
   }
@@ -171,7 +210,7 @@
     return uploadType === "po" ? row.po_ref_number : row.ra_ref_number;
   }
 
-  function renderRefsList(container, rows, uploadType) {
+  function renderRefsList(container, rows, uploadType, highlightRefs) {
     container.innerHTML = "";
     if (!rows.length) {
       container.innerHTML = `<div class="search-hint">No records found for this file.</div>`;
@@ -181,13 +220,14 @@
     // nothing meaningful left to sort BY file name here — sorted by ref number instead,
     // for a stable, predictable order.
     const sorted = [...rows].sort((a, b) => (refNumber(a, uploadType) || "").localeCompare(refNumber(b, uploadType) || ""));
-    sorted.forEach((row) => container.appendChild(buildRefRow(row, uploadType)));
+    sorted.forEach((row) => container.appendChild(buildRefRow(row, uploadType, highlightRefs)));
   }
 
-  function buildRefRow(row, uploadType) {
+  function buildRefRow(row, uploadType, highlightRefs) {
     const ref = refNumber(row, uploadType);
+    const isHighlighted = !!(highlightRefs && ref && highlightRefs.has(String(ref).trim().toUpperCase()));
     const el = document.createElement("div");
-    el.className = "dash-ref-row";
+    el.className = "dash-ref-row" + (isHighlighted ? " is-highlighted" : "");
     const isPo = uploadType === "po";
     el.innerHTML = `
       <div class="dash-ref-head">

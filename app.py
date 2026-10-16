@@ -3019,6 +3019,11 @@ def api_dashboard_files():
         return jsonify({"error": f"upload_type must be one of {sorted(DASHBOARD_UPLOAD_TYPES)}"}), 400
 
     params = {"upload_type": upload_type}
+    ref_values = (request.args.get("ref_values") or "").strip()
+    if ref_values:
+        refs = _split_po_refs(ref_values)
+        if refs:
+            params["ref_values"] = ",".join(refs)
     company = (request.args.get("company") or "").strip().upper()
     if company:
         if upload_type != "po":
