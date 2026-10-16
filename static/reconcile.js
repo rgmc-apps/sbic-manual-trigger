@@ -3385,8 +3385,13 @@
         <div class="shipto-fix-error hidden"></div>
       </div>
       <div class="shipto-link-panel hidden">
-        <div class="search-row"><input type="text" class="search-input" placeholder="Search Business Central items…" /></div>
+        <div class="search-row item-search-row"><input type="text" class="search-input" placeholder="Search Business Central items…" /></div>
         <div class="search-results item-manual-results"></div>
+        <div class="search-hint uom-hint hidden">
+          This item's Document AI unit (<strong>${escapeHtml(item.unit_of_measurement || "")}</strong>) isn't one of its
+          valid units in Business Central — pick the correct one:
+        </div>
+        <div class="search-results uom-results"></div>
       </div>
     `;
 
@@ -3398,10 +3403,14 @@
     const resolvedBox = row.querySelector(".group-resolved");
     const unlinkBtn = row.querySelector(".btn-unlink");
     const fixErrorEl = row.querySelector(".shipto-fix-error");
+    const searchRow = row.querySelector(".item-search-row");
     const searchInput = row.querySelector(".search-input");
     const manualResultsEl = row.querySelector(".item-manual-results");
+    const uomHint = row.querySelector(".uom-hint");
+    const uomResultsEl = row.querySelector(".uom-results");
     let currentFixId = pendingFix ? pendingFix.id : null;
     let resolvedItem = item.resolved_item || null;
+    let needsUom = item.status === "needs_uom";
 
     function showQueuing(text) {
       panel.classList.add("hidden");
@@ -3440,10 +3449,25 @@
       queuingStatus.classList.add("hidden");
       resolvedBox.classList.add("hidden");
       fixErrorEl.classList.add("hidden");
-      const stillNeedsLinking = !resolvedItem;
-      actionBtn.textContent = stillNeedsLinking ? "Link item…" : "Queue";
-      badge.textContent = stillNeedsLinking ? "⚠ Needs linking" : "✓ Ready to insert";
-      badge.className = "order-badge " + (stillNeedsLinking ? "failed" : "ready");
+      // Item search picker only applies while the SKU itself is unresolved; once an item
+      // is resolved, any remaining problem is the UOM picker's job instead.
+      searchRow.classList.toggle("hidden", !!resolvedItem);
+      manualResultsEl.classList.toggle("hidden", !!resolvedItem);
+      uomHint.classList.toggle("hidden", !needsUom);
+      uomResultsEl.classList.toggle("hidden", !needsUom);
+      if (!resolvedItem) {
+        actionBtn.textContent = "Link item…";
+        badge.textContent = "⚠ Needs linking";
+        badge.className = "order-badge failed";
+      } else if (needsUom) {
+        actionBtn.textContent = "Resolve UOM…";
+        badge.textContent = "⚠ Needs UOM";
+        badge.className = "order-badge failed";
+      } else {
+        actionBtn.textContent = "Queue";
+        badge.textContent = "✓ Ready to insert";
+        badge.className = "order-badge ready";
+      }
       row.classList.remove("is-queued", "is-loading");
     }
 
@@ -3524,12 +3548,40 @@
       await queueFix(resolved, getEmployeeDetails().employee_name);
     }
 
-    actionBtn.addEventListener("click", () => {
-      if (!currentFixId && resolvedItem) {
-        queueFix(resolvedItem, getEmployeeDetails().employee_name); // "Queue" — ready item, no panel needed
+    // Resolves the UOM problem for an item whose SKU is already fine — saves a "uom"
+    // override keyed to this exact item+raw-unit combo (same shape the Buffer tab's
+    // Unit of Measure overrides already use), then queues with the item unchanged.
+    async function pickUomCandidate(candidate) {
+      const resolved = resolvedPayload("uom", candidate);
+      try {
+        const res = await fetch("/api/overrides", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "uom", key: `${resolvedItem.itemNo}::${item.unit_of_measurement}`, resolved,
+            resolved_by: getEmployeeDetails().employee_name, buffer_ids: [],
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.detail || "Saving the UOM link failed");
+      } catch (e) {
+        setMissingItemsStatus(`Could not save UOM link: ${e.message}`, true);
         return;
       }
-      panel.classList.toggle("hidden"); // "Link item…" or "Change…" — open/close the picker
+      needsUom = false;
+      await queueFix(resolvedItem, getEmployeeDetails().employee_name);
+    }
+
+    actionBtn.addEventListener("click", () => {
+      if (!currentFixId && resolvedItem && !needsUom) {
+        queueFix(resolvedItem, getEmployeeDetails().employee_name); // "Queue" — fully resolved, no panel needed
+        return;
+      }
+      if (!panel.dataset.uomRendered && needsUom) {
+        panel.dataset.uomRendered = "1";
+        renderCandidateList(uomResultsEl, "uom", normalizeCandidates("uom", item.uom_options || []), pickUomCandidate);
+      }
+      panel.classList.toggle("hidden"); // "Link item…", "Resolve UOM…", or "Change…" — open/close the picker
     });
 
     let searchTimer = null;

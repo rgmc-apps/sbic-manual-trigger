@@ -1372,8 +1372,15 @@ def api_apply_known_overrides():
 def _build_missing_items_filter(po_ref_number: str, date_from: str, date_to: str) -> str:
     """OData $filter for GET /bc/custom/v2/sales-orders — Business Central's v2.0 custom
     API uses plain unquoted ISO date literals for Edm.Date fields (orderDate), the
-    standard convention across Microsoft's BC APIs."""
-    conditions = []
+    standard convention across Microsoft's BC APIs.
+
+    Always scoped to status eq 'Open' — a Released order's lines are locked in BC, so a
+    Transfer to BC attempt against one always fails. Confirmed live: an early version of
+    this search had no status filter and surfaced Released POs whose "missing" items
+    could never actually be added without first reopening the order in BC (out of scope
+    here — reopening is a business decision, not something this tool should do silently).
+    """
+    conditions = ["status eq 'Open'"]
     if po_ref_number:
         refs = _split_po_refs(po_ref_number)
         if len(refs) == 1:
@@ -1453,6 +1460,31 @@ def _fetch_expected_lines_batch(po_refs: list) -> dict:
     return by_ref
 
 
+def _fetch_valid_uoms_batch(item_nos: set, company: str) -> dict:
+    """item_no -> raw list of that item's valid BC Units of Measure ([{code, description,
+    qtyPerUnitOfMeasure}, ...]), fetched once per UNIQUE item instead of once per missing
+    line across every order — same N+1 avoidance as _fetch_expected_lines_batch, since
+    many orders typically share the same handful of catalog items."""
+    if not item_nos:
+        return {}
+
+    def _fetch_one(item_no):
+        try:
+            resp = _bc_api("GET", f"/bc/custom/v2/items/{item_no}/unit-of-measure", params={"company": company}, timeout=20)
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                return item_no, body.get("data") or []
+        except requests.RequestException:
+            pass
+        return item_no, []
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=min(10, len(item_nos))) as ex:
+        for item_no, rows in ex.map(_fetch_one, item_nos):
+            result[item_no] = rows
+    return result
+
+
 def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_to: str) -> list:
     """For every BC Sales Order matching the given filters, compare its current lines
     against the Document-AI-extracted lines for the same PO (via _fetch_expected_lines_batch)
@@ -1468,6 +1500,16 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
     here as "needs linking" even though BC could already auto-resolve it on its own.
     Harmless false positive (a redundant link), not a false negative (never hides a
     line that's genuinely missing).
+
+    A resolved line also needs a BC-valid Unit of Measure before it can actually be
+    added — confirmed live: Transfer to BC failing with a UOM rejection for items whose
+    Document-AI-extracted unit code (e.g. "CS") isn't one of that item's own valid units
+    in BC (same class of issue as the Buffer tab's existing Unit of Measure overrides —
+    see _extract_uom_issues above). Reuses that exact same override shape
+    (type="uom", key="{itemNo}::{rawUom}", resolved={uomCode, description}) so a UOM
+    link saved here also benefits the Buffer tab's automated import path, and vice
+    versa. A line whose resolved item's raw UOM doesn't validate, and has no saved UOM
+    override either, is reported as "needs_uom" instead of "ready".
     """
     odata_filter = _build_missing_items_filter(po_ref_number, date_from, date_to)
     params = {"company": company, "expand": "salesOrderLines"}
@@ -1481,25 +1523,33 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
     if not orders:
         return []
 
-    overrides_by_key = {
+    sku_overrides_by_key = {
         (ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("sku")
+    }
+    uom_overrides_by_key = {
+        (ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("uom")
     }
 
     po_refs = [order.get("externalDocumentNo") for order in orders if order.get("externalDocumentNo")]
     expected_by_ref = _fetch_expected_lines_batch(po_refs)
 
-    results = []
+    # Pass 1: find every missing line and figure out which resolved items' UOM validity
+    # still needs a live BC check (no saved override already covers it) — collected
+    # across ALL orders first, so the actual BC calls in pass 2 are batched per unique
+    # item, not repeated for every order that happens to be missing the same item.
+    order_candidates = []
+    pending_uom_checks: set = set()
     for order in orders:
         expected_lines = expected_by_ref.get(order.get("externalDocumentNo") or "", [])
         current_numbers = {
             (l.get("number") or "").strip().upper()
             for l in (order.get("salesOrderLines") or [])
         }
-        missing = []
+        candidates = []
         for line in expected_lines:
             sku_key = _sku_key_for_line(line)
-            override = overrides_by_key.get(sku_key.upper())
-            resolved_item = override.get("resolved") if override else None
+            sku_override = sku_overrides_by_key.get(sku_key.upper())
+            resolved_item = sku_override.get("resolved") if sku_override else None
             resolved_item_no = ((resolved_item or {}).get("itemNo") or "").strip()
             raw_sku = (line.get("customerSKUCode") or "").strip()
 
@@ -1510,15 +1560,61 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
             if already_present:
                 continue
 
-            missing.append({
+            raw_uom = (line.get("unitOfMeasurement") or "").strip()
+            uom_key = f"{resolved_item_no}::{raw_uom}".upper() if (resolved_item_no and raw_uom) else ""
+            needs_uom_check = bool(resolved_item_no and raw_uom and uom_key not in uom_overrides_by_key)
+            if needs_uom_check:
+                pending_uom_checks.add(resolved_item_no)
+
+            candidates.append({
                 "sku_key": sku_key,
                 "customer_sku_code": raw_sku,
                 "customer_sku_desc": (line.get("customerSKUDesc") or "").strip(),
                 "po_qty": line.get("poQty"),
-                "unit_of_measurement": line.get("unitOfMeasurement"),
+                "unit_of_measurement": raw_uom,
                 "unit_price": line.get("unitPrice"),
-                "status": "ready" if resolved_item else "needs_linking",
                 "resolved_item": resolved_item,
+                "resolved_item_no": resolved_item_no,
+                "uom_key": uom_key,
+                "needs_uom_check": needs_uom_check,
+            })
+        if candidates:
+            order_candidates.append((order, candidates))
+
+    valid_uoms_by_item = _fetch_valid_uoms_batch(pending_uom_checks, company) if pending_uom_checks else {}
+
+    # Pass 2: finalize status now that every item's valid-UOM list (if needed) is known.
+    results = []
+    for order, candidates in order_candidates:
+        missing = []
+        for c in candidates:
+            resolved_item = c["resolved_item"]
+            uom_options = None
+            if not resolved_item:
+                item_status = "needs_linking"
+            elif not c["unit_of_measurement"]:
+                item_status = "ready"  # nothing to validate
+            elif c["uom_key"] in uom_overrides_by_key:
+                item_status = "ready"  # already-saved UOM link covers this item+raw-unit combo
+            else:
+                valid_rows = valid_uoms_by_item.get(c["resolved_item_no"], [])
+                valid_codes = {(row.get("code") or "").strip().upper() for row in valid_rows}
+                if c["unit_of_measurement"].upper() in valid_codes:
+                    item_status = "ready"
+                else:
+                    item_status = "needs_uom"
+                    uom_options = valid_rows
+
+            missing.append({
+                "sku_key": c["sku_key"],
+                "customer_sku_code": c["customer_sku_code"],
+                "customer_sku_desc": c["customer_sku_desc"],
+                "po_qty": c["po_qty"],
+                "unit_of_measurement": c["unit_of_measurement"],
+                "unit_price": c["unit_price"],
+                "status": item_status,
+                "resolved_item": resolved_item,
+                "uom_options": uom_options,
             })
 
         if missing:
