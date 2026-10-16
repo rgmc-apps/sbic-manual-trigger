@@ -11,6 +11,9 @@
   const searchBtn        = document.getElementById("dash-search-btn");
   const statusLine       = document.getElementById("dash-status-line");
   const fileListEl       = document.getElementById("dash-file-list");
+  const bcModalOverlay   = document.getElementById("dash-bc-modal-overlay");
+  const bcModalBody      = document.getElementById("dash-bc-modal-body");
+  const bcModalClose     = document.getElementById("dash-bc-modal-close");
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (ch) => ({
@@ -345,8 +348,14 @@
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || data.detail || "Check failed");
           if (data.in_bc) {
-            resultEl.textContent = `✓ Found in Business Central (${data.orders.length} order(s))`;
+            resultEl.innerHTML = `✓ Found in Business Central (${data.orders.length} order(s)) `;
             resultEl.className = "dash-check-result ok";
+            const viewBtn = document.createElement("button");
+            viewBtn.type = "button";
+            viewBtn.className = "btn-link-toggle dash-view-bc-btn";
+            viewBtn.textContent = "View BC Details";
+            viewBtn.addEventListener("click", () => openBcDetailsModal(ref, data.orders));
+            resultEl.appendChild(viewBtn);
           } else {
             resultEl.textContent = "✗ Not found in Business Central";
             resultEl.className = "dash-check-result missing";
@@ -391,5 +400,51 @@
         btn.disabled = false;
       }
     });
+  }
+
+  // ── Business Central details modal — shown instead of cramming order headers +
+  // line items inline into the already 3-level-deep tree. ──────────────────────
+  function closeBcDetailsModal() {
+    bcModalOverlay.classList.add("hidden");
+    bcModalBody.innerHTML = "";
+  }
+  bcModalClose.addEventListener("click", closeBcDetailsModal);
+  bcModalOverlay.addEventListener("click", (e) => { if (e.target === bcModalOverlay) closeBcDetailsModal(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !bcModalOverlay.classList.contains("hidden")) closeBcDetailsModal();
+  });
+
+  function openBcDetailsModal(searchedRef, orders) {
+    bcModalBody.innerHTML = (orders || []).map((order, i) => {
+      const lines = order.salesOrderLines || [];
+      const lineRows = lines.map((l) => `
+        <tr>
+          <td>${escapeHtml(l.number || "—")}</td>
+          <td>${escapeHtml(l.description || "—")}</td>
+          <td>${escapeHtml(l.quantity ?? "—")}</td>
+          <td>${escapeHtml(l.unitOfMeasureCode || "—")}</td>
+          <td>${escapeHtml(l.unitPrice ?? "—")}</td>
+          <td>${escapeHtml(l.lineAmount ?? "—")}</td>
+        </tr>
+      `).join("");
+      return `
+        <div class="dash-bc-order-block"${i > 0 ? ' style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border);"' : ""}>
+          <p class="modal-subtitle">
+            Order <strong>${escapeHtml(order.number || "—")}</strong> &middot;
+            Status: ${escapeHtml(order.status || "—")} &middot;
+            Sell-to: ${escapeHtml(order.sellToCustomerName || order.sellToCustomerNo || "—")} &middot;
+            Order date: ${escapeHtml(order.orderDate || "—")} &middot;
+            PO ref: ${escapeHtml(order.externalDocumentNo || searchedRef || "—")}
+          </p>
+          <div class="modal-table-wrap">
+            <table class="modal-so-table">
+              <thead><tr><th>Item</th><th>Description</th><th>Qty</th><th>UOM</th><th>Unit Price</th><th>Amount</th></tr></thead>
+              <tbody>${lineRows || `<tr><td colspan="6">No lines found.</td></tr>`}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }).join("");
+    bcModalOverlay.classList.remove("hidden");
   }
 })();

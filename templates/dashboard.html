@@ -77,6 +77,18 @@
 
   </main>
 
+  <!-- Business Central details modal — populated by dashboard.js when "View BC
+       Details" is clicked after a Check Business Central call finds order(s). -->
+  <div class="modal-overlay hidden" id="dash-bc-modal-overlay">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Business Central Details</h3>
+        <button class="modal-close-btn" id="dash-bc-modal-close" type="button">&times;</button>
+      </div>
+      <div class="modal-body" id="dash-bc-modal-body"></div>
+    </div>
+  </div>
+
   <script src="/static/dashboard.js"></script>
 </body>
 </html>

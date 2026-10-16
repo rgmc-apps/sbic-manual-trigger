@@ -3152,6 +3152,7 @@ def api_dashboard_bc_status():
         safe_ref = po_ref.replace("'", "''")
         resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={
             "company": company, "filter": f"externalDocumentNo eq '{safe_ref}'",
+            "expand": "salesOrderLines",
         }, timeout=30)
         body, status_code = _proxy_json(resp)
         if status_code != 200:
