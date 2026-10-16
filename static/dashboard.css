@@ -108,6 +108,22 @@
 .dash-buffer-result.ok { color: var(--success-text); }
 .dash-buffer-result.warn { color: var(--error-text); }
 
+/* BQ-vs-MSSQL / BQ-vs-BC variance comparison (Check MSSQL / Check Business Central
+   "View ... Details" modals) — reuses .modal-so-table's base styling, this just adds
+   the variance highlighting on top. */
+.dash-variance-banner {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+  font-size: .8125rem;
+  font-weight: 600;
+}
+.dash-variance-row { background: var(--warn-bg); }
+.dash-variance-cell { color: var(--warn-text); font-weight: 700; }
+
 @media (max-width: 720px) {
   .dash-file-name { max-width: 100%; }
 }

@@ -3102,33 +3102,36 @@ def api_dashboard_mssql_status():
     if not ref_value:
         return jsonify({"error": "ref_value is required"}), 400
 
-    def _count(table_name):
-        """Returns (count, error) — error is None on success, or a short diagnostic
+    def _fetch(table_name):
+        """Returns (rows, error) — error is None on success, or a short diagnostic
         string on failure, so a bad column/table name shows up in the response instead
         of a generic "lookup failed" (see api.py git history: a prior version of this
         reused the BigQuery snake_case ref_column here, 500ing every call with
-        "Invalid column name 'po_ref_number'" — MSSQL's _BQ tables use camelCase)."""
+        "Invalid column name 'po_ref_number'" — MSSQL's _BQ tables use camelCase).
+        Returns full rows (not just a count) so the dashboard's variance checker modal
+        can compare them against the BigQuery detail rows it already has."""
         try:
             resp = _gcp_api("GET", "/sbic/by_table/value", params={
                 "table_name": table_name, "where_column": config_["mssql_ref_column"], "where_value": ref_value,
             }, timeout=30)
             body, status_code = _proxy_json(resp)
             if status_code == 200:
-                return body.get("record_count") or 0, None
+                return body.get("data") or [], None
             return None, str(body.get("detail") or body.get("error") or f"HTTP {status_code}")[:200]
         except requests.RequestException as exc:
             return None, f"Could not reach rgmc-gcp-api: {exc}"
 
     with ThreadPoolExecutor(max_workers=2) as ex:
-        header_future = ex.submit(_count, config_["mssql_header_table"])
-        detail_future = ex.submit(_count, config_["mssql_detail_table"])
-        header_count, header_error = header_future.result()
-        detail_count, detail_error = detail_future.result()
+        header_future = ex.submit(_fetch, config_["mssql_header_table"])
+        detail_future = ex.submit(_fetch, config_["mssql_detail_table"])
+        header_rows, header_error = header_future.result()
+        detail_rows, detail_error = detail_future.result()
 
     return jsonify({
-        "header_in_mssql": header_count is not None and header_count > 0,
-        "detail_count_in_mssql": detail_count,
-        "check_failed": header_count is None or detail_count is None,
+        "header_in_mssql": header_rows is not None and len(header_rows) > 0,
+        "detail_count_in_mssql": None if detail_rows is None else len(detail_rows),
+        "detail_data": detail_rows or [],
+        "check_failed": header_rows is None or detail_rows is None,
         "error": header_error or detail_error,
     })
 

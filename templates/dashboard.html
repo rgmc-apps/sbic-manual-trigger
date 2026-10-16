@@ -77,15 +77,15 @@
 
   </main>
 
-  <!-- Business Central details modal — populated by dashboard.js when "View BC
-       Details" is clicked after a Check Business Central call finds order(s). -->
-  <div class="modal-overlay hidden" id="dash-bc-modal-overlay">
+  <!-- Shared details/variance modal — populated by dashboard.js for both "View BC
+       Details" (Check Business Central) and "View MSSQL Details" (Check MSSQL). -->
+  <div class="modal-overlay hidden" id="dash-details-modal-overlay">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>Business Central Details</h3>
-        <button class="modal-close-btn" id="dash-bc-modal-close" type="button">&times;</button>
+        <h3 id="dash-details-modal-title">Details</h3>
+        <button class="modal-close-btn" id="dash-details-modal-close" type="button">&times;</button>
       </div>
-      <div class="modal-body" id="dash-bc-modal-body"></div>
+      <div class="modal-body" id="dash-details-modal-body"></div>
     </div>
   </div>
 
