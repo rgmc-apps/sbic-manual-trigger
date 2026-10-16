@@ -80,6 +80,7 @@
           <button class="action-tab-btn" data-action-tab="overrides" type="button">Overrides</button>
           <button class="action-tab-btn" data-action-tab="bigquery" type="button">BigQuery Lookup</button>
           <button class="action-tab-btn" data-action-tab="missing-shipto" type="button">Missing Ship-To</button>
+          <button class="action-tab-btn" data-action-tab="missing-items" type="button">Missing Items</button>
         </div>
 
         <div class="action-tab-panel" id="action-panel-buffer">
@@ -420,6 +421,94 @@
             </div>
             <p class="status-line" id="shipto-history-status-line"></p>
             <div class="history-list" id="shipto-history-results-list"></div>
+          </div>
+        </div>
+
+        <!-- Missing Items tab: find already-created BC Sales Orders whose current lines
+             are missing one or more items the original Document AI extraction (BigQuery
+             int_document_ai_detail / Cloud SQL CustomerPOULDetail) says should be there.
+             Linking/queuing an item only ever writes to Firestore — Transfer to BC is
+             the one real write, re-validated fresh against BC immediately before each
+             line is added. See missing_items_plan.md for the full design. -->
+        <div class="action-tab-panel hidden" id="action-panel-missing-items">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="missing-items-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="missing-items-company-select">
+                  <option value="">— Select a company —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="missing-items-po-ref-input">PO number</label>
+              <input class="form-input" type="text" id="missing-items-po-ref-input" placeholder="e.g. 21721871 (comma-separated for multiple)" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="missing-items-date-from">Date from</label>
+              <input class="form-input" type="date" id="missing-items-date-from" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="missing-items-date-to">Date to</label>
+              <input class="form-input" type="date" id="missing-items-date-to" />
+            </div>
+            <button class="btn-reprocess" id="missing-items-search-btn" type="button">
+              <span class="btn-spinner hidden" id="missing-items-search-spinner"></span>
+              <span id="missing-items-search-btn-label">Search</span>
+            </button>
+            <button class="btn-link-toggle" id="missing-items-history-toggle-btn" type="button">🕘 Link History</button>
+          </div>
+          <div class="details-hint sync-hint">
+            Searches Business Central directly for Sales Orders matching the filters above, then compares each
+            order's current lines against the original Document AI-extracted PO lines (BigQuery/Cloud SQL) to find
+            items that never made it onto the BC order.
+            <ul class="hint-list">
+              <li><strong>✓ Ready to insert</strong> — this SKU already has a saved item link; click
+                <strong>Queue</strong> to add it to the next Transfer to BC run.</li>
+              <li><strong>⚠ Needs linking</strong> — no saved link for this SKU yet; click <strong>Link item…</strong>
+                to search Business Central items and pick one. Linking saves the item override AND queues the fix in
+                one step.</li>
+              <li>Linking/queuing never writes to BC directly — click <strong>Transfer to BC</strong> above the
+                results to actually add the queued lines, re-validated fresh against BC immediately before each
+                write.</li>
+              <li>An item successfully added to BC is automatically removed from this list on the next search. One
+                that failed stays queued with the reason shown, ready to retry.</li>
+            </ul>
+          </div>
+          <p class="status-line" id="missing-items-status-line"></p>
+          <div class="bq-insert-action hidden" id="missing-item-fixes-action">
+            <span class="status-line" id="missing-item-fixes-queued-count"></span>
+            <button class="btn-reprocess" id="missing-item-fixes-apply-btn" type="button">
+              <span class="btn-spinner hidden" id="missing-item-fixes-apply-spinner"></span>
+              <span id="missing-item-fixes-apply-btn-label">Transfer to BC</span>
+            </button>
+          </div>
+          <div class="order-list" id="missing-items-results-list"></div>
+
+          <!-- Missing Items Link History: searchable, append-only record of every
+               Transfer to BC attempt (applied/already_present/failed) by PO ref or
+               order number. -->
+          <div class="shipto-history-panel hidden" id="missing-items-history-panel">
+            <h3 class="shipto-history-title">Missing Items Link History</h3>
+            <p class="details-hint">
+              Every Transfer to BC attempt ever made for a missing item, searchable by PO ref or BC order number —
+              including ones that failed, with the reason.
+            </p>
+            <div class="toolbar">
+              <div class="form-group toolbar-select">
+                <label class="form-label" for="missing-items-history-search-input">PO ref or order number</label>
+                <input class="form-input" type="text" id="missing-items-history-search-input" placeholder="e.g. 21721871 or SBSO260125" />
+              </div>
+              <button class="btn-reprocess" id="missing-items-history-search-btn" type="button">
+                <span class="btn-spinner hidden" id="missing-items-history-search-spinner"></span>
+                <span id="missing-items-history-search-btn-label">Search</span>
+              </button>
+            </div>
+            <p class="status-line" id="missing-items-history-status-line"></p>
+            <div class="history-list" id="missing-items-history-results-list"></div>
           </div>
         </div>
 

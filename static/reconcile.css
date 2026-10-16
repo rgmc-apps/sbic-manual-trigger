@@ -687,6 +687,21 @@
 }
 .order-row.is-loading { opacity: .85; }
 .order-list > .bq-group-heading:first-child { margin-top: 0; }
+
+/* Missing Items tab: each BC order is a group-row (shared with the BigQuery search
+   tab's styling) with its missing lines nested and indented underneath, so it's
+   visually unambiguous which items belong to which order even with several orders
+   on screen at once. */
+.missing-items-order-group { margin-bottom: 14px; }
+.missing-items-sub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding-left: 18px;
+  border-left: 2px solid var(--border);
+}
+.missing-item-row { padding: 10px 14px; }
 .shipto-group-body { display: flex; flex-direction: column; gap: 10px; }
 .shipto-group-body:empty { display: none; }
 .shipto-history-panel { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }

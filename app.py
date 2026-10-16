@@ -1369,6 +1369,241 @@ def api_apply_known_overrides():
     })
 
 
+def _build_missing_items_filter(po_ref_number: str, date_from: str, date_to: str) -> str:
+    """OData $filter for GET /bc/custom/v2/sales-orders — Business Central's v2.0 custom
+    API uses plain unquoted ISO date literals for Edm.Date fields (orderDate), the
+    standard convention across Microsoft's BC APIs."""
+    conditions = []
+    if po_ref_number:
+        refs = _split_po_refs(po_ref_number)
+        if len(refs) == 1:
+            conditions.append(f"externalDocumentNo eq '{refs[0]}'")
+        elif refs:
+            conditions.append("(" + " or ".join(f"externalDocumentNo eq '{r}'" for r in refs) + ")")
+    if date_from:
+        conditions.append(f"orderDate ge {date_from}")
+    if date_to:
+        conditions.append(f"orderDate le {date_to}")
+    return " and ".join(conditions)
+
+
+def _sku_key_for_line(line: dict) -> str:
+    """Grouping key for a Document-AI detail line — customerSKUCode if present, else a
+    derived key from the description, same convention _group_buffer already uses for
+    blank-SKU lines."""
+    sku = (line.get("customerSKUCode") or "").strip()
+    if sku:
+        return sku
+    desc = (line.get("customerSKUDesc") or "").strip()
+    return f"__NOSKU__::{(desc or '(no SKU code, no description)').upper()}"
+
+
+def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_to: str) -> list:
+    """For every BC Sales Order matching the given filters, compare its current lines
+    against the Document-AI-extracted lines for the same PO (via _recover_lines_for_order)
+    and report any expected line with no matching current BC line.
+
+    "Missing" determination (known limitation, accepted for v1 — see
+    missing_items_plan.md): a Document-AI line counts as present unless a current BC
+    line's `number` equals either (a) a saved SKU override's resolved itemNo for this
+    line's key, or (b) the line's own raw customer_sku_code (handles the common case
+    where the customer's SKU code literally is the BC item number). This does not
+    replicate rgmc-worker-pool's BC item-reference ("ref_map") matching from automated
+    import — a line BC resolved that way, but never saved as our own override, shows
+    here as "needs linking" even though BC could already auto-resolve it on its own.
+    Harmless false positive (a redundant link), not a false negative (never hides a
+    line that's genuinely missing).
+    """
+    odata_filter = _build_missing_items_filter(po_ref_number, date_from, date_to)
+    params = {"company": company, "expand": "salesOrderLines"}
+    if odata_filter:
+        params["filter"] = odata_filter
+    resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params=params)
+    body, status_code = _proxy_json(resp)
+    if status_code != 200:
+        raise RuntimeError(body.get("detail") or body.get("error") or f"BC returned {status_code}")
+    orders = body.get("data") or []
+    if not orders:
+        return []
+
+    overrides_by_key = {
+        (ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("sku")
+    }
+
+    def _expected_lines(order):
+        po_ref = order.get("externalDocumentNo") or ""
+        lines, _source = _recover_lines_for_order(po_ref) if po_ref else ([], None)
+        return order, lines
+
+    with ThreadPoolExecutor(max_workers=min(20, len(orders))) as ex:
+        order_line_pairs = list(ex.map(_expected_lines, orders))
+
+    results = []
+    for order, expected_lines in order_line_pairs:
+        current_numbers = {
+            (l.get("number") or "").strip().upper()
+            for l in (order.get("salesOrderLines") or [])
+        }
+        missing = []
+        for line in expected_lines:
+            sku_key = _sku_key_for_line(line)
+            override = overrides_by_key.get(sku_key.upper())
+            resolved_item = override.get("resolved") if override else None
+            resolved_item_no = ((resolved_item or {}).get("itemNo") or "").strip()
+            raw_sku = (line.get("customerSKUCode") or "").strip()
+
+            already_present = bool(
+                (resolved_item_no and resolved_item_no.upper() in current_numbers)
+                or (raw_sku and raw_sku.upper() in current_numbers)
+            )
+            if already_present:
+                continue
+
+            missing.append({
+                "sku_key": sku_key,
+                "customer_sku_code": raw_sku,
+                "customer_sku_desc": (line.get("customerSKUDesc") or "").strip(),
+                "po_qty": line.get("poQty"),
+                "unit_of_measurement": line.get("unitOfMeasurement"),
+                "unit_price": line.get("unitPrice"),
+                "status": "ready" if resolved_item else "needs_linking",
+                "resolved_item": resolved_item,
+            })
+
+        if missing:
+            results.append({"order": order, "missing_items": missing})
+
+    return results
+
+
+@app.route("/api/sales-orders/missing-items")
+def api_sales_orders_missing_items():
+    """BC Sales Orders (matching the given PO/company/date filters) whose current lines
+    are missing one or more items the original Document AI extraction says should be
+    there. Read-only — nothing here ever changes an existing Sales Order; see
+    _find_missing_items for the comparison logic and its known limitations."""
+    company = (request.args.get("company") or "").strip()
+    po_ref_number = (request.args.get("po_ref_number") or "").strip()
+    date_from = (request.args.get("date_from") or "").strip()
+    date_to = (request.args.get("date_to") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    try:
+        groups = _find_missing_items(company, po_ref_number, date_from, date_to)
+        return jsonify({"data": groups, "total": len(groups)})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/sales-orders/missing-item-fixes", methods=["GET"])
+def api_list_missing_item_fixes():
+    """Queued/attempted missing-item fixes — lets the Missing Items tab show which
+    rows already have a fix queued without re-deriving that from the BC search itself."""
+    params = {}
+    company = (request.args.get("company") or "").strip()
+    if company:
+        params["company"] = company
+    applied = request.args.get("applied")
+    if applied is not None:
+        params["applied"] = applied
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/missing-item-fixes", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/missing-item-fixes", methods=["POST"])
+def api_queue_missing_item_fix():
+    """Queue one missing-item fix — picking an item (whether auto-resolved via a saved
+    SKU override, or freshly linked through /api/overrides) only ever writes here. Apply
+    Missing Item Fixes is the one real write to BC, same two-step shape as every other
+    link-then-apply flow in this app."""
+    data = request.get_json(silent=True) or {}
+    required = ("company", "order_id", "sku_key", "item_no")
+
+    def _is_blank(value):
+        return not value.strip() if isinstance(value, str) else value in (None, "")
+
+    missing = [f for f in required if _is_blank(data.get(f))]
+    if missing:
+        return jsonify({"error": f"{', '.join(missing)} required"}), 400
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/missing-item-fixes", json={
+            "company": data.get("company"),
+            "order_id": data.get("order_id"),
+            "order_no": data.get("order_no") or "",
+            "po_ref": data.get("po_ref") or "",
+            "sku_key": data.get("sku_key"),
+            "customer_sku_code": data.get("customer_sku_code") or "",
+            "customer_sku_desc": data.get("customer_sku_desc") or "",
+            "item_no": data.get("item_no"),
+            "item_description": data.get("item_description") or "",
+            "po_qty": data.get("po_qty") or 0,
+            "unit_of_measurement": data.get("unit_of_measurement") or "",
+            "unit_price": data.get("unit_price") or 0,
+            "resolved_by": data.get("resolved_by") or "",
+        })
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/missing-item-fixes/<fix_id>", methods=["DELETE"])
+def api_cancel_missing_item_fix(fix_id):
+    """Cancel a queued missing-item fix before an Apply run has picked it up."""
+    try:
+        resp = _bc_api("DELETE", f"/bc/custom/v2/so-buffer/missing-item-fixes/{fix_id}")
+        if resp.status_code == 204:
+            return "", 204
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/missing-item-fix-history")
+def api_missing_item_fix_history():
+    """Search the append-only missing-item fix attempt history — every Apply run's
+    outcome (applied/already_present/failed), by PO ref or order number."""
+    params = {}
+    for key in ("po_ref", "order_no", "company", "outcome"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/missing-item-fix-history", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/apply-missing-item-fixes", methods=["POST"])
+def api_apply_missing_item_fixes():
+    """Apply every pending queued missing-item fix for a company — synchronous (unlike
+    Apply Ship-To Fixes, this skips Pub/Sub + rgmc-worker-pool entirely: adding a Sales
+    Order Line is already a single existing BC call, re-validated fresh against BC
+    immediately before each write). Optionally scoped to specific order_ids."""
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    payload = {"company": company, "applied_by": data.get("applied_by") or ""}
+    if data.get("order_ids"):
+        payload["order_ids"] = data["order_ids"]
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/missing-item-fixes/apply", json=payload, timeout=90)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/sales-orders")
 def api_sales_orders():
     """Look up existing BC Sales Orders by customer number — used by the Overrides
