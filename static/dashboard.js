@@ -73,6 +73,17 @@
     }
   }
 
+  // A plain <input type="date"> carries no time component at all, so "Date to"
+  // naturally meant "midnight at the start of that day" once it reached BigQuery's
+  // DATETIME comparison — excluding every record from later that same day. Pins the
+  // boundary times explicitly instead of leaving it to implicit date->datetime casting.
+  function dateFromBoundary(value) {
+    return value ? `${value}T00:00:00` : "";
+  }
+  function dateToBoundary(value) {
+    return value ? `${value}T23:59:59` : "";
+  }
+
   // ── File list (top level) ────────────────────────────────────────────────
 
   // Comma/whitespace-separated ref numbers, normalized for case-insensitive exact-match
@@ -92,8 +103,8 @@
       const params = new URLSearchParams({ upload_type: uploadType });
       if (refs.length) params.set("ref_values", refs.join(","));
       if (companySelect.value) params.set("company", companySelect.value);
-      if (dateFromInput.value) params.set("date_from", dateFromInput.value);
-      if (dateToInput.value) params.set("date_to", dateToInput.value);
+      if (dateFromInput.value) params.set("date_from", dateFromBoundary(dateFromInput.value));
+      if (dateToInput.value) params.set("date_to", dateToBoundary(dateToInput.value));
       const res = await fetch(`/api/dashboard/files?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Search failed");

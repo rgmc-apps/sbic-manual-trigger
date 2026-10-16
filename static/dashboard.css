@@ -5,6 +5,12 @@
    .btn-spinner) rather than inventing a parallel visual language — only the
    dashboard-specific layout/indentation below is new. */
 
+/* Date from/Date to as one unbreakable pair — the surrounding .toolbar still wraps
+   normally when the row runs out of room, but these two inputs now wrap (or don't) as
+   a single unit instead of "Date to" landing alone on its own line while "Date from"
+   stays on the row above it. */
+.dash-date-range { display: flex; gap: 16px; flex-wrap: nowrap; }
+
 .dash-file-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
 
 .dash-file-row {
