@@ -1439,6 +1439,14 @@ def _fetch_expected_lines_batch(po_refs: list) -> dict:
     of skipping the Cloud SQL-first preference — acceptable here since every PO in this
     list already exists in BC, meaning it already made it through BigQuery upstream of
     that, unlike the Buffer tab's buffered-and-failed orders this helper doesn't touch.
+
+    Deduplicates per ref by _sku_key_for_line, the same composite key the BigQuery
+    bridge itself already uses to decide a detail row is a duplicate (po_ref_number +
+    customer_name + customer_sku_code, keep='first' — see mappings.required_columns in
+    rgmc-gcp-api). Without this, a PO whose Document AI extraction genuinely has a line
+    duplicated would hand _find_missing_items two "missing" candidates for the same SKU,
+    which api_dashboard_queue_missing_items would then queue as two separate Sales Order
+    lines for the same item on Transfer to BC.
     """
     unique_refs = sorted({r for r in po_refs if r})
     if not unique_refs:
@@ -1458,13 +1466,14 @@ def _fetch_expected_lines_batch(po_refs: list) -> dict:
         return []
 
     by_ref: dict = {}
+    seen_keys_by_ref: dict = {}
     with ThreadPoolExecutor(max_workers=min(5, len(chunks))) as ex:
         for rows in ex.map(_fetch_chunk, chunks):
             for r in rows:
                 ref = r.get("po_ref_number")
                 if not ref:
                     continue
-                by_ref.setdefault(ref, []).append({
+                line = {
                     "customerSKUCode": r.get("customer_sku_code"),
                     "customerSKUDesc": r.get("customer_sku_desc"),
                     "poQty": r.get("po_qty"),
@@ -1472,7 +1481,13 @@ def _fetch_expected_lines_batch(po_refs: list) -> dict:
                     "unitOfMeasurement": r.get("unit_of_measurement"),
                     "unitPrice": r.get("unit_price"),
                     "netPrice": r.get("net_price"),
-                })
+                }
+                sku_key = _sku_key_for_line(line).upper()
+                seen_keys = seen_keys_by_ref.setdefault(ref, set())
+                if sku_key in seen_keys:
+                    continue
+                seen_keys.add(sku_key)
+                by_ref.setdefault(ref, []).append(line)
     return by_ref
 
 

@@ -113,18 +113,29 @@
     progressCard.classList.add("hidden");
 
     const ok = data.ok === true;
+    // The BigQuery-read + MSSQL-write work now runs in rgmc-worker-pool, pulled off a
+    // Pub/Sub queue rather than inline in this request -- rgmc-gcp-api's runbridge
+    // endpoints return {"status": "queued", ...} immediately instead of the actual
+    // result. See rgmc-gcp-api's handoff.md ("Move bigquery_bridge heavy work to
+    // worker pool"). The real outcome arrives by email once the worker finishes.
+    const queued = ok && data.response && typeof data.response === "object" && data.response.status === "queued";
 
     // Icon
     resultIcon.className = "result-icon " + (ok ? "success" : "error");
     resultIcon.textContent = ok ? "✓" : "✗";
 
     // Title & meta
-    resultTitle.textContent = ok
-      ? `${data.process_name} completed successfully`
-      : `${data.process_name} encountered an error`;
+    if (queued) {
+      resultTitle.textContent = `${data.process_name} queued`;
+    } else {
+      resultTitle.textContent = ok
+        ? `${data.process_name} completed successfully`
+        : `${data.process_name} encountered an error`;
+    }
     resultTitle.style.color = ok ? "var(--success)" : "var(--error)";
 
-    resultMeta.textContent = `HTTP ${data.status_code ?? "—"}  ·  ${data.timestamp ?? ""}`;
+    resultMeta.textContent = `HTTP ${data.status_code ?? "—"}  ·  ${data.timestamp ?? ""}`
+      + (queued ? "  ·  Processing in the background — the result will arrive by email." : "");
 
     // Body
     const body = data.response ?? data.error ?? "No response body.";

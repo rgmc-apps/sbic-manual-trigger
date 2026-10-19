@@ -325,9 +325,40 @@
     return el;
   }
 
+  // Same composite key the BigQuery bridge itself already uses to decide a detail row
+  // is a duplicate (mappings.required_columns['customerpouldetailbq'] = po_ref_number +
+  // customer_name + customer_sku_code, kept='first') -- within one already-single-PO
+  // detailRows list, po_ref_number/customer_name are constant, so customer_sku_code (or
+  // the description, for blank-SKU lines) alone is the key. Without this, a PO whose
+  // Document AI extraction genuinely has every line duplicated inflates the dashboard's
+  // BQ count and "price/UOM variance" tally to look like a huge mismatch when the real
+  // line count already matches BC. Confirmed live: PO 14356975 showed "BQ: 14" / "14
+  // line(s) with variance" against BC's real 7 lines, because each line was extracted
+  // twice -- deduped, it's "BQ: 7" with no variance.
+  function dedupeBqLines(detailRows) {
+    const seen = new Set();
+    const deduped = [];
+    (detailRows || []).forEach((row) => {
+      const sku = (row.customer_sku_code || "").trim().toUpperCase();
+      const key = sku || `__NOSKU__::${(row.customer_sku_desc || "").trim().toUpperCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      deduped.push(row);
+    });
+    return deduped;
+  }
+
   // ── Detail panel (third level — detail lines + MSSQL/BC/buffer actions) ─────
   function renderDetailPanel(panel, headerRow, detailRows, uploadType) {
     const ref = refNumber(headerRow, uploadType);
+    // The raw table below still shows every extracted row, duplicates included --
+    // useful for spotting a genuine extraction problem. Only the MSSQL/BC comparison
+    // counts below use the deduped set, so "BQ: N" reflects distinct lines.
+    const dedupedDetailRows = dedupeBqLines(detailRows);
+    const duplicateCount = detailRows.length - dedupedDetailRows.length;
+    const duplicateNote = duplicateCount
+      ? ` (ignoring ${duplicateCount} duplicate BigQuery line(s))`
+      : "";
     const isPo = uploadType === "po";
     const company = (headerRow.company_name || "").trim().toUpperCase();
     const isSbicPo = isPo && (company.includes("SBIC") || company.includes("SUNCOAST"));
@@ -376,18 +407,18 @@
           resultEl.className = "dash-check-result missing";
         } else {
           const mssqlDetailRows = data.detail_data || [];
-          const comparisonRows = buildComparisonRows(detailRows, (bq) => {
+          const comparisonRows = buildComparisonRows(dedupedDetailRows, (bq) => {
             if (bq.line_index == null) return undefined;
             const m = mssqlDetailRows.find((r) => r.lineIndex === bq.line_index);
             return m ? { qty: m.poQty, uom: m.unitOfMeasurement, price: m.unitPrice } : undefined;
           });
-          const countMismatch = detailRows.length !== mssqlDetailRows.length;
+          const countMismatch = dedupedDetailRows.length !== mssqlDetailRows.length;
           const varianceCount = comparisonRows.filter((r) => r.priceVariance || r.uomVariance).length;
 
           let msg = `✓ In MSSQL (${mssqlDetailRows.length} detail line(s))`;
           let cls = "ok";
           if (countMismatch) {
-            msg += ` — ⚠ count mismatch (BQ: ${detailRows.length})`;
+            msg += ` — ⚠ count mismatch (BQ: ${dedupedDetailRows.length}${duplicateNote})`;
             cls = "warn";
           }
           if (varianceCount) {
@@ -400,7 +431,7 @@
           viewBtn.type = "button";
           viewBtn.className = "btn-link-toggle dash-view-mssql-btn";
           viewBtn.textContent = "View MSSQL Details";
-          viewBtn.addEventListener("click", () => showMssqlDetailsModal(detailRows, mssqlDetailRows));
+          viewBtn.addEventListener("click", () => showMssqlDetailsModal(dedupedDetailRows, mssqlDetailRows));
           resultEl.appendChild(viewBtn);
         }
       } catch (e) {
@@ -439,18 +470,18 @@
                 const key = (l.number || "").trim().toUpperCase();
                 if (key && !bcByItem[key]) bcByItem[key] = { qty: l.quantity, uom: l.unitOfMeasureCode, price: l.unitPrice };
               });
-              const rows = buildComparisonRows(detailRows, (bq) => {
+              const rows = buildComparisonRows(dedupedDetailRows, (bq) => {
                 const itemNo = resolvedItemNoForBqLine(bq, skuOverrides);
                 return itemNo ? bcByItem[itemNo] : undefined;
               });
-              if (detailRows.length !== (order.salesOrderLines || []).length) countMismatch = true;
+              if (dedupedDetailRows.length !== (order.salesOrderLines || []).length) countMismatch = true;
               varianceCount += rows.filter((r) => r.priceVariance || r.uomVariance).length;
             });
 
             let msg = `✓ Found in Business Central (${data.orders.length} order(s), ${bcLineCount} line(s))`;
             let cls = "ok";
             if (countMismatch) {
-              msg += ` — ⚠ count mismatch (BQ: ${detailRows.length})`;
+              msg += ` — ⚠ count mismatch (BQ: ${dedupedDetailRows.length}${duplicateNote})`;
               cls = "warn";
             }
             if (varianceCount) {
@@ -463,7 +494,7 @@
             viewBtn.type = "button";
             viewBtn.className = "btn-link-toggle dash-view-bc-btn";
             viewBtn.textContent = "View BC Details";
-            viewBtn.addEventListener("click", () => showBcDetailsModal(ref, data.orders, detailRows, skuOverrides));
+            viewBtn.addEventListener("click", () => showBcDetailsModal(ref, data.orders, dedupedDetailRows, skuOverrides));
             resultEl.appendChild(viewBtn);
           } else {
             resultEl.textContent = "✗ Not found in Business Central";
