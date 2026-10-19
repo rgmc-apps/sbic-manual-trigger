@@ -82,6 +82,7 @@
           <button class="action-tab-btn" data-action-tab="bigquery" type="button">BigQuery Lookup</button>
           <button class="action-tab-btn" data-action-tab="missing-shipto" type="button">Missing Ship-To</button>
           <button class="action-tab-btn" data-action-tab="missing-items" type="button">Missing Items</button>
+          <button class="action-tab-btn" data-action-tab="customer-shipto" type="button">Customer/Ship-To Mismatch</button>
         </div>
 
         <div class="action-tab-panel" id="action-panel-buffer">
@@ -510,6 +511,102 @@
             </div>
             <p class="status-line" id="missing-items-history-status-line"></p>
             <div class="history-list" id="missing-items-history-results-list"></div>
+          </div>
+        </div>
+
+        <!-- Customer/Ship-To Mismatch tab: find already-created BC Sales Orders whose
+             Sell-to Customer and/or Ship-to Code is wrong (not just missing, which is
+             Missing Ship-To's narrower job) and re-point both at once by picking the
+             correct ship-to address. Picking a ship-to never writes to BC directly —
+             Apply Customer/Ship-To Fixes is the one real write, re-validated fresh
+             against BC immediately before each PATCH, same as Missing Items. -->
+        <div class="action-tab-panel hidden" id="action-panel-customer-shipto">
+          <div class="toolbar">
+            <div class="form-group toolbar-select">
+              <label class="form-label" for="customer-shipto-company-select">Company</label>
+              <div class="select-wrapper">
+                <select class="form-select" id="customer-shipto-company-select">
+                  <option value="">— Select a company —</option>
+                  {% for c in companies %}
+                  <option value="{{ c }}">{{ c }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="customer-shipto-po-ref-input">PO ref number</label>
+              <input class="form-input" type="text" id="customer-shipto-po-ref-input" placeholder="e.g. 21721871 (comma-separated for multiple)" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="customer-shipto-date-from">Date from</label>
+              <input class="form-input" type="date" id="customer-shipto-date-from" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="customer-shipto-date-to">Date to</label>
+              <input class="form-input" type="date" id="customer-shipto-date-to" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="customer-shipto-customer-input">Customer name</label>
+              <input class="form-input" type="text" id="customer-shipto-customer-input" placeholder="Searches BC Sell-to Customer Name" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="customer-shipto-shipto-input">Ship-to address</label>
+              <input class="form-input" type="text" id="customer-shipto-shipto-input" placeholder="Searches BC Ship-to Addresses" />
+            </div>
+            <button class="btn-reprocess" id="customer-shipto-search-btn" type="button">
+              <span class="btn-spinner hidden" id="customer-shipto-search-spinner"></span>
+              <span id="customer-shipto-search-btn-label">Search</span>
+            </button>
+            <button class="btn-link-toggle" id="customer-shipto-history-toggle-btn" type="button">🕘 Link History</button>
+          </div>
+          <div class="details-hint sync-hint">
+            Searches Business Central directly (not the buffer) for <strong>Open</strong> Sales Orders this app's own
+            SO-import pipeline created (<code>submittedBy = "SBIC AI Uploading"</code>) — for orders whose
+            <strong>Sell-to Customer</strong> and/or <strong>Ship-to Code</strong> are already set but wrong, which
+            only a human can spot (there's nothing to auto-compare against, unlike Missing Items/Missing Ship-To).
+            <ul class="hint-list">
+              <li>Click <strong>Update Ship-To…</strong> and search for the correct Ship-to address in BC. Unlike
+                the Missing Ship-To tab, you can pick a ship-to that belongs to a <strong>different</strong> customer
+                than the order's current one — picking it queues a fix that updates <strong>both</strong> the
+                Sell-to Customer No. and the Ship-to Code together.</li>
+              <li>Picking a candidate only <strong>queues</strong> the fix — it never writes to BC directly. Click
+                <strong>Apply Customer/Ship-To Fixes</strong> above the results to actually patch every queued
+                order, re-validated fresh against BC immediately before each write.</li>
+              <li>An order successfully updated in BC is automatically removed from this list on the next search
+                (its customer/ship-to no longer matches what was queued). One that failed stays queued with the
+                reason shown, ready to retry.</li>
+            </ul>
+          </div>
+          <p class="status-line" id="customer-shipto-status-line"></p>
+          <div class="bq-insert-action hidden" id="customer-shipto-fixes-action">
+            <span class="status-line" id="customer-shipto-fixes-queued-count"></span>
+            <button class="btn-reprocess" id="customer-shipto-fixes-apply-btn" type="button">
+              <span class="btn-spinner hidden" id="customer-shipto-fixes-apply-spinner"></span>
+              <span id="customer-shipto-fixes-apply-btn-label">Apply Customer/Ship-To Fixes</span>
+            </button>
+          </div>
+          <div class="order-list" id="customer-shipto-results-list"></div>
+
+          <!-- Customer/Ship-To Link History: searchable, append-only record of every
+               Apply attempt (applied/already_present/failed) by PO ref or order number. -->
+          <div class="shipto-history-panel hidden" id="customer-shipto-history-panel">
+            <h3 class="shipto-history-title">Customer/Ship-To Link History</h3>
+            <p class="details-hint">
+              Every Apply Customer/Ship-To Fixes attempt ever made, searchable by PO ref or BC order number —
+              including ones that failed, with the reason.
+            </p>
+            <div class="toolbar">
+              <div class="form-group toolbar-select">
+                <label class="form-label" for="customer-shipto-history-search-input">PO ref or order number</label>
+                <input class="form-input" type="text" id="customer-shipto-history-search-input" placeholder="e.g. 21721871 or SBSO260125" />
+              </div>
+              <button class="btn-reprocess" id="customer-shipto-history-search-btn" type="button">
+                <span class="btn-spinner hidden" id="customer-shipto-history-search-spinner"></span>
+                <span id="customer-shipto-history-search-btn-label">Search</span>
+              </button>
+            </div>
+            <p class="status-line" id="customer-shipto-history-status-line"></p>
+            <div class="history-list" id="customer-shipto-history-results-list"></div>
           </div>
         </div>
 

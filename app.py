@@ -1782,6 +1782,228 @@ def api_apply_missing_item_fixes():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+def _find_orders_for_customer_shipto_mismatch(
+    company: str, po_ref_number: str, date_from: str, date_to: str, customer_name: str, ship_to_search: str,
+) -> list:
+    """Open BC Sales Orders (submittedBy == "SBIC AI Uploading") for manual review/
+    correction of a wrong Sell-to Customer and/or Ship-to Code — the Customer/Ship-To
+    Mismatch tab's search. Unlike _find_orders_missing_shipto, this is NOT restricted to
+    a blank Ship-to Code: the point here is an order whose customer/ship-to is already
+    SET but wrong, which a human has to spot visually, not something this search can
+    auto-detect (there's no "correct" value to compare against). status eq 'Open' is
+    still enforced (same as every other sales-order fix tab) since BC rejects a PATCH to
+    a Released order's header.
+
+    customer_name filters by contains(sellToCustomerName, ...) directly (the field
+    already lives on the order row). ship_to_search is a two-step filter: first finds
+    every BC ship-to address whose name contains the term, then ORs the order search by
+    THOSE shipToCode values — sales order rows only carry a bare shipToCode, not a
+    readable address name, so there's nothing on the order itself to substring-match
+    against directly.
+    """
+    conditions = [f"submittedBy eq '{_SBIC_AI_SUBMITTED_BY}'", "status eq 'Open'"]
+    if po_ref_number:
+        refs = _split_po_refs(po_ref_number)
+        if len(refs) == 1:
+            conditions.append(f"externalDocumentNo eq '{refs[0]}'")
+        elif refs:
+            conditions.append("(" + " or ".join(f"externalDocumentNo eq '{r}'" for r in refs) + ")")
+    if date_from:
+        conditions.append(f"orderDate ge {date_from}")
+    if date_to:
+        conditions.append(f"orderDate le {date_to}")
+    if customer_name:
+        # Not tolower() -- see _multi_field_contains_search's docstring: BC's custom API
+        # pages return zero rows through tolower(), and RGMC/SBIC data entry is all caps
+        # anyway, so uppercasing the search term reproduces case-insensitive matching.
+        esc = customer_name.replace("'", "''").upper()
+        conditions.append(f"contains(sellToCustomerName,'{esc}')")
+    if ship_to_search:
+        esc = ship_to_search.replace("'", "''").upper()
+        resp = _bc_api("GET", "/bc/custom/v2/ship-to-addresses", params={
+            "company": company, "filter": f"contains(name,'{esc}')",
+        })
+        body, status_code = _proxy_json(resp)
+        if status_code != 200:
+            raise RuntimeError(body.get("detail") or body.get("error") or f"BC returned {status_code} searching ship-to addresses")
+        codes = sorted({(r.get("code") or "").strip() for r in (body.get("data") or []) if r.get("code")})
+        if not codes:
+            return []  # no BC ship-to address matched this text at all -- nothing to OR against
+        esc_codes = [c.replace("'", "''") for c in codes]
+        conditions.append("(" + " or ".join(f"shipToCode eq '{c}'" for c in esc_codes) + ")")
+
+    odata_filter = " and ".join(conditions)
+    resp = _bc_api("GET", "/bc/custom/v2/sales-orders", params={"company": company, "filter": odata_filter})
+    body, status_code = _proxy_json(resp)
+    if status_code != 200:
+        raise RuntimeError(body.get("detail") or body.get("error") or f"BC returned {status_code}")
+    return body.get("data") or []
+
+
+@app.route("/api/sales-orders/customer-shipto-mismatch")
+def api_sales_orders_customer_shipto_mismatch():
+    """Open BC Sales Orders (submittedBy == "SBIC AI Uploading") for the Customer/Ship-To
+    Mismatch tab — see _find_orders_for_customer_shipto_mismatch. Read-only: nothing here
+    ever changes an existing Sales Order."""
+    company = (request.args.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    po_ref_number = (request.args.get("po_ref_number") or "").strip()
+    date_from = (request.args.get("date_from") or "").strip()
+    date_to = (request.args.get("date_to") or "").strip()
+    customer_name = (request.args.get("customer_name") or "").strip()
+    ship_to_search = (request.args.get("ship_to_search") or "").strip()
+    try:
+        orders = _find_orders_for_customer_shipto_mismatch(
+            company, po_ref_number, date_from, date_to, customer_name, ship_to_search,
+        )
+        return jsonify({"data": orders, "total": len(orders)})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route("/api/sales-orders/customer-shipto-fixes", methods=["GET"])
+def api_list_customer_shipto_fixes():
+    """Queued/attempted customer+ship-to fixes — lets the Customer/Ship-To Mismatch tab
+    show which rows already have a fix queued without re-deriving that from the BC
+    search itself."""
+    params = {}
+    company = (request.args.get("company") or "").strip()
+    if company:
+        params["company"] = company
+    applied = request.args.get("applied")
+    if applied is not None:
+        params["applied"] = applied
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/customer-shipto-fixes", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/customer-shipto-fixes", methods=["POST"])
+def api_queue_customer_shipto_fix():
+    """Queue one customer+ship-to correction — picking a ship-to address (whether it
+    belongs to the order's current customer or a different one) only ever writes here.
+    Apply Customer/Ship-To Fixes is the one real write to BC, same two-step shape as
+    every other link-then-apply flow in this app.
+
+    Re-queries Business Central fresh server-side via _find_orders_for_customer_shipto_mismatch
+    rather than trusting the client-supplied order_id for anything but WHICH result to
+    act on, same safety principle api_queue_shipto_fix already uses -- an order_id that
+    didn't come back from that fresh query (already fixed by someone else, no longer
+    Open, or no longer submittedBy "SBIC AI Uploading") is rejected rather than silently
+    queued. Unlike api_queue_shipto_fix, a ship-to belonging to a DIFFERENT customer than
+    the order's current one is explicitly ALLOWED here -- that's this tab's whole reason
+    to exist.
+    """
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip()
+    order_id = (data.get("order_id") or "").strip()
+    new_ship_to_code = (data.get("new_ship_to_code") or "").strip()
+    new_ship_to_name = (data.get("new_ship_to_name") or "").strip()
+    new_customer_no = (data.get("new_customer_no") or "").strip()
+    new_customer_name = (data.get("new_customer_name") or "").strip()
+    source = (data.get("source") or "").strip()
+
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    if not order_id:
+        return jsonify({"error": "order_id is required"}), 400
+    if not new_ship_to_code:
+        return jsonify({"error": "new_ship_to_code is required"}), 400
+    if not new_customer_no:
+        return jsonify({"error": "new_customer_no is required"}), 400
+
+    try:
+        orders = _find_orders_for_customer_shipto_mismatch(company, "", "", "", "", "")
+    except (requests.RequestException, RuntimeError) as exc:
+        return jsonify({"error": f"Could not search Business Central: {exc}"}), 502
+
+    order = next((o for o in orders if o.get("id") == order_id), None)
+    if not order:
+        return jsonify({
+            "error": "This order no longer matches (it may have changed status, company, or submittedBy "
+                     "since the lookup ran) — refresh and try again."
+        }), 409
+
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/customer-shipto-fixes", json={
+            "company": company,
+            "order_id": order_id,
+            "order_no": order.get("number") or "",
+            "po_ref": order.get("externalDocumentNo") or "",
+            "current_customer_no": order.get("sellToCustomerNo") or "",
+            "current_customer_name": order.get("sellToCustomerName") or "",
+            "current_ship_to_code": order.get("shipToCode") or "",
+            "new_customer_no": new_customer_no,
+            "new_customer_name": new_customer_name,
+            "new_ship_to_code": new_ship_to_code,
+            "new_ship_to_name": new_ship_to_name,
+            "resolved_by": (data.get("resolved_by") or "").strip(),
+            "source": source,
+        })
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/customer-shipto-fixes/<fix_id>", methods=["DELETE"])
+def api_cancel_customer_shipto_fix(fix_id):
+    """Cancel a queued customer/ship-to fix before an Apply run has picked it up."""
+    try:
+        resp = _bc_api("DELETE", f"/bc/custom/v2/so-buffer/customer-shipto-fixes/{fix_id}")
+        if resp.status_code == 204:
+            return "", 204
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/sales-orders/customer-shipto-fix-history")
+def api_customer_shipto_fix_history():
+    """Search the append-only customer/ship-to fix attempt history — every Apply run's
+    outcome (applied/already_present/failed), by PO ref or order number."""
+    params = {}
+    for key in ("po_ref", "order_no", "company", "outcome"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/customer-shipto-fix-history", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/apply-customer-shipto-fixes", methods=["POST"])
+def api_apply_customer_shipto_fixes():
+    """Apply every pending queued customer/ship-to fix for a company — synchronous (like
+    Apply Missing Item Fixes, unlike Apply Ship-To Fixes): re-pointing a header's
+    Sell-to Customer No. and/or Ship-to Code is one existing BC PATCH call, re-validated
+    fresh against BC immediately before each write, so no Pub/Sub + rgmc-worker-pool
+    round-trip is needed. Optionally scoped to specific order_ids."""
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "company is required"}), 400
+    payload = {"company": company, "applied_by": data.get("applied_by") or ""}
+    if data.get("order_ids"):
+        payload["order_ids"] = data["order_ids"]
+    try:
+        resp = _bc_api("POST", "/bc/custom/v2/so-buffer/customer-shipto-fixes/apply", json=payload, timeout=90)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/api/sales-orders")
 def api_sales_orders():
     """Look up existing BC Sales Orders by customer number — used by the Overrides
