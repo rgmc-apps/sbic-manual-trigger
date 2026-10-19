@@ -3166,6 +3166,78 @@ def api_dashboard_bc_status():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/dashboard/queue-missing-items", methods=["POST"])
+def api_dashboard_queue_missing_items():
+    """Bulk-queue missing Sales Order lines for one or more PO refs that already have an
+    Open order in Business Central — a one-click shortcut from the Upload Dashboard's BC
+    comparison view straight into the same so_missing_item_fixes_{env} Firestore buffer
+    the Missing Items tab reads from, so Transfer to BC there picks these up too. Reuses
+    _find_missing_items (same matching rules as the Missing Items tab) instead of
+    re-deriving the comparison from whatever the dashboard already has client-side, so an
+    order/line only ever gets queued from a fresh, server-validated BC + BigQuery read.
+
+    Still only ever QUEUES — see _find_missing_items/api_queue_missing_item_fix, the one
+    real BC write stays behind Apply Missing Item Fixes on the Buffer Reconciliation page.
+    Only a "ready" item (same readiness bar the Missing Items tab's own one-click Queue
+    button requires — a resolved BC item AND a BC-valid Unit of Measure) gets queued;
+    "needs_linking"/"needs_uom" items are reported back as skipped rather than queued
+    with an item_no/UOM that Apply would just reject.
+
+    po_ref_number may be a single ref or a comma-separated list (e.g. every PO ref under
+    one uploaded file) — _build_missing_items_filter already ORs multiple refs into one
+    BC search, so this naturally scopes to "every PO under this file that's both in BC
+    and still has a missing line," with no separate per-PO looping needed here."""
+    data = request.get_json(silent=True) or {}
+    company = (data.get("company") or "").strip().upper()
+    po_ref_number = (data.get("po_ref_number") or "").strip()
+    if company != "SBIC":
+        return jsonify({"error": "Only company=SBIC is supported here"}), 400
+    if not po_ref_number:
+        return jsonify({"error": "po_ref_number is required"}), 400
+
+    try:
+        groups = _find_missing_items(company, po_ref_number, "", "")
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    queued, skipped, errors = [], [], []
+    for group in groups:
+        order = group["order"]
+        po_ref = order.get("externalDocumentNo") or ""
+        for item in group["missing_items"]:
+            label = item.get("customer_sku_code") or item.get("customer_sku_desc") or item["sku_key"]
+            if item["status"] != "ready":
+                skipped.append({"po_ref": po_ref, "sku": label, "reason": item["status"]})
+                continue
+            resolved_item = item.get("resolved_item") or {}
+            try:
+                resp = _bc_api("POST", "/bc/custom/v2/so-buffer/missing-item-fixes", json={
+                    "company": company, "order_id": order.get("id"), "order_no": order.get("number") or "",
+                    "po_ref": po_ref, "sku_key": item["sku_key"],
+                    "customer_sku_code": item.get("customer_sku_code") or "",
+                    "customer_sku_desc": item.get("customer_sku_desc") or "",
+                    "item_no": resolved_item.get("itemNo"), "item_description": resolved_item.get("description") or "",
+                    "po_qty": item.get("po_qty") or 0, "unit_of_measurement": item.get("unit_of_measurement") or "",
+                    "unit_price": item.get("unit_price") or 0, "resolved_by": "upload-dashboard",
+                })
+                body, status_code = _proxy_json(resp)
+                if status_code == 201:
+                    queued.append({"po_ref": po_ref, "item_no": resolved_item.get("itemNo"), "sku": label})
+                else:
+                    errors.append({"po_ref": po_ref, "sku": label, "detail": body.get("detail") or body.get("error") or f"HTTP {status_code}"})
+            except requests.RequestException as exc:
+                errors.append({"po_ref": po_ref, "sku": label, "detail": f"Could not reach rgmc-bc-api: {exc}"})
+
+    return jsonify({
+        "orders_with_missing_items": len(groups),
+        "queued": queued, "queued_count": len(queued),
+        "skipped": skipped, "skipped_count": len(skipped),
+        "errors": errors, "errors_count": len(errors),
+    })
+
+
 @app.route("/api/dashboard/add-to-buffer", methods=["POST"])
 def api_dashboard_add_to_buffer():
     """Add a PO (not yet in Business Central) to the SO-import buffer — thin wrapper

@@ -130,6 +130,23 @@
 .dash-variance-row { background: var(--warn-bg); }
 .dash-variance-cell { color: var(--warn-text); font-weight: 700; }
 
+/* "Missing from BC" section + its Add-to-buffer action, inside the View BC Details
+   modal (Check Business Central) — same color tokens as the variance banner above. */
+.dash-missing-items-block { margin-top: 16px; }
+.dash-missing-items-summary { margin: 0 0 10px; font-size: .8125rem; font-weight: 600; }
+.dash-missing-items-summary.ok { color: var(--success-text); }
+.dash-missing-items-summary.warn {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+}
+.dash-queue-missing-action { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dash-queue-missing-result { font-size: .8125rem; font-weight: 600; }
+.dash-queue-missing-result.ok { color: var(--success-text); }
+.dash-queue-missing-result.warn { color: var(--error-text); }
+
 @media (max-width: 720px) {
   .dash-file-name { max-width: 100%; }
 }

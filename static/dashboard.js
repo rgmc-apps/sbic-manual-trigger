@@ -153,6 +153,7 @@
         </div>
         <div class="dash-file-actions">
           <button class="btn-link-toggle dash-view-file-btn" type="button">View file</button>
+          ${uploadType === "po" ? `<button class="btn-reprocess dash-queue-file-btn" type="button">Queue Missing Items</button>` : ""}
           <button class="btn-history-toggle dash-expand-btn" type="button">Expand ▾</button>
         </div>
       </div>
@@ -160,6 +161,7 @@
     `;
 
     const viewFileBtn = row.querySelector(".dash-view-file-btn");
+    const queueFileBtn = row.querySelector(".dash-queue-file-btn");
     const expandBtn = row.querySelector(".dash-expand-btn");
     const refsListEl = row.querySelector(".dash-refs-list");
 
@@ -208,6 +210,45 @@
       if (opening) loadRefs();
     });
 
+    if (queueFileBtn) {
+      queueFileBtn.addEventListener("click", async () => {
+        queueFileBtn.disabled = true;
+        const orig = queueFileBtn.textContent;
+        queueFileBtn.textContent = "Checking refs…";
+        try {
+          await loadRefs();
+          const sbicRefs = Array.from(refsListEl.querySelectorAll(".dash-ref-row"))
+            .filter((r) => {
+              const c = (r.dataset.company || "").toUpperCase();
+              return c.includes("SBIC") || c.includes("SUNCOAST");
+            })
+            .map((r) => r.dataset.ref)
+            .filter(Boolean);
+          if (!sbicRefs.length) {
+            setStatus("No SBIC PO ref(s) found under this file — Missing Items queuing only applies to SBIC.", true);
+            return;
+          }
+          queueFileBtn.textContent = `Queuing ${sbicRefs.length} PO(s)…`;
+          const res = await fetch("/api/dashboard/queue-missing-items", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ company: "SBIC", po_ref_number: sbicRefs.join(",") }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || data.detail || "Queue failed");
+          let msg = `✓ Checked ${sbicRefs.length} SBIC PO(s) — ${data.orders_with_missing_items} had missing items, queued ${data.queued_count} item(s) to the buffer`;
+          if (data.skipped_count) msg += `; ${data.skipped_count} need linking/UOM resolution on the Missing Items tab`;
+          if (data.errors_count) msg += `; ${data.errors_count} failed`;
+          setStatus(msg, !!data.errors_count);
+        } catch (e) {
+          setStatus("Could not queue missing items for this file: " + e.message, true);
+        } finally {
+          queueFileBtn.disabled = false;
+          queueFileBtn.textContent = orig;
+        }
+      });
+    }
+
     // A ref-number search is really asking "show me what's in the file(s) containing
     // this ref" — auto-expanding every result (rather than requiring an extra click
     // per file) gets straight to the highlighted row(s) the search was for.
@@ -244,6 +285,8 @@
     const el = document.createElement("div");
     el.className = "dash-ref-row" + (isHighlighted ? " is-highlighted" : "");
     const isPo = uploadType === "po";
+    el.dataset.ref = ref || "";
+    el.dataset.company = isPo ? (row.company_name || "") : "";
     el.innerHTML = `
       <div class="dash-ref-head">
         <span class="order-ref">${escapeHtml(ref || "(no ref)")}</span>
@@ -572,8 +615,76 @@
     return ((override && override.itemNo) || sku || "").trim().toUpperCase();
   }
 
+  // Items counted "missing" here use the same SKU-override-then-raw-SKU resolution as
+  // the Missing Items tab's own matching (resolvedItemNoForBqLine), so what's shown
+  // here lines up with what Queue would actually find — but the real readiness check
+  // (resolved item AND a BC-valid Unit of Measure) only happens server-side in
+  // _find_missing_items when the queue button is clicked; a row shown as "missing"
+  // here may still come back "skipped" if it needs linking or UOM resolution first.
+  function renderMissingItemsSection(missingRows, bqTotal) {
+    if (!missingRows.length) {
+      return `<p class="dash-missing-items-summary ok">✓ All ${bqTotal} BigQuery item(s) are already in this BC order.</p>`;
+    }
+    const bodyRows = missingRows.map((r) => `
+      <tr>
+        <td>${escapeHtml(r.sku)}</td>
+        <td>${escapeHtml(r.bqQty ?? "—")}</td>
+        <td>${escapeHtml(r.bqUom || "—")}</td>
+        <td>${escapeHtml(r.bqPrice ?? "—")}</td>
+      </tr>
+    `).join("");
+    return `
+      <div class="dash-missing-items">
+        <p class="dash-missing-items-summary warn">⚠ ${missingRows.length} of ${bqTotal} BigQuery item(s) are missing from this BC order.</p>
+        <div class="modal-table-wrap">
+          <table class="modal-so-table">
+            <thead><tr><th>SKU/Item</th><th>BQ Qty</th><th>BQ UOM</th><th>BQ Price</th></tr></thead>
+            <tbody>${bodyRows}</tbody>
+          </table>
+        </div>
+        <div class="dash-queue-missing-action">
+          <button class="btn-reprocess dash-queue-missing-btn" type="button">Add Missing Items to Buffer</button>
+          <span class="dash-queue-missing-result"></span>
+        </div>
+      </div>
+    `;
+  }
+
+  // Only ever queues to the so_missing_item_fixes Firestore buffer — see
+  // /api/dashboard/queue-missing-items. The real BC write stays behind Apply Missing
+  // Item Fixes on the Buffer Reconciliation page, same queue-then-apply shape as every
+  // other link in this app.
+  async function queueMissingItemsToBuffer(btn, resultEl, poRefNumber) {
+    btn.disabled = true;
+    resultEl.textContent = "Queuing…";
+    resultEl.className = "dash-queue-missing-result";
+    try {
+      const res = await fetch("/api/dashboard/queue-missing-items", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company: "SBIC", po_ref_number: poRefNumber }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Queue failed");
+      let msg = `✓ Queued ${data.queued_count} item(s) to the buffer`;
+      if (data.skipped_count) msg += ` — ${data.skipped_count} need linking/UOM resolution on the Missing Items tab`;
+      if (data.errors_count) msg += ` — ${data.errors_count} failed`;
+      resultEl.textContent = msg;
+      resultEl.className = "dash-queue-missing-result " + (data.errors_count ? "warn" : "ok");
+      if (data.queued_count && !data.errors_count) {
+        btn.remove();
+      } else {
+        btn.disabled = false;
+      }
+    } catch (e) {
+      resultEl.textContent = "Error: " + e.message;
+      resultEl.className = "dash-queue-missing-result warn";
+      btn.disabled = false;
+    }
+  }
+
   function showBcDetailsModal(searchedRef, orders, bqDetailRows, skuOverrides) {
-    const html = (orders || []).map((order, i) => {
+    const orderData = (orders || []).map((order) => {
       const bcLines = order.salesOrderLines || [];
       const bcByItem = {};
       bcLines.forEach((l) => {
@@ -586,21 +697,38 @@
         const itemNo = resolvedItemNoForBqLine(bq, skuOverrides);
         return itemNo ? bcByItem[itemNo] : undefined;
       });
-      const countMismatch = bqDetailRows.length !== bcLines.length;
-      return `
-        <div class="dash-bc-order-block"${i > 0 ? ' style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border);"' : ""}>
-          <p class="modal-subtitle">
-            Order <strong>${escapeHtml(order.number || "—")}</strong> &middot;
-            Status: ${escapeHtml(order.status || "—")} &middot;
-            Sell-to: ${escapeHtml(order.sellToCustomerName || order.sellToCustomerNo || "—")} &middot;
-            Order date: ${escapeHtml(order.orderDate || "—")} &middot;
-            PO ref: ${escapeHtml(order.externalDocumentNo || searchedRef || "—")}
-          </p>
-          ${renderComparisonTable(rows, countMismatch, bqDetailRows.length, bcLines.length, "BC")}
-        </div>
-      `;
-    }).join("");
+      return {
+        order, bcLines, rows,
+        countMismatch: bqDetailRows.length !== bcLines.length,
+        missingRows: rows.filter((r) => !r.found),
+        poRef: order.externalDocumentNo || searchedRef || "",
+      };
+    });
+
+    const html = orderData.map((od, i) => `
+      <div class="dash-bc-order-block" data-order-index="${i}"${i > 0 ? ' style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border);"' : ""}>
+        <p class="modal-subtitle">
+          Order <strong>${escapeHtml(od.order.number || "—")}</strong> &middot;
+          Status: ${escapeHtml(od.order.status || "—")} &middot;
+          Sell-to: ${escapeHtml(od.order.sellToCustomerName || od.order.sellToCustomerNo || "—")} &middot;
+          Order date: ${escapeHtml(od.order.orderDate || "—")} &middot;
+          PO ref: ${escapeHtml(od.poRef || "—")}
+        </p>
+        ${renderComparisonTable(od.rows, od.countMismatch, bqDetailRows.length, od.bcLines.length, "BC")}
+        <div class="dash-missing-items-block">${renderMissingItemsSection(od.missingRows, bqDetailRows.length)}</div>
+      </div>
+    `).join("");
+
     openDetailsModal("Business Central Details — BQ vs BC Comparison", html || "<p>No orders to show.</p>");
+
+    orderData.forEach((od, i) => {
+      if (!od.missingRows.length) return;
+      const block = detailsModalBody.querySelector(`.dash-bc-order-block[data-order-index="${i}"]`);
+      const btn = block && block.querySelector(".dash-queue-missing-btn");
+      const resultEl = block && block.querySelector(".dash-queue-missing-result");
+      if (!btn || !resultEl) return;
+      btn.addEventListener("click", () => queueMissingItemsToBuffer(btn, resultEl, od.poRef));
+    });
   }
 
   function showMssqlDetailsModal(bqDetailRows, mssqlDetailRows) {
