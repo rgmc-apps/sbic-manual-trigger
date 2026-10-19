@@ -3906,6 +3906,9 @@
         PO ref: ${escapeHtml(poRef || "—")} &middot;
         Order date: ${escapeHtml(order.orderDate || "—")}
       </div>
+      <div class="order-detail bq-branch-detail">
+        BigQuery branch on file: <strong>${escapeHtml(order.bqCustomerBranchName || "—")}</strong>
+      </div>
       <div class="search-hint search-loading shipto-queuing-status hidden">
         <span class="btn-spinner"></span> <span class="queuing-text"></span>
       </div>

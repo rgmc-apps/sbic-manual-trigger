@@ -1840,11 +1840,54 @@ def _find_orders_for_customer_shipto_mismatch(
     return body.get("data") or []
 
 
+def _fetch_bq_customer_branch_names(po_refs: list) -> dict:
+    """po_ref -> BigQuery int_document_ai's customer_branch_name (the raw Document-AI-
+    extracted branch text, as originally uploaded) — shown alongside each Customer/
+    Ship-To Mismatch result so a human has the ORIGINAL branch text to compare against
+    BC's current (possibly wrong) ship-to, without leaving the page. Batched via the
+    same document-ai/search IN UNNEST(...) endpoint _fetch_expected_lines_batch already
+    uses for the Missing Items tab, chunked by 100 refs per call.
+
+    Rows come back ordered by created_at DESC (search_document_ai's own ORDER BY), so
+    the first row seen per po_ref is the most recent extraction — same "latest wins"
+    convention _fetch_customerpoul_branch_info's Cloud SQL equivalent uses, just sourced
+    from BigQuery directly instead of the promoted CustomerPOUL table, per this tab's
+    own ask (BigQuery, not Cloud SQL).
+    """
+    unique_refs = sorted({r for r in po_refs if r})
+    if not unique_refs:
+        return {}
+    chunks = [unique_refs[i:i + 100] for i in range(0, len(unique_refs), 100)]
+
+    def _fetch_chunk(chunk):
+        try:
+            resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params={
+                "po_ref_number": ",".join(chunk),
+            }, timeout=90)
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                return body.get("data") or []
+        except requests.RequestException:
+            pass
+        return []
+
+    by_ref: dict = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(chunks))) as ex:
+        for rows in ex.map(_fetch_chunk, chunks):
+            for r in rows:
+                ref = r.get("po_ref_number")
+                if ref and ref not in by_ref:
+                    by_ref[ref] = r.get("customer_branch_name") or ""
+    return by_ref
+
+
 @app.route("/api/sales-orders/customer-shipto-mismatch")
 def api_sales_orders_customer_shipto_mismatch():
     """Open BC Sales Orders (submittedBy == "SBIC AI Uploading") for the Customer/Ship-To
     Mismatch tab — see _find_orders_for_customer_shipto_mismatch. Read-only: nothing here
-    ever changes an existing Sales Order."""
+    ever changes an existing Sales Order. Each order is enriched with bqCustomerBranchName
+    (see _fetch_bq_customer_branch_names) so the UI can show the original BigQuery-
+    extracted branch alongside BC's current customer/ship-to."""
     company = (request.args.get("company") or "").strip()
     if not company:
         return jsonify({"error": "company is required"}), 400
@@ -1857,6 +1900,9 @@ def api_sales_orders_customer_shipto_mismatch():
         orders = _find_orders_for_customer_shipto_mismatch(
             company, po_ref_number, date_from, date_to, customer_name, ship_to_search,
         )
+        branch_by_ref = _fetch_bq_customer_branch_names([o.get("externalDocumentNo") for o in orders])
+        for o in orders:
+            o["bqCustomerBranchName"] = branch_by_ref.get(o.get("externalDocumentNo") or "", "")
         return jsonify({"data": orders, "total": len(orders)})
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
