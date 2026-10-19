@@ -627,6 +627,29 @@
 .search-results { margin-top: 8px; }
 .search-hint { font-size: .74rem; color: var(--text-muted); padding: 4px 2px; }
 
+/* BC-backed autocomplete dropdown for a toolbar filter input (e.g. Customer/Ship-To
+   Mismatch tab's Customer name / Ship-to address fields) — floats below the input
+   instead of pushing the rest of the toolbar down, since toolbar fields sit in a single
+   row. .toolbar-suggest-wrap just needs position:relative so the dropdown anchors to
+   its own input, not the whole toolbar. */
+.toolbar-suggest-wrap { position: relative; }
+.toolbar-suggest-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin-top: 4px;
+  padding: 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .14);
+  max-height: 260px;
+  overflow-y: auto;
+}
+.toolbar-suggest-dropdown .candidate-list { margin-bottom: 0; }
+
 /* ── History ── */
 .history-section { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
 .btn-history-toggle {

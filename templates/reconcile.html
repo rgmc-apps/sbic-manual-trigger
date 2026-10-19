@@ -545,13 +545,15 @@
               <label class="form-label" for="customer-shipto-date-to">Date to</label>
               <input class="form-input" type="date" id="customer-shipto-date-to" />
             </div>
-            <div class="form-group">
+            <div class="form-group toolbar-suggest-wrap">
               <label class="form-label" for="customer-shipto-customer-input">Customer name</label>
-              <input class="form-input" type="text" id="customer-shipto-customer-input" placeholder="Searches BC Sell-to Customer Name" />
+              <input class="form-input" type="text" id="customer-shipto-customer-input" placeholder="Searches BC Sell-to Customer Name" autocomplete="off" />
+              <div class="toolbar-suggest-dropdown hidden" id="customer-shipto-customer-suggest"></div>
             </div>
-            <div class="form-group">
+            <div class="form-group toolbar-suggest-wrap">
               <label class="form-label" for="customer-shipto-shipto-input">Ship-to address</label>
-              <input class="form-input" type="text" id="customer-shipto-shipto-input" placeholder="Searches BC Ship-to Addresses" />
+              <input class="form-input" type="text" id="customer-shipto-shipto-input" placeholder="Searches BC Ship-to Addresses" autocomplete="off" />
+              <div class="toolbar-suggest-dropdown hidden" id="customer-shipto-shipto-suggest"></div>
             </div>
             <button class="btn-reprocess" id="customer-shipto-search-btn" type="button">
               <span class="btn-spinner hidden" id="customer-shipto-search-spinner"></span>

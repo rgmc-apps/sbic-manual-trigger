@@ -71,7 +71,9 @@
   const customerShiptoDateFrom       = document.getElementById("customer-shipto-date-from");
   const customerShiptoDateTo         = document.getElementById("customer-shipto-date-to");
   const customerShiptoCustomerInput  = document.getElementById("customer-shipto-customer-input");
+  const customerShiptoCustomerSuggest = document.getElementById("customer-shipto-customer-suggest");
   const customerShiptoShiptoInput    = document.getElementById("customer-shipto-shipto-input");
+  const customerShiptoShiptoSuggest  = document.getElementById("customer-shipto-shipto-suggest");
   const customerShiptoSearchBtn      = document.getElementById("customer-shipto-search-btn");
   const customerShiptoStatusLine     = document.getElementById("customer-shipto-status-line");
   const customerShiptoResultsList    = document.getElementById("customer-shipto-results-list");
@@ -4127,6 +4129,76 @@
 
   customerShiptoSearchBtn.addEventListener("click", searchCustomerShiptoMismatch);
   customerShiptoPoRefInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchCustomerShiptoMismatch(); });
+
+  // BC-backed autocomplete for a toolbar filter input — debounced search-as-you-type,
+  // rendered via the same renderCandidateList/normalizeCandidates the resolution
+  // pickers already use, just floated in a dropdown (.toolbar-suggest-dropdown) instead
+  // of an inline block, since this sits in a single-row toolbar. Picking a suggestion
+  // fills the field with BC's own exact name and immediately re-runs the search — the
+  // field itself still just free-texts into the existing contains(...) filter
+  // server-side, so typing without ever picking a suggestion keeps working exactly as
+  // before.
+  function wireToolbarSuggest(inputEl, dropdownEl, fetchCandidates, candidateType) {
+    let timer = null;
+    function hide() {
+      dropdownEl.classList.add("hidden");
+      dropdownEl.innerHTML = "";
+    }
+    inputEl.addEventListener("input", () => {
+      clearTimeout(timer);
+      const term = inputEl.value.trim();
+      if (term.length < 2) { hide(); return; }
+      timer = setTimeout(async () => {
+        dropdownEl.classList.remove("hidden");
+        dropdownEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Looking up BC…</div>`;
+        try {
+          const rows = await fetchCandidates(term);
+          if (inputEl.value.trim() !== term) return; // stale response guard
+          if (!rows.length) {
+            dropdownEl.innerHTML = `<div class="search-hint">No matches.</div>`;
+            return;
+          }
+          renderCandidateList(dropdownEl, candidateType, normalizeCandidates(candidateType, rows), (candidate) => {
+            inputEl.value = candidate.name || "";
+            hide();
+            searchCustomerShiptoMismatch();
+          });
+        } catch (e) {
+          if (inputEl.value.trim() !== term) return;
+          dropdownEl.innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`;
+        }
+      }, 300);
+    });
+    // Delayed so a click on a dropdown item registers (mousedown→click) before blur
+    // hides it out from under the cursor.
+    inputEl.addEventListener("blur", () => setTimeout(hide, 150));
+    inputEl.addEventListener("focus", () => {
+      if (inputEl.value.trim().length >= 2 && dropdownEl.innerHTML.trim()) dropdownEl.classList.remove("hidden");
+    });
+  }
+
+  async function fetchBcCustomerSuggestions(term) {
+    const company = customerShiptoCompanySelect.value;
+    if (!company) throw new Error("Select a company above first.");
+    const res = await fetch(`/api/lookup/customers?search=${encodeURIComponent(term)}&company=${encodeURIComponent(company)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
+    return data.data || [];
+  }
+
+  async function fetchBcShipToSuggestions(term) {
+    const company = customerShiptoCompanySelect.value;
+    if (!company) throw new Error("Select a company above first.");
+    const res = await fetch(`/api/lookup/ship-to?search=${encodeURIComponent(term)}&company=${encodeURIComponent(company)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
+    return data.data || [];
+  }
+
+  wireToolbarSuggest(customerShiptoCustomerInput, customerShiptoCustomerSuggest, fetchBcCustomerSuggestions, "customer");
+  wireToolbarSuggest(customerShiptoShiptoInput, customerShiptoShiptoSuggest, fetchBcShipToSuggestions, "branch");
+  // Enter still runs a plain free-text search even if the suggestion dropdown never
+  // opened/was dismissed — wireToolbarSuggest only handles picking a suggestion.
   customerShiptoCustomerInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchCustomerShiptoMismatch(); });
   customerShiptoShiptoInput.addEventListener("keydown", (e) => { if (e.key === "Enter") searchCustomerShiptoMismatch(); });
 
