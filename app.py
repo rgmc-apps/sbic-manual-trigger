@@ -1603,7 +1603,10 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
                 "customer_sku_desc": (line.get("customerSKUDesc") or "").strip(),
                 "po_qty": line.get("poQty"),
                 "unit_of_measurement": raw_uom,
-                "unit_price": line.get("unitPrice"),
+                # Net price (post-discount) is the real basis for the line — unit price
+                # alone ignores whatever discount Document AI also extracted. Falls back
+                # to unit price when net price is 0 (not every PO has one extracted).
+                "unit_price": line.get("netPrice") or line.get("unitPrice"),
                 "resolved_item": resolved_item,
                 "resolved_item_no": resolved_item_no,
                 "uom_key": uom_key,

@@ -3,366 +3,314 @@
 ## Goal
 
 Maintain and extend the SO-import buffer reconciliation ecosystem for RGMC/SBIC across four
-repos: `rgmc-gcp-api` (BigQuery/MSSQL bridge), `rgmc-bc-api` (BC/Firestore buffer API),
-`rgmc-worker-pool` (Pub/Sub SO-import worker — untouched this session), and
-`sbic-manual-trigger-page` (the `/reconcile` + `/` Flask UI, this repo). This session's concrete
-asks, roughly in order:
+repos: `rgmc-gcp-api` (`C:\RGMC\Source\git\rgmc-gcp-api` — BigQuery/MSSQL bridge + BC trigger
+endpoints), `rgmc-bc-api` (`C:\claude\rgmc-bc-api` — BC/Firestore buffer API), `rgmc-worker-pool`
+(`C:\claude\rgmc-worker-pool` — Cloud Run Worker Pool, Pub/Sub-driven BC writes), and
+`sbic-manual-trigger-page` (`C:\claude\sbic-manual-trigger-page`, this repo — the `/`, `/trigger`,
+and `/reconcile` Flask UI). This session's concrete asks, in order, each already covered by a
+prior handoff up to the MSSQL/rate-limiter work, then continuing fresh:
 
-1. Investigate and fix an "8 concurrent `/handoff/runbridge/` calls" problem in `rgmc-gcp-api`
-   (root cause of data-correctness bugs from a prior session's handoff: silently-dropped
-   `CustomerPOULBQ`/`CustomerPOULDetailBQ` rows, possibly related to 3 fully-missing Manila
-   Taste Curators PO refs).
-2. Build a **Missing Items tab** on `/reconcile` (sbic-manual-trigger-page): find BC Sales Orders
-   whose lines don't match their Document-AI-extracted PO lines, let a human queue/link fixes,
-   then an explicit **Transfer to BC** button applies them — same queue-then-apply shape as the
-   already-complete Missing Ship-To tab. Binding acceptance criteria (carried over from Missing
-   Ship-To, repeated by the user this session): never write to BC directly from a pick/link
-   action, only from an explicit batched Apply step.
-3. Build an **Upload Monitoring Dashboard** as the new `/` page (moving the old manual-trigger
-   form to `/trigger`): search BigQuery uploads across all three Document AI pipelines (PO, RA,
-   RA-xml) by upload type / company / date range / PO-or-RA ref number, browse every uploaded
-   file in a collapsible tree (file → refs → detail lines), view the original uploaded source
-   file via a signed GCS URL, and compare BigQuery's data against MSSQL and (PO+SBIC only)
-   Business Central, with variance highlighting on item count/price/UOM mismatches.
-4. Along the way: several real production bugs were found (by the user actually using the
-   features) and fixed — a 504 timeout, a BigQuery column-name bug, a BC company-param bug, and a
-   BigQuery DATE-vs-DATETIME bug that silently zeroed out same-day search results.
+1. **(Inherited from the previous handoff, now resolved)** Fix `rgmc-gcp-api`'s MSSQL dashboard
+   routes blocking the whole event loop on one slow query, and the `/handoff/runbridge/` rate
+   limiter starving `customerpoul` traffic behind dense `customerra` bursts.
+2. Set up automatic retry for "Held back (0 line items extracted yet)" orders — a Cloud Scheduler
+   job instead of requiring a human to notice and click the manual backfill button.
+3. Add duplicate-BigQuery-row detection to the Upload Dashboard's BQ-vs-MSSQL/BC comparison
+   counts (and to the Missing Items tab's matching), so a PO whose Document AI extraction
+   genuinely duplicated every line doesn't inflate "BQ: 14" when the real count is 7.
+4. **The session's largest task**: move `BigqueryBridge.main()`'s actual BigQuery-read + MSSQL-
+   write + SO-import-publish work OUT of `rgmc-gcp-api`'s HTTP request path entirely, into
+   `rgmc-worker-pool`'s Pub/Sub pull workers — explicitly requested scope: **move everything**,
+   including the three manual "Run Bridge Now" buttons on `/trigger`, not just the Eventarc-
+   triggered automated path.
+5. Add a new **"Customer/Ship-To Mismatch"** tab on `/reconcile`: search BC Sales Orders
+   (`submittedBy = "SBIC AI Uploading"`) by PO ref/date/company/customer-name/ship-to-address, let
+   a human pick the correct ship-to (allowed to belong to a **different** customer than the
+   order's current one, unlike the existing Missing Ship-To tab), queue the fix, then an explicit
+   batched Apply re-points both `sellToCustomerNo` and `shipToCode` together. Binding acceptance
+   criterion (carried over verbatim from every other tab this session and prior ones): never write
+   to BC directly from a pick/link action, only from an explicit Apply step.
+6. Add BC-backed live search suggestions to that tab's Customer name / Ship-to address filter
+   fields (autocomplete dropdown, reusing existing `/api/lookup/customers` / `/api/lookup/ship-to`
+   endpoints).
+7. Show the BigQuery-extracted `customer_branch_name` (the *original* uploaded branch text) on
+   each Customer/Ship-To Mismatch result row, for comparison against BC's current (possibly wrong)
+   ship-to.
+8. Fix a real production bug reported by users: `rgmc-worker-pool`'s `_create_order` (the function
+   that actually creates/resumes a BC Sales Order) was trusting a *flat* (name-only) customer
+   override outright, even when BC has split one raw customer name across multiple real Customer
+   records (e.g. "WALTERMART SUPERMARKET, INC." — confirmed in production). Fix: resolve the
+   branch's own ship-to FIRST; if it disagrees with a flat override, the ship-to match wins; if
+   ship-to can't be resolved at all, buffer the order instead of guessing via name alone.
+9. Fix a `pip` dependency conflict the user hit deploying `rgmc-worker-pool` (`protobuf==6.33.1`,
+   copied from `rgmc-gcp-api`'s requirements without checking it was only needed there for
+   `google-cloud-tasks`, conflicted with this repo's own `google-cloud-firestore==2.20.1`, which
+   caps `protobuf <6.0.0dev`).
 
 ## Current State
 
-**Everything currently committed is deployed and confirmed working in production**, with one
-significant exception (see below). Working trees are clean in all three touched repos.
+**Everything above is committed AND deployed successfully, confirmed live via direct gcloud/API
+checks at the end of this session.** No repo has uncommitted work. Specifics:
 
-- **`sbic-manual-trigger-page`** (branch `master`, single Cloud Run service `sbic-manual-trigger`,
-  deploys directly on push to `master`): at commit `f9419fc`. `/` is now the Upload Dashboard,
-  `/trigger` is the old manual-trigger form, `/reconcile` is unchanged plus the new Missing Items
-  tab. All three pages cross-link in their nav. **Confirmed live and working** via direct
-  production API calls throughout the session (see Context & Gotchas for what's safe to call
-  directly vs. not).
-- **`rgmc-gcp-api`** (branch `main`, Cloud Run service `rgmc-gcp-api`, deploys directly on push to
-  `main` — no staging split): at commit `975b809`. Confirmed live and working.
-- **`rgmc-bc-api`** (branch `staging` deploys to `rgmc-bc-api-staging`; branch `master` deploys to
-  `rgmc-bc-api-prod`, normally via a reviewed GitHub PR per this repo's own history, but this
-  session did two direct `git merge --no-ff staging -> master` + push instead, since `gh` CLI
-  isn't installed in this environment): `staging` and `master` are both at commit `a995eb1`
-  (`master`'s own merge commit is `e2b99a0`). Confirmed live and working on both services.
+- **`rgmc-gcp-api`** (branch `main`, deploys directly on push): tip `6bceb09 DI-0215 transfer
+  handoff to worker pool`. Live revision `rgmc-gcp-api-00147-mjx`. `/handoff/runbridge/`,
+  `/customerpoul/runbridge/[/onlinesalespo/]`, `/customerra/runbridge/` all now publish to
+  Pub/Sub topic `rgmc-bridge-run` and return `{"status": "queued", ...}` immediately —
+  confirmed via `src/services/bridge_trigger.py` and the four route files. `BigqueryBridge` class
+  itself (`src/routers/bigquery_bridge.py`) is untouched and still used inline ONLY by
+  `/customerpoul/insert-from-bigquery` (the BigQuery Lookup tab's manual caller-scoped insert —
+  deliberately not moved, it's not the heavy "everything new" pull). This repo's own
+  `handoff.md` has the full writeup of items 1 and 4 (MSSQL fix, rate limiter fix, held-back
+  scheduler, and the worker-pool migration) if more detail is needed than below.
+- **`rgmc-worker-pool`** (Cloud Run Worker Pool, `asia-southeast1`): tip `d8c0413 fix deployment`
+  (on top of `a835a94 DI-0215 added worker pool mods`). Live revision
+  `rgmc-worker-pool-00099-vxr`, deployed from **Cloud Build `5cc0285b` (SUCCESS, 2026-10-19
+  11:40:22 UTC)** — the build immediately before it, `8dcd05cb` (11:25:45 UTC), **FAILED** on the
+  `protobuf==6.33.1` conflict; `d8c0413` fixed `requirements.txt` by removing that pin entirely
+  (see Context & Gotchas) and the very next build succeeded. New capability confirmed live:
+  `src/workers/bigquery_bridge_worker.py` (Pub/Sub pull, `FlowControl(max_messages=1)`),
+  `src/services/bigquery_bridge.py` (ported `BigqueryBridge`), `src/db/dbconn.py` (Cloud SQL
+  Python Connector + pytds, no `db_name` param — only ever touches `MSSQL_DATABASE`/`sbic_prod`),
+  `src/mappings_bridge.py`, `src/services/bq_read.py`. IAM role `roles/cloudsql.client` for
+  `rgmc-worker-pool@durable-woods-465907-n1.iam.gserviceaccount.com` **confirmed granted**. Cloud
+  Run annotation `run.googleapis.com/cloudsql-instances=durable-woods-465907-n1:asia-southeast1:
+  rgmc-in-house-prod` **confirmed present**. `so_import_worker.py`'s `_create_order` ship-to-first
+  fix (item 8) is also in this same `a835a94`/`d8c0413` deploy — **live in production now**, not
+  yet observed in action against a real "WALTERMART-style" ambiguous order (no such order has
+  reportedly come through since deploy as of session end).
+- **`rgmc-bc-api`** (branch `master`, deploys directly on push — this repo's own history shows it
+  normally goes through `staging` first, but this session, like the last one, pushed straight to
+  `master`): tip `6a48b28 DI-0214 added ship-to/customer mismatch`, deployed successfully (build
+  `9d1238b2`, SUCCESS, 2026-10-19 10:21:43 UTC) — this is the Customer/Ship-To Mismatch backend
+  (`so_buffer_service.py`'s `*_customer_shipto_fix*` functions + `so_buffer_routes.py`'s
+  `/customer-shipto-fixes*` routes). **A newer, unrelated commit `4345ead "added graphify"` was
+  mid-deploy (Cloud Build `71b3c23e`, status WORKING) as this session ended** — this commit adds
+  `.claude/settings.json`, `CLAUDE.md`, and a large `graphify-out/` cache directory (some local
+  static-analysis/graph tool), made by the user directly, **not part of this session's work at
+  all**. Check `gcloud builds describe 71b3c23e-f98f-4624-be84-442454f58482` if picking this up
+  soon after handoff — if it failed, that's unrelated to anything in this document.
+- **`sbic-manual-trigger-page`** (this repo, branch `master`, deploys directly on push): tip
+  `bb89950 DI-0214 added ship-to address hints` (on top of `f9ccefe DI-0214 added ship-to/customer
+  search` and `ff0c735 DI-0214 added customer/ship-to mismatch`). Two successful builds confirmed
+  (`b67ebd16` and `8f050ad8`). Covers: the dashboard duplicate-row fix (item 3), the Manual
+  Trigger page's async "queued" UX (item 4's frontend half), the whole Customer/Ship-To Mismatch
+  tab (items 5–7).
 
-**Significant exception — Item 1 (the SQL Server concurrency lock) was reverted and never
-successfully re-fixed.** `rgmc-gcp-api/src/routers/bigquery_bridge.py`'s `BigqueryBridge.main()`
-has **no concurrency protection at all** right now — it is back to its exact pre-session state.
-A first attempt (a SQL Server `sp_getapplock` call via a `DECLARE/EXEC/SELECT` multi-statement
-batch through SQLAlchemy+pytds) was deployed, immediately broke **all** `customerra` bridge runs
-in production (every call failed with `"This result object does not return rows"`, silently
-treated as "lock busy" so **zero** runs actually executed), was caught via Cloud Logging within
-minutes, and was reverted (`git revert`, commit `f527da8`). The underlying 8x-concurrency problem
-this was meant to fix is now only *indirectly* mitigated by Item 2 (the debounce layer, see
-below), which reduces concurrent `/handoff/runbridge/` invocations from the original problem but
-does not eliminate the possibility of two overlapping runs racing on the same MSSQL watermark —
-see Next Step.
+**Update from the following session (2026-10-20): both items below ARE now independently confirmed
+live.**
 
-**Item 2 (debounce) is complete and confirmed working.** A new Cloud Tasks queue
-(`rgmc-bridge-debounce`, `asia-southeast1`) plus a new `POST /handoff/runbridge/debounce/`
-endpoint in `rgmc-gcp-api` collapses a burst of near-simultaneous Eventarc events into a single
-delayed call ~30s later (deterministic Cloud-Tasks-task-name-per-time-bucket dedup). All four
-Eventarc triggers (`ingest-batch-output-done-trigger`, `ingest-batch-output-done-trigger-online`,
-`ingest-batch-output-done-trigger-ra`, `bq-int-document-ai-ra-trigger-v2`) were rerouted to this
-new endpoint — confirmed via `gcloud eventarc triggers list` and via live log watching that a
-burst of ~16-30 events produced exactly one real downstream `/handoff/runbridge/` call.
+- **BigQuery bridge via Pub/Sub**: confirmed via Cloud Logging, no manual trigger needed — a real
+  automated `customerra` run flowed through naturally. `rgmc-gcp-api` logged `Published bridge run
+  request: {'group_code': 'customerra', 'method': 'triggered'}` at `2026-10-20T09:55:32.12Z`;
+  `rgmc-worker-pool` (resource type is `cloud_run_worker_pool`, **not** `cloud_run_revision` — easy
+  to search the wrong log bucket) picked it up, connected to MSSQL via pytds, and logged `Bridge
+  run complete (group_code='customerra', method='triggered'): {'status': 'success', 'message': 'No
+  new data to process.'}` at `09:55:35.39Z`. Full path confirmed working end to end.
+- **Customer/Ship-To Mismatch tab, live in a browser** (claude-in-chrome against the real deployed
+  `sbic-manual-trigger-page` service): company select, search, candidate picker, queue, and cancel
+  all confirmed working correctly. Specifically: searched SBIC with no filters, got **"Found 972
+  order(s)"**; clicked **Update Ship-To...** on `SBSO260002`, typed "METRO" into the ship-to
+  search, got candidates from **different customers** (`ME003`, `ME011`, `ON003`, `RO005`, etc.) as
+  designed; picked `ME003-M001`, UI immediately showed `Queued — Customer ME001 → ME003 (GRAND
+  METRO WINE CENTER CORP.), Ship-to ME001-S010 → ME003-M001 — METRO VINOS` with **no BC write**
+  (order's displayed customer stayed ME001 throughout — the fix only appeared as a queued diff with
+  Cancel/Change buttons); clicked **Cancel** to clean up the test fix (`SBSO260002` was NOT a real
+  mismatch, just used to exercise the UI), confirmed back to "Not queued". **The queue-then-apply
+  contract holds.**
+  - **New finding, not in scope to fix without user input**: the unfiltered search (no PO ref /
+    date / customer / ship-to) took **182.9 seconds** server-side (confirmed both via a direct
+    `Invoke-WebRequest` to the endpoint and via Cloud Logging's `httpRequest.latency` field) before
+    returning those 972 rows. This isn't a hang — `_find_orders_for_customer_shipto_mismatch`'s BC
+    call and `_fetch_bq_customer_branch_names`'s BigQuery calls both eventually complete — but in
+    practice almost every Open `"SBIC AI Uploading"` order ever created matches this tab's filter
+    (there's nothing to auto-detect a mismatch by design, per its own docstring), so a human has to
+    wait 3 minutes AND scroll through ~972 rows to spot a real mismatch unless they already know a
+    narrowing PO ref/date/customer-name. Worth asking the user whether this needs a required
+    default date-range filter or BC-side pagination before it sees real use.
+  - **Still genuinely unconfirmed**: whether BC's Sales Order API accepts a `sellToCustomerNo`
+    change on an order that already has lines. Deliberately did NOT click **Apply Customer/Ship-To
+    Fixes** against a real order to test this — `SBSO260002` was not an actual mismatch, and
+    applying a fabricated "fix" would have incorrectly repointed a legitimate production order's
+    customer/ship-to. This needs either a genuinely known-wrong order (e.g. a future
+    WALTERMART-style case) or explicit user sign-off before testing for real.
 
-**Item 3 (scoping the over-broad `bq-int-document-ai-ra-trigger-v2` audit-log trigger) was
-investigated and explicitly deprioritized, not implemented.** Eventarc audit-log triggers can
-only filter on `serviceName`/`methodName`/`resourceName`, and for BigQuery job audit logs
-`resourceName` is the job's own random resource name, not the destination table — there is no
-supported way to scope this trigger to "only `int_document_ai_ra` inserts." It still fires on
-every `JobService.InsertJob` in the whole project. Its practical impact is now much smaller since
-item 2 rerouted it through the same debounce layer (most of its spurious firings now just produce
-"already_scheduled" no-ops), but it has not been fixed or removed. See Next Step.
-
-**The 3 fully-missing Manila Taste Curators PO refs mystery (`21721828`, `21721850`, `21721866`,
-from the original cross-session handoff) was never further investigated this session**, but a
-strong new lead was found as a side effect of the Upload Dashboard's "view file" research: every
-`int_document_ai`/`int_document_ai_ra` row tagged under a `portal/batch/manila_taste/...` `file_name`
-prefix has a basename that embeds a literal dummy server path
-(`..._var_www_html_mvp_uploading_batches_dummy_files1_...`), and **no matching object exists in
-the real `sbic-po-parser-in-v2` input bucket** for any of these — confirmed via live `gsutil`
-checks. These documents did not come through the normal `portal/` GCS upload flow at all, which
-plausibly explains why some of them (the 3 refs above) never made it further downstream either.
-Not pursued further — flagged here for whoever picks this up next.
+**Also found while re-verifying this session (drift since the previous handoff, all unrelated to
+this ecosystem's work, all already deployed successfully — see Context & Gotchas)**:
+`rgmc-worker-pool`'s live revision ticked from `00099-vxr` to `00100-rr8` (same container image,
+just the Cloud SQL instance annotation update the user applied from Cloud Shell, timestamped
+~36 min after the image build — not new code). `rgmc-bc-api`'s `staging`/`master` history moved
+past `6a48b28` via two more reviewed PR merges (`#61` "Added a custom page for transaction sales
+entry", `#62`) plus an unrelated direct commit `cfed4f5 "DI-0216 fix for missing sales order
+submissions"` — confirmed all already deployed (`rgmc-bc-api-prod-00273-99c`, builds
+`91382258`/`1925ec97`/`611b4466`/`680f2a3f` all `SUCCESS`). None of this touches the Customer/
+Ship-To Mismatch backend routes this session built.
 
 ## Files Actively Being Edited
 
-All committed, nothing mid-edit. Working trees clean in all three repos as of this write.
+None — every file touched this session is committed in the repo it lives in (see Current State
+for exact commit hashes). Nothing is mid-edit. For a future session that needs to touch any of
+this code, the key new/changed files per repo are:
 
-**`rgmc-gcp-api`** (`C:\RGMC\Source\git\rgmc-gcp-api`):
-- `src/services/bq_read.py` (**new**) — `read_gbq_with_timeout()`: runs `pandas_gbq.read_gbq` in a
-  worker thread, enforces a 60s wall-clock cutoff (`BQ_READ_TIMEOUT_SECONDS` env var) instead of
-  inheriting google-api-core's 600s default retry deadline. Fixes a confirmed-live incident where
-  a BigQuery SSL hiccup tied up a Cloud Run instance for 10 minutes.
-- `src/main.py` — `/checkBigQuery` uses `read_gbq_with_timeout`.
-- `src/routers/bigquery_bridge.py` — all 5 `pandas_gbq.read_gbq` call sites in
-  `__get_bigquery_data` use `read_gbq_with_timeout`. **No lock/concurrency code present** — fully
-  reverted to pre-session state (see Current State).
-- `src/routers/bigquery_routes/bigquery_routes.py` — heavily extended this session:
-  - `_run_parameterized`/`by_table/value`/`by_table/latest` use `read_gbq_with_timeout`, return
-    `504` (not `500`) specifically for a `TimeoutError`.
-  - `UPLOAD_TYPE_TABLES`, `UPLOAD_TYPE_INPUT_BUCKETS`, `_PAGE_SUFFIX_RE` — module-level config for
-    the Upload Dashboard feature.
-  - `_get_signing_credentials()` — self-impersonated credentials (`impersonated_credentials
-    .Credentials` targeting this SA's own email) for Cloud Storage signed-URL generation.
-    **Not optional** — `compute_engine.Credentials` (the ambient Cloud Run credentials) has no
-    `sign_bytes` implementation at all; confirmed live that the naive `blob.generate_signed_url()`
-    call fails with `"you need a private key to sign credentials"` even with
-    `service_account_email` passed. Relies on `roles/iam.serviceAccountTokenCreator` already
-    granted to the compute SA on itself (see Context & Gotchas).
-  - `GET /bigquery_routes/upload-dashboard/files` — distinct `file_name`s grouped with counts,
-    filterable by `upload_type`, `ref_values` (comma-separated, `IN UNNEST`), `company_terms`
-    (po only), `date_from`/`date_to` (now `DATETIME`-typed, see the date-bug fix below).
-  - `GET /bigquery_routes/document-ai/source-file` — reverses the Document AI batch-output naming
-    convention to find and sign a URL to the real original upload. `ra_xml` explicitly returns
-    `"not_available"` (empty table, no known bucket).
-  - `date_from`/`date_to` on `upload-dashboard/files` are `DATETIME`-typed (not `DATE`) — fixed a
-    confirmed-live bug where `created_at <= date_to` (a `DATETIME` column compared to a `DATE`
-    param) silently excluded the entire `date_to` day (0 rows found vs. 170 after the fix, tested
-    directly against BigQuery before and after).
-- `src/routers/sbic_routes/handoff.py` — new `POST /handoff/runbridge/debounce/` endpoint (Cloud
-  Tasks-based debounce, see Current State's Item 2).
-- `src/config.py` — new Cloud Tasks config: `cloud_tasks_project_id`, `cloud_tasks_location`,
-  `cloud_tasks_queue`, `runbridge_debounce_seconds`, `runbridge_service_url`,
-  `runbridge_invoker_service_account` (the last one doubles as the signing-credentials target
-  principal above).
-- `requirements.txt` — added `google-cloud-tasks==2.23.0` (pinned to this version specifically —
-  `2.25.0`/`2.26.0` require `protobuf>=6.33.5`, incompatible with this repo's pinned
-  `protobuf==6.33.1`; `2.23.0` only needs `protobuf>=4.25.8`).
-- **Known pre-existing issue, not touched**: `src/config.py` line ~25 has a real-looking secret
-  hardcoded as `BC_CLIENT_SECRET`'s `os.getenv(...)` *default value*, committed to git history.
-  Flagged to the user, not rotated or removed.
-- **Known pre-existing issue, not touched**: 8 different router files (`handoff.py`,
-  `CustomerPOUL.py`, `CustomerRA.py`, `Customer.py`, `CustomerBranch.py`,
-  `CustomerPOULDetail.py`, `bigquery_routes.py`, `mssql_routes.py`) each independently call
-  `cloud_logging.Client().setup_logging()` at import time, stacking 8 duplicate handlers onto the
-  root logger — every app log line gets written to Cloud Logging 8 times. Pure observability
-  noise (confirmed NOT the cause of the real 8x-concurrency bug — that was independently confirmed
-  via Cloud Run's own `httpRequest` access logs, which aren't subject to this duplication). Not
-  fixed — centralizing `setup_logging()` to call once in `main.py` would fix it.
+**`rgmc-gcp-api`**:
+- `src/config.py` — new `pubsub_bridge_run_topic`.
+- `src/services/bridge_trigger.py` (**new**) — `publish_bridge_run(group_code, method)`.
+- `src/routers/sbic_routes/handoff.py`, `CustomerPOUL.py`, `CustomerRA.py` — the four `runbridge`
+  routes now call `publish_bridge_run` instead of `BigqueryBridge(...).main()`.
+- `handoff.md` (repo root) — this repo's own detailed writeup, superseding its prior (unrelated,
+  ANTZ-integration-planning) content, with that old content preserved at the bottom under "Older,
+  separate, still-unresolved thread."
 
-**`rgmc-bc-api`** (`C:\claude\rgmc-bc-api`):
-- `src/services/so_buffer_service.py` — new Firestore collections `so_missing_item_fixes_{env}`/
-  `so_missing_item_fix_history_{env}` (mirrors `so_shipto_fixes_{env}`'s shape). New functions:
-  `list_missing_item_fixes`, `queue_missing_item_fix`, `delete_missing_item_fix`,
-  `list_missing_item_fix_history`, `_record_missing_item_fix_attempt`,
-  `apply_missing_item_fixes` (**synchronous**, unlike ship-to-fixes' Pub/Sub+worker-pool path —
-  adding a Sales Order Line is already a single existing BC call, so no async round-trip needed;
-  capped at `MISSING_ITEM_FIX_APPLY_BATCH_CAP = 50` per call, returns `remaining` count).
-  `apply_missing_item_fixes` resolves `unitOfMeasureCode` fresh against saved `"uom"` overrides
-  (`key="{itemNo}::{rawUom}"`, same shape the Buffer tab's existing UOM overrides use) immediately
-  before building each line payload, rather than trusting whatever was on the fix doc when queued.
-- `src/routers/bc_routes/so_buffer_routes.py` — 5 new routes under `/bc/custom/v2/so-buffer/`:
-  `GET/POST/DELETE missing-item-fixes[/{fix_id}]`, `GET missing-item-fix-history`,
-  `POST missing-item-fixes/apply`.
+**`rgmc-worker-pool`**:
+- `requirements.txt` — added `pandas`, `pandas-gbq`, `db-dtypes`, `SQLAlchemy`, `sqlalchemy-pytds`,
+  `cloud-sql-python-connector`; bumped `google-cloud-bigquery` to `3.38.0`. **No explicit protobuf
+  pin** (see Failed Attempts/Context & Gotchas — this was the deploy-breaking mistake, now fixed).
+- `src/config.py` — new `BIGQUERY_DATASET_ID` (default `"sbic_int"`, confirmed via `bq ls` this is
+  the REAL dataset for `int_document_ai*`, not the `bc_sbic_prod_*` ones), `BQ_TABLE_VERSION`,
+  `BQ_READ_TIMEOUT_SECONDS`, `MSSQL_INSTANCE`/`MSSQL_USER`/`MSSQL_PASSWORD`/`MSSQL_DATABASE`
+  (empty-string code defaults only — real values already existed as Cloud Run env vars before this
+  session, confirmed via `gcloud beta run worker-pools describe`, see Context & Gotchas),
+  `PUBSUB_BRIDGE_SUBSCRIPTION`, `PUBSUB_POUL_SO_TOPIC`.
+- `src/db/dbconn.py`, `src/services/bq_read.py`, `src/mappings_bridge.py`,
+  `src/services/bigquery_bridge.py` (**all new**) — ported from `rgmc-gcp-api`'s equivalents, see
+  that repo's `handoff.md` for the exact adaptation notes (config var naming, `send_mail` API
+  swap, no `insert_selected_records`).
+- `src/workers/bigquery_bridge_worker.py` (**new**) — Pub/Sub pull consumer,
+  `FlowControl(max_messages=1)`.
+- `src/main.py` — starts/stops `bigquery_bridge_worker` alongside the three existing workers.
+- `src/workers/so_import_worker.py` — `_create_order`'s customer/ship-to resolution reordered
+  (lines ~591–760ish post-edit): branch override and PO/branch-**scoped** customer override
+  unchanged; a **flat** (unscoped) customer override is no longer trusted outright — this branch's
+  own ship-to is resolved first via the same code/lookup-code/fuzzy-name matching the no-override
+  path already used, and wins if it disagrees with the flat override; if ship-to can't be resolved
+  at all, the order is buffered (`raise ValueError`) instead of falling back to the flat guess.
 
-**`sbic-manual-trigger-page`** (`C:\claude\sbic-manual-trigger-page`):
-- `app.py` — very heavily edited:
-  - Routing: `/` → `dashboard_page()` (new), `/trigger` → `index()` (moved from `/`), `/reconcile`
-    unchanged.
-  - `BQ_COMPANY_NAME_TERMS` extended with an `"MTC"` entry (previously SBIC-only) — single source
-    of truth for both the Upload Dashboard's company filter and the existing BigQuery Lookup tab.
-  - Missing Items: `_fetch_expected_lines_batch`, `_fetch_valid_uoms_batch`,
-    `_build_missing_items_filter` (now includes `status eq 'Open'` — Released orders can't accept
-    new lines in BC, confirmed live), `_find_missing_items`, plus proxy routes
-    `/api/sales-orders/missing-items`, `/missing-item-fixes[/<id>]`,
-    `/missing-item-fix-history`, `/api/apply-missing-item-fixes`.
-  - Upload Dashboard: `DASHBOARD_UPLOAD_TYPES` (includes both `ref_column`, the BigQuery
-    snake_case join column, and `mssql_ref_column`, the MSSQL camelCase equivalent — these are
-    **not the same string**, a real bug was shipped and fixed over this distinction, see Failed
-    Attempts), proxy routes `/api/dashboard/files`, `/file-records`, `/detail-records`,
-    `/mssql-status`, `/bc-status`, `/add-to-buffer`, `/source-file`.
-- `templates/dashboard.html` (**new**) — search toolbar (Upload Type, PO/RA Ref Number(s) —
-  comma-separated, label switches with Upload Type —, Company, Date from/to grouped in
-  `.dash-date-range`), results list, and a shared `dash-details-modal-*` modal (used by both
-  "View BC Details" and "View MSSQL Details").
-- `templates/index.html`, `templates/reconcile.html` — nav links updated for the new 3-page
-  structure (Dashboard / Manual Trigger / Buffer Reconciliation all cross-link).
-- `static/dashboard.js` (**new**, ~470 lines) — the whole Upload Dashboard client: file search →
-  expand (auto-expands + highlights matching rows when a ref-number search was used) → more
-  details → Check MSSQL / Check Business Central, each with inline count-mismatch and
-  price/UOM-variance indicators plus a "View ... Details" modal built from a shared
-  `buildComparisonRows`/`renderComparisonTable` pair. `dateFromBoundary`/`dateToBoundary` append
-  explicit `T00:00:00`/`T23:59:59` before the date params ever leave the browser.
-- `static/dashboard.css` (**new**) — reuses `style.css`/`reconcile.css`'s existing tokens and
-  component vocabulary (`.modal-*`, `.order-row`, `.btn-*`) rather than inventing new ones; only
-  adds dashboard-specific tree indentation/variance-highlighting classes.
-- `static/reconcile.js`/`static/reconcile.css` — Missing Items tab UI (`buildMissingItemRow`,
-  `buildMissingItemsOrderGroup`, UOM-resolution picker reusing the existing `renderCandidateList`/
-  `normalizeCandidates("uom", ...)` machinery), plus the `.dash-toolbar`/alignment-fix pattern
-  (pre-existing fix for `.backfill-toolbar`/`.bq-toolbar`, now also applied via
-  `.dash-toolbar`/`.dash-date-range` in dashboard.css).
-- `.gitignore` — user added `plans/` so planning docs (`po_upload_plan.md`,
-  `missing_items_plan.md`, `upload_dashboard_plan.md`, all now under `plans/`) don't get committed.
-  All three are substantially or fully executed; useful as design-rationale reference, not as
-  outstanding TODOs.
+**`rgmc-bc-api`**:
+- `src/services/so_buffer_service.py` — new `so_customer_shipto_fixes_{env}` /
+  `so_customer_shipto_fix_history_{env}` Firestore collections + `list_customer_shipto_fixes`,
+  `queue_customer_shipto_fix`, `delete_customer_shipto_fix`, `list_customer_shipto_fix_history`,
+  `_record_customer_shipto_fix_attempt`, `apply_customer_shipto_fixes` (**synchronous**, like
+  `apply_missing_item_fixes` — re-pointing a header is 1 BC PATCH call, no Pub/Sub+worker-pool
+  round-trip needed). `apply_customer_shipto_fixes` re-validates the order is still Open and still
+  `submittedBy = "SBIC AI Uploading"` before PATCHing, and sends `sellToCustomerNo`+`shipToCode`
+  together in ONE PATCH when both need to change.
+- `src/routers/bc_routes/so_buffer_routes.py` — 5 new routes under
+  `/bc/custom/v2/so-buffer/customer-shipto-fixes[...]` mirroring the missing-item-fixes routes'
+  shape exactly.
+
+**`sbic-manual-trigger-page`**:
+- `app.py` — `_find_orders_for_customer_shipto_mismatch` (BC search: `submittedBy` + `status eq
+  'Open'` + optional po_ref/date/customer_name(`contains`)/ship_to_search(two-step: search BC
+  ship-to-addresses by name first, then OR-filter orders by those codes)), `_fetch_bq_customer_
+  branch_names` (batched BigQuery `document-ai/search` lookup, chunked 100 refs), and 6 new proxy
+  routes (`/api/sales-orders/customer-shipto-mismatch`, `.../customer-shipto-fixes` GET/POST/
+  DELETE, `.../customer-shipto-fix-history`, `/api/apply-customer-shipto-fixes`).
+- `templates/reconcile.html` — new `data-action-tab="customer-shipto"` tab button + full panel
+  (toolbar with Company/PO-ref/Date-from/Date-to/Customer-name/Ship-to-address fields, each of the
+  latter two wrapped in `.toolbar-suggest-wrap` for the autocomplete dropdown, plus a Link History
+  sub-panel).
+- `static/reconcile.js` — `buildCustomerShiptoRow` (per-order row + ship-to candidate picker,
+  reuses `normalizeCandidates("branch", ...)`/`renderCandidateList`), `searchCustomerShiptoMismatch`,
+  `wireToolbarSuggest` (generic debounced BC-autocomplete helper, wired to both new fields),
+  queue/apply/history functions mirroring Missing Items' synchronous-apply pattern.
+- `static/reconcile.css` — `.toolbar-suggest-wrap`/`.toolbar-suggest-dropdown` (floating
+  autocomplete dropdown under a toolbar input, since toolbar fields sit in one row).
+- `static/script.js`, `templates/index.html` — Manual Trigger page now shows "{process} queued"
+  instead of claiming synchronous completion, since `/trigger`'s backend calls now return
+  `{"status": "queued", ...}` instantly.
+- `app.py` (separately, item 3) — `_fetch_expected_lines_batch` dedupes per-ref lines by
+  `_sku_key_for_line` before they reach `_find_missing_items`/queue-to-buffer.
+- `static/dashboard.js` (item 3) — `dedupeBqLines` (same composite key the BigQuery bridge itself
+  uses to dedupe: `po_ref_number`+`customer_name`+`customer_sku_code`) applied before the MSSQL/BC
+  comparison counts; raw per-line table still shows every row, duplicates included.
 
 ## Failed Attempts
 
-- **SQL Server app-lock via `DECLARE/EXEC/SELECT` batch** (Item 1): tried capturing
-  `sp_getapplock`'s return value via `connection.execute(text("DECLARE @res INT; EXEC @res = ...; SELECT @res;"))`
-  through SQLAlchemy + the `sqlalchemy-pytds`/`python-tds` dialect. **Deployed to production and
-  immediately broke every `customerra` bridge run** — every call errored with `"This result object
-  does not return rows"` (pytds likely doesn't expose the DECLARE/EXEC statement's result the way
-  `.scalar()` expects, landing on the wrong result-set token), and the code's own
-  `except Exception: return False` path silently treated every error as "lock busy," so the bridge
-  silently skipped 100% of runs with zero data loss *alerting* (just zero processing). Caught via
-  Cloud Logging within ~15 minutes, reverted via `git revert` (commit `f527da8`), confirmed normal
-  operation resumed. **The correct fix was identified but never implemented or tested**: pytds's
-  raw DBAPI cursor supports `cursor.callproc('sp_getapplock', (...))` +
-  `cursor.get_proc_return_status()`, purpose-built for exactly this (confirmed via reading pytds's
-  source locally: `hasattr(pytds.Cursor, 'callproc')` and `get_proc_return_status` both exist).
-  This still needs to be written, tested, and deployed — see Next Step.
-- **Testing the above fix locally before redeploying**: blocked by this harness's own safety
-  guard twice — once when trying to fetch production MSSQL credentials to local files (even
-  scoped per-field via `--format=value(...)`, flagged "Credential Materialization"), once when
-  trying to spin up a local Docker SQL Server container to test `sp_getapplock` in complete
-  isolation from any production system (also flagged "Credential Materialization", seemingly
-  just for touching Docker at all in that moment). Neither path is viable in this environment;
-  any future attempt at Item 1 needs either an explicit one-off permission grant from the user for
-  one of these approaches, or a willingness to redeploy-and-watch-logs again (the Item 2/3 Cloud
-  Tasks work was validated this same cautious way — small code, read the docs/pytds source
-  carefully, then deploy and verify via live logs/API calls immediately after).
-- **Firing manual test HTTP calls directly at the live `sbic-manual-trigger-page`/`rgmc-bc-api-prod`
-  URLs to "exercise" a feature** (e.g. two concurrent calls to test the then-new lock): blocked by
-  the auto-mode classifier as "Production Deploy" risk. Plain **read-only GETs** against
-  `rgmc-gcp-api`'s own endpoints (BigQuery/GCS reads, no side effects) were *not* blocked and were
-  used extensively and successfully for verification throughout the session — the restriction
-  appears to key off of "could this write/trigger a side effect," not "is this calling a
-  production URL at all."
-- **Dashboard's "Check MSSQL" originally reused the BigQuery `ref_column` (snake_case,
-  `po_ref_number`) for MSSQL lookups too**: 500'd every single time with
-  `"Invalid column name 'po_ref_number'"` (MSSQL's `_BQ` staging tables use camelCase —
-  `poRefNumber`/`raRefNumber`), silently surfaced to the user as a generic "lookup failed" because
-  the error itself was being swallowed. Fixed by adding a separate `mssql_ref_column` per upload
-  type in `DASHBOARD_UPLOAD_TYPES` (`app.py`) and by no longer swallowing the underlying error
-  string in the response.
-- **Dashboard's "Check Business Central" originally sent `headerRow.company_name`** (the row's raw
-  free-text BigQuery value, e.g. `"SUNCOAST BRANDS INTERNATIONAL CORP"`) as the `company` query
-  param instead of the real BC company code: every call 400'd with `"Business Central status is
-  only available for company=SBIC"` even when the user's own company filter was set to SBIC,
-  because the raw text never equals `"SBIC"` after normalization. Fixed by hardcoding `"SBIC"`
-  directly in that one call site (the button is already gated on `isSbicPo` having matched, so
-  there's nothing else it could legitimately be).
-- **An early version of the Missing Items search fanned out one network call per matched BC
-  order** (via `_recover_lines_for_order`, through a 20-worker thread pool) to fetch each order's
-  expected BigQuery lines, with no cap on how many orders a broad company+date search could
-  return. A real production search (`company=SBIC`, one-day range, no PO filter) matched ~300
-  orders and the fan-out alone consumed the remaining ~296s of a 300s Cloud Run request budget,
-  killed by Cloud Run's own infrastructure with a non-JSON 504 body (`"upstream request
-  timeout"`), which broke the browser's `res.json()` parse (`"Unexpected token 'u'"` — the actual
-  bug report that led to this fix). Replaced with `_fetch_expected_lines_batch`, chunking all
-  matched PO refs into batches of 100 and reusing the existing `search_document_ai` endpoint's
-  `IN UNNEST(...)` detail query — confirmed fixed, same search now completes well within budget.
-- **`created_at` date-range filtering on `upload-dashboard/files` used `DATE`-typed BigQuery query
-  parameters** against `created_at`, which is itself a `DATETIME` column: `created_at <= @date_to`
-  implicitly cast `date_to` down to midnight at the *start* of that day, so a same-day search
-  returned 0 rows (confirmed by testing the exact old parameter shape directly against BigQuery:
-  170 rows with the fix, 0 without). Fixed by sending full `YYYY-MM-DDTHH:MM:SS` boundaries from
-  the browser (`00:00:00`/`23:59:59`) and changing the BigQuery parameter type to `DATETIME`.
+- **Pinned `protobuf==6.33.1` in `rgmc-worker-pool`'s `requirements.txt`**, copying it verbatim
+  from `rgmc-gcp-api`'s own pin without checking *why* it was there. **Why it failed**: gcp-api
+  only needs that pin because of its OWN `google-cloud-tasks` dependency (2.25.0+ requires
+  `protobuf>=6.33.5`) — `rgmc-worker-pool` has no `google-cloud-tasks` at all, but DOES depend on
+  `google-cloud-firestore==2.20.1`, which caps `protobuf <6.0.0dev`. Pinning 6.33.1 made these two
+  constraints directly unresolvable — confirmed live via a failed Cloud Build
+  (`8dcd05cb`, `ResolutionImpossible`). **Fixed** by removing the pin entirely (commit
+  `d8c0413 fix deployment`); the immediately following build (`5cc0285b`) succeeded.
+- **Two `gcloud` commands blocked by this harness's own safety classifier**, not by GCP itself —
+  `gcloud projects add-iam-policy-binding ... --role=roles/cloudsql.client` and
+  `gcloud beta run worker-pools update ... --add-cloudsql-instances=...`. Same denial pattern as
+  an EARLIER session's attempts to fetch/copy MSSQL credential values — any IAM- or Cloud-SQL-
+  connectivity-granting action gets refused outright regardless of scope. **Worked around**: gave
+  the user the exact commands to run themselves from Cloud Shell; they did, hitting two follow-up
+  prompts (an interactive IAM-condition picker, and a missing `--project` flag because their Cloud
+  Shell session had no default project set) — both resolved with guidance, both grants now
+  confirmed live (see Current State).
+- **A `gcloud beta run worker-pools describe` call with a broad `env` field request** accidentally
+  printed `MSSQL_PASSWORD`, `BC_CLIENT_SECRET`, and `SMTP_PASSWORD` in plaintext into this
+  session's own transcript — not blocked by the classifier (unlike narrower, explicitly-named-
+  credential scoped queries earlier in the session, which WERE blocked). Flagged live to the user
+  as a security incident; recommended rotating those three credentials out of caution. Not
+  confirmed whether the user has rotated them — **worth asking if not already done**.
 
 ## Next Step
 
-**Re-attempt Item 1 (the SQL Server concurrency lock in `rgmc-gcp-api`), using the
-`cursor.callproc()` approach, not the `DECLARE/EXEC/SELECT` batch that already failed once.**
+Both items that used to head this list (bridge-via-Pub/Sub, Customer/Ship-To Mismatch tab) are now
+confirmed live as of the 2026-10-20 follow-up session — see Current State. What's left:
 
-Concretely, in `rgmc-gcp-api/src/routers/bigquery_bridge.py`'s `BigqueryBridge` class (the lock
-code was previously added then fully reverted — nothing to clean up, just add fresh):
-
-1. Add `__acquire_run_lock`/`__release_run_lock` methods, using
-   `connection.connection.dbapi_connection.cursor()` to get the raw pytds cursor, then
-   `cursor.callproc('sp_getapplock', (lock_name, 'Exclusive', 'Transaction', wait_ms))` followed by
-   `cursor.get_proc_return_status()` (an int: `>= 0` means acquired, negative means not). Keep
-   `@LockOwner = 'Transaction'` (not `'Session'`) — SQLAlchemy's connection pool keeps the
-   physical connection alive after `.close()`, so a session-scoped lock would never actually
-   release between pooled reuses.
-2. Wrap `main()`'s body (and `insert_selected_records`, the manual-trigger-page's BigQuery-lookup
-   insert path, which writes to the same MSSQL tables and races the same way) in
-   acquire-lock/try-finally-release, same shape as the reverted attempt.
-3. **Validate before deploying this time** — ask the user directly whether they're willing to
-   grant one of: (a) a scoped exception to fetch a single MSSQL credential value to a local file
-   for an isolated test, or (b) permission to run a local Docker SQL Server container, or
-   (c) accept redeploying straight to production and watching Cloud Logging closely immediately
-   after (the pattern that worked fine for the Cloud Tasks/debounce work, but this is the second
-   attempt at this *exact* lock mechanism after the first attempt caused a real incident — extra
-   caution warranted). Do not silently redeploy without raising this choice explicitly, given the
-   first attempt's blast radius (100% of customerra runs silently no-op'd for ~15 minutes).
-4. After it's confirmed working, revisit whether Item 3 (the over-broad audit-log trigger) is
-   still worth closing — now lower priority since the debounce layer absorbs most of its impact.
-
-**Secondary, lower-urgency threads still open** (not blocking, but worth surfacing to the user if
-asked "what's left"): the hardcoded `BC_CLIENT_SECRET` default in `rgmc-gcp-api/src/config.py`
-(rotation + removal from source), the 8-duplicate-Cloud-Logging-handlers cleanup, and the 3
-fully-missing Manila Taste Curators PO refs (new lead: `gsutil` confirms no real input file exists
-for any `portal/batch/manila_taste/...`-tagged row — worth checking with whoever owns that
-ingestion path about where "manila_taste" batches actually originate from).
+1. **Decide whether the Customer/Ship-To Mismatch tab's unfiltered search needs a performance
+   fix** before relying on it day-to-day: confirmed taking 182.9s and returning 972 rows with no
+   filters applied (see Current State for the measurement). Options to raise with the user: require
+   at least one filter (date range or PO ref) before allowing a search, add BC-side pagination,
+   or leave it as-is if a human is always expected to narrow by PO ref/customer first anyway.
+2. **Get a real Apply Customer/Ship-To Fixes test against an actual mismatched order** — the one
+   remaining genuinely open question (does BC's Sales Order API accept a `sellToCustomerNo` change
+   on an order that already has lines) still needs either a real known-wrong order or explicit
+   user sign-off before testing, since a fabricated test fix must never be applied to a legitimate
+   production order.
+3. **If a "WALTERMART-style" ambiguous-customer-name order comes through** after the
+   `so_import_worker.py` fix deployed, check Cloud Logging for the new
+   `"flat customer override for ... points to ..., but branch ...'s own ship-to resolves to ...
+   instead"` warning line — confirms the fix is actually firing as designed, not just deployed.
+4. Ask the user whether `MSSQL_PASSWORD`/`BC_CLIENT_SECRET`/`SMTP_PASSWORD` (accidentally
+   transcript-leaked this session, see Failed Attempts) have been rotated yet.
 
 ## Context & Gotchas
 
-- **Three different git/deploy topologies in play, don't assume one pattern fits all**:
-  `rgmc-gcp-api` deploys straight from `main` (no staging). `sbic-manual-trigger-page` deploys
-  straight from `master` (no staging). `rgmc-bc-api` has a real staging/prod split —
-  `rgmc-bc-api-staging` deploys from `staging`, `rgmc-bc-api-prod` deploys from `master`, and this
-  repo's own git history shows every prior feature landed on `master` via a genuine GitHub PR
-  (`"Merge pull request #N from rgmc-apps/staging"`). This session did two direct
-  `git merge --no-ff staging` + `git push origin master` instead, because `gh` CLI isn't installed
-  in this environment — functionally equivalent, but flag to the user if they'd prefer the PR-review
-  habit restored (e.g. by installing `gh` or doing the merge via GitHub's web UI themselves next
-  time).
-- **`sbic-manual-trigger-page`'s `BC_API_BASE` env var points at `rgmc-bc-api-prod`, not
-  `-staging`** — any `rgmc-bc-api` change only actually takes effect for the live app once it's on
-  `master`/`-prod`, not just `staging`. This tripped up this session once (code was live on
-  staging, invisible to the real app, until explicitly promoted) — always check which service the
-  live app's env vars actually point to before declaring a backend change "done."
-- **This harness's safety classifier blocks credential-adjacent and Docker actions outright**, even
-  narrowly-scoped ones (a single `--format=value(...)` field fetch, a plain `docker --version`
-  check) — don't assume "I scoped it carefully" will get it through; if a validation approach
-  needs either of these, it needs to be raised as an explicit choice to the user, not attempted
-  silently. Plain read-only `gcloud`/`gsutil`/`bq` commands against this GCP project were not
-  blocked and were used heavily and successfully all session for diagnosis.
-- **BigQuery column casing differs from MSSQL's `_BQ` staging tables** — BigQuery is snake_case
-  (`po_ref_number`, `customer_sku_code`, `unit_of_measurement`), MSSQL's `CustomerPOULBQ`/
-  `CustomerRABQ`/their `*DetailBQ` siblings are camelCase (`poRefNumber`, `customerSKUCode`,
-  `unitOfMeasurement`) — confirmed via `rgmc-gcp-api/src/mappings.py`'s `table_mappings` dict,
-  which is the authoritative source for every such rename. Getting this wrong silently 500s MSSQL
-  queries with `"Invalid column name"` (happened once this session already, see Failed Attempts).
-- **RA and RA(xml)'s BigQuery/MSSQL schema is NOT just "PO's schema with fewer columns"** — it's a
-  genuinely different shape with no `company_name`, `customer_branch_name`, `customer_sku_code`,
-  `unit_price`, or `unit_of_measurement` concept at all (its real fields are remittance/deduction
-  line items like `ra_amount_detail`, `gross_amount_detail`, `doc_ref_number_detail`). The
-  dashboard's detail-table rendering for non-PO upload types still shows PO-shaped column
-  headers/values as a pre-existing, not-yet-fixed cosmetic gap (everything just reads "—" for RA)
-  — low priority, but don't be surprised by it.
-- **Signed URLs for GCS objects require self-impersonated credentials on this project**, not a
-  plain service-account-default call — `google.auth.compute_engine.Credentials` (what Cloud Run
-  gives you by default) has no `sign_bytes` implementation at all, confirmed by reading
-  `google-auth`'s source directly (`hasattr(ce.Credentials, 'sign_bytes')` is `False`). The fix
-  (`google.auth.impersonated_credentials.Credentials` targeting the SA's own email, relying on
-  `roles/iam.serviceAccountTokenCreator` already granted to it on itself for the earlier Cloud
-  Tasks work) is now the established pattern in `bigquery_routes.py`'s `_get_signing_credentials`
-  — reuse it rather than re-deriving this from scratch if another "give me a link to a GCS object"
-  feature comes up.
-- **Document AI batch-output naming convention**: an input upload at
-  `gs://{bucket}-in[-v2]/portal/{basename}.{ext}` produces output(s) at
-  `gs://{bucket}-out[-v2]/portal/batch/{batch-id}/{job-id}/{shard}/{basename}-{page}.json`.
-  Reversing this (strip the last path segment, strip the trailing `-{page}.json` via
-  `re.compile(r"-\d+\.json$")`) recovers `{basename}`, then list the input bucket by prefix
-  `portal/{basename}` to find the real file (extension isn't guessable — seen `.pdf`, could be an
-  image). Confirmed working for both `sbic-po-parser-in-v2`/`-out-v2` and `sbic-ra-parser-in`/
-  `-out`. `sbic-ra-parser-xml`-equivalent buckets do not exist yet (table is empty, no Eventarc
-  trigger found for it).
-- **`int_document_ai`'s `line_index` column is a stable 1:1 join key between a BigQuery detail row
-  and its MSSQL `*DetailBQ` counterpart** (`lineIndex` there) — used for the dashboard's BQ-vs-
-  MSSQL variance comparison instead of trying to match by SKU (which MSSQL doesn't need to
-  disambiguate since it's a direct staging mirror of BigQuery, unlike BC which requires resolving
-  a raw SKU to a real BC Item Number first).
-- **The Missing Items / Upload Dashboard's BC-side SKU matching deliberately does not replicate
-  `rgmc-worker-pool`'s own BC item-reference ("ref_map") matching** from automated import — only
-  checks saved `"sku"`-type overrides plus the raw-SKU-as-BC-item-number fallback. This is a
-  known, accepted v1 limitation (documented in `plans/missing_items_plan.md`): worst case is a
-  harmless false "needs linking"/variance flag for an item BC could already auto-resolve on its
-  own, never a false negative that hides a genuinely missing/mismatched line.
+- **This is still the single most incident-prone pipeline in the whole RGMC ecosystem.** A PRIOR
+  session's SQL Server app-lock attempt inside `BigqueryBridge.main()` broke 100% of `customerra`
+  bridge runs in production for ~15 minutes (reverted as `f527da8`). Today's worker-pool migration
+  and the `_create_order` ship-to fix both touch adjacent, equally-critical logic — any FUTURE
+  change here should deploy one repo at a time and watch Cloud Logging immediately after, same
+  caution already exercised this session.
+- **`rgmc-worker-pool` already had real MSSQL/BC/SMTP credentials sitting as Cloud Run env vars
+  before this session**, unused by any code until now — confirmed via the `describe` call that
+  also (accidentally) leaked them into this transcript. No credential needed to be copied or set
+  by anyone for the bridge migration; the new `config.py` just started reading what was already
+  provisioned. If a future session needs to ADD a new credential-backed capability to worker-pool,
+  check the existing env vars first (via a narrowly-scoped, non-broad query — broad `env` dumps
+  are what caused the leak) before assuming something needs to be freshly granted.
+- **`sbic_int` (not `bc_sbic_prod_int`) is the real BigQuery dataset** for
+  `int_document_ai`/`int_document_ai_detail` — confirmed via `bq ls`/`bq ls sbic_int` this session.
+  `bq ls` with no `--max_results` silently truncates alphabetically (missed everything from
+  `s` onward on the first attempt) — always pass `--max_results=200`+ when hunting for a dataset
+  this way.
+- **This harness's safety classifier blocks IAM-policy-binding and Cloud-SQL-connectivity-granting
+  `gcloud` commands outright**, no matter how narrowly scoped — confirmed twice more this session
+  (on top of earlier-session credential-fetch denials). Any future infra step needing one of these
+  must be handed to the user as an exact command, not attempted directly.
+- **Whether BC's Sales Order API accepts changing `sellToCustomerNo` on an order that already has
+  lines is still UNCONFIRMED** — `apply_customer_shipto_fixes` sends the PATCH and surfaces
+  whatever BC says verbatim (not swallowed), but no real Apply attempt against a genuinely
+  mismatched order has happened yet as of session end. This is the one piece of the Customer/
+  Ship-To Mismatch tab that could still turn out to need a different approach (e.g., BC might
+  require clearing lines first, or might reject it entirely) — find out on the first real use.
+- **`rgmc-bc-api`'s git history now has an unrelated `graphify-out/` cache directory and a
+  `CLAUDE.md`/`.claude/settings.json` committed** (`4345ead "added graphify"`, by the user,
+  outside this session) — don't mistake this for anything related to the SO-import/BC work; it's
+  some separate local tooling the user set up.
+- **Dataset/table-mapping duplication across repos is intentional, not an oversight**: `rgmc-
+  worker-pool`'s `src/mappings_bridge.py` is a verbatim, independently-maintained copy of
+  `rgmc-gcp-api`'s `src/mappings.py` (same pattern already established for the SUNCOAST/SBIC
+  company-keyword map duplicated between `CustomerPOUL.py` and `so_import_worker.py`). If the
+  PO/RA/online-sales-PO table shapes ever change in one, update the other by hand.
+- **Three different git/deploy topologies, still true**: `rgmc-gcp-api` and `sbic-manual-trigger-
+  page` deploy straight from their main branch (no staging). `rgmc-worker-pool` likewise deploys
+  directly. `rgmc-bc-api` nominally has a staging/prod split in its own history but this session
+  (like the last one) pushed straight to `master`.
