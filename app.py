@@ -1031,6 +1031,26 @@ def api_history():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/handoff-history")
+def api_handoff_history():
+    """BigQuery-bridge handoff history — one record per bridge run, listing only the
+    PO ref numbers inserted into MSSQL per target table, plus date/time/status.
+
+    All filters are optional; omit everything to list the whole log (most recent first).
+    """
+    params = {}
+    for key in ("group_code", "status", "date"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/handoff-history", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 # Sales Orders eligible for the Overrides tab's "Find previous orders"/"Update these
 # orders" actions are restricted to this exact value — this app's own automated
 # SO-import pipeline stamps every order it creates with submittedBy="SBIC AI Uploading"

@@ -122,6 +122,39 @@
       <button class="btn-reset" id="reset-btn">Trigger Another Process</button>
     </section>
 
+    <!-- Handoff History Card -->
+    <section class="card" id="handoff-history-card">
+      <div class="handoff-history-header">
+        <h2 class="card-title">BigQuery Bridge Handoff History</h2>
+        <button class="btn-reset" id="handoff-history-refresh">Refresh</button>
+      </div>
+      <p class="handoff-history-hint">
+        Every BigQuery &rarr; MSSQL handoff run — just the PO ref numbers inserted per
+        target table, not the full records (already in BigQuery/MSSQL).
+      </p>
+
+      <div class="handoff-history-filters">
+        <div class="select-wrapper">
+          <select class="form-select" id="handoff-history-group-code">
+            <option value="">All processes</option>
+            <option value="customerpoul">CustomerPOUL</option>
+            <option value="customerra">CustomerRA</option>
+            <option value="onlinesalespo">Online Sales PO</option>
+          </select>
+        </div>
+        <div class="select-wrapper">
+          <select class="form-select" id="handoff-history-status">
+            <option value="">Any status</option>
+            <option value="success">Success</option>
+            <option value="error">Error</option>
+          </select>
+        </div>
+      </div>
+
+      <p class="handoff-history-status" id="handoff-history-status-msg"></p>
+      <div class="handoff-history-list" id="handoff-history-list"></div>
+    </section>
+
   </main>
 
   <!-- ── Footer ── -->
@@ -130,5 +163,6 @@
   </footer>
 
   <script src="/static/script.js"></script>
+  <script src="/static/handoff-history.js"></script>
 </body>
 </html>
