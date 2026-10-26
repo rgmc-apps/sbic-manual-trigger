@@ -394,6 +394,8 @@
       mssqlBtn.disabled = true;
       resultEl.textContent = "Checking MSSQL…";
       resultEl.className = "dash-check-result";
+      bufferActionEl.classList.add("hidden");
+      bufferActionEl.innerHTML = "";
       try {
         const url = `/api/dashboard/mssql-status?upload_type=${encodeURIComponent(uploadType)}&ref_value=${encodeURIComponent(ref)}`;
         const res = await fetch(url);
@@ -405,6 +407,7 @@
         } else if (!data.header_in_mssql) {
           resultEl.textContent = "✗ Not found in MSSQL staging tables";
           resultEl.className = "dash-check-result missing";
+          if (isPo) renderRetriggerMssqlAction(bufferActionEl, headerRow, detailRows);
         } else {
           const mssqlDetailRows = data.detail_data || [];
           const comparisonRows = buildComparisonRows(dedupedDetailRows, (bq) => {
@@ -532,6 +535,40 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || data.detail || "Add to buffer failed");
         resultEl.textContent = "✓ Added to the SO-import buffer — resolve any flagged links on the Buffer Reconciliation page, then Reprocess Buffer.";
+        resultEl.className = "dash-buffer-result ok";
+        btn.remove();
+      } catch (e) {
+        resultEl.textContent = "Error: " + e.message;
+        resultEl.className = "dash-buffer-result warn";
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // Re-sends this PO's BigQuery header/detail rows into MSSQL alone (no buffer/BC
+  // touch) — for a PO Check MSSQL found missing, instead of waiting for the next
+  // automated bridge run or re-running the whole company's bridge.
+  function renderRetriggerMssqlAction(container, headerRow, detailRows) {
+    container.classList.remove("hidden");
+    container.innerHTML = `
+      <button class="btn-reprocess dash-retrigger-mssql-btn" type="button">Retrigger Handoff (MSSQL)</button>
+      <span class="dash-buffer-result"></span>
+    `;
+    const btn = container.querySelector(".dash-retrigger-mssql-btn");
+    const resultEl = container.querySelector(".dash-buffer-result");
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      resultEl.textContent = "Retriggering MSSQL handoff…";
+      resultEl.className = "dash-buffer-result";
+      try {
+        const res = await fetch("/api/dashboard/retrigger-mssql-handoff", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ header: headerRow, details: detailRows }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.status !== "success") throw new Error(data.message || data.error || data.detail || "Retrigger failed");
+        resultEl.textContent = "✓ Re-sent to MSSQL — click Check MSSQL again to confirm.";
         resultEl.className = "dash-buffer-result ok";
         btn.remove();
       } catch (e) {

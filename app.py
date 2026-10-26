@@ -3560,6 +3560,28 @@ def api_dashboard_add_to_buffer():
     return jsonify(_insert_and_buffer([header], details, employee))
 
 
+@app.route("/api/dashboard/retrigger-mssql-handoff", methods=["POST"])
+def api_dashboard_retrigger_mssql_handoff():
+    """Re-send one PO's BigQuery header/detail rows into CustomerPOULBQ/
+    CustomerPOULDetailBQ (promoted into CustomerPOUL/CustomerPOULDetail by MSSQL's own
+    AFTER INSERT trigger) — the MSSQL half of _insert_and_buffer, used standalone here
+    for the dashboard's Check MSSQL "not found" case, without also touching the buffer
+    or BC. PO uploads only — rgmc-gcp-api has no RA equivalent of insert-from-bigquery."""
+    data = request.get_json(silent=True) or {}
+    header = data.get("header")
+    details = data.get("details") or []
+    if not header:
+        return jsonify({"error": "header is required"}), 400
+    header = {k: v for k, v in header.items() if k not in BQ_UI_ONLY_HEADER_FIELDS}
+    try:
+        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
+                         json={"headers": [header], "details": details}, timeout=90)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+
 @app.route("/api/dashboard/source-file")
 def api_dashboard_source_file():
     """Signed URL to the original uploaded file behind a Document AI file_name — the
