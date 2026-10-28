@@ -3302,16 +3302,21 @@ DASHBOARD_UPLOAD_TYPES = {
         # reusing ref_column here 500s every MSSQL check. See rgmc-gcp-api's
         # mappings.py table_mappings['customerpoulbq']/['customerradetailbq'].
         "mssql_ref_column": "poRefNumber",
+        # The table CustomerPOULBQ's own AFTER INSERT trigger promotes a matching row
+        # into — see api_dashboard_mssql_status's "promoted" check.
+        "mssql_promoted_table": "CustomerPOUL",
     },
     "ra": {
         "header_table": "int_document_ai_ra", "detail_table": "int_document_ai_ra_detail",
         "ref_column": "ra_ref_number", "mssql_header_table": "CustomerRABQ",
         "mssql_detail_table": "CustomerRADetailBQ", "mssql_ref_column": "raRefNumber",
+        "mssql_promoted_table": "CustomerRA",
     },
     "ra_xml": {
         "header_table": "int_document_ai_ra_xml", "detail_table": "int_document_ai_ra_xml_detail",
         "ref_column": "ra_ref_number", "mssql_header_table": "CustomerRABQ",
         "mssql_detail_table": "CustomerRADetailBQ", "mssql_ref_column": "raRefNumber",
+        "mssql_promoted_table": "CustomerRA",
     },
 }
 
@@ -3427,18 +3432,32 @@ def api_dashboard_mssql_status():
         except requests.RequestException as exc:
             return None, f"Could not reach rgmc-gcp-api: {exc}"
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         header_future = ex.submit(_fetch, config_["mssql_header_table"])
         detail_future = ex.submit(_fetch, config_["mssql_detail_table"])
+        # Checked alongside the staging-table lookups above (not gated behind them
+        # being found first) so one round trip covers both — CustomerPOULBQ's own
+        # AFTER INSERT trigger is what actually promotes a row into this table, a
+        # separate, silent, server-side step a staging-table-only check can't see
+        # (see bigquery_bridge.py's __verify_trigger_promotion for the same check on
+        # the automated-bridge side). "ref_value not in staging at all" and "in
+        # staging but never promoted" both come back as promoted_in_mssql=False here —
+        # the caller tells them apart via header_in_mssql.
+        promoted_future = ex.submit(_fetch, config_["mssql_promoted_table"])
         header_rows, header_error = header_future.result()
         detail_rows, detail_error = detail_future.result()
+        promoted_rows, promoted_error = promoted_future.result()
 
     return jsonify({
         "header_in_mssql": header_rows is not None and len(header_rows) > 0,
         "detail_count_in_mssql": None if detail_rows is None else len(detail_rows),
         "detail_data": detail_rows or [],
+        "promoted_in_mssql": None if promoted_rows is None else len(promoted_rows) > 0,
+        # Retrigger (cleanup-staging + insert-from-bigquery) only exists for PO
+        # uploads — rgmc-gcp-api has no RA equivalent of either endpoint.
+        "retrigger_supported": upload_type == "po",
         "check_failed": header_rows is None or detail_rows is None,
-        "error": header_error or detail_error,
+        "error": header_error or detail_error or promoted_error,
     })
 
 
@@ -3561,9 +3580,9 @@ def api_dashboard_add_to_buffer():
 
 
 def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: str | None):
-    """Shared MSSQL-insert-then-verify-then-log core of both /api/dashboard/
-    retrigger-mssql-handoff (used standalone) and /api/handoff-history/retrigger-mssql
-    (used after that route's own cleanup step). Returns (response_body, status_code).
+    """Shared MSSQL-insert-then-verify-then-log core of /api/handoff-history/
+    retrigger-mssql, called after that route's own cleanup-staging step.
+    Returns (response_body, status_code).
 
     Re-sends header/details into CustomerPOULBQ/CustomerPOULDetailBQ via
     insert-from-bigquery, then verifies CustomerPOULBQ's own AFTER INSERT trigger's
@@ -3608,38 +3627,16 @@ def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: s
     return body, status_code
 
 
-@app.route("/api/dashboard/retrigger-mssql-handoff", methods=["POST"])
-def api_dashboard_retrigger_mssql_handoff():
-    """Re-send one PO's BigQuery header/detail rows into CustomerPOULBQ/
-    CustomerPOULDetailBQ (promoted into CustomerPOUL/CustomerPOULDetail by MSSQL's own
-    AFTER INSERT trigger) — the MSSQL half of _insert_and_buffer, used standalone here
-    for the dashboard's Check MSSQL "not found" case, without also touching the buffer
-    or BC. PO uploads only — rgmc-gcp-api has no RA equivalent of insert-from-bigquery.
-
-    Only safe when nothing is already sitting in the _BQ staging tables for this PO —
-    a row that's already there (e.g. the trigger failed to promote it last time, see
-    /api/handoff-history/retrigger-mssql) makes this hit a duplicate-key error instead
-    of giving the trigger a fresh INSERT to react to."""
-    data = request.get_json(silent=True) or {}
-    header = data.get("header")
-    details = data.get("details") or []
-    if not header:
-        return jsonify({"error": "header is required"}), 400
-    po_ref = header.get("po_ref_number")
-    file_name = header.get("file_name")
-    body, status_code = _insert_mssql_and_log(header, details, po_ref, file_name)
-    return jsonify(body), status_code
-
-
 @app.route("/api/handoff-history/retrigger-mssql", methods=["POST"])
 def api_handoff_history_retrigger_mssql():
-    """Full MSSQL-handoff retry for one PO from the Handoff History log — for a
-    trigger_status "not_promoted" record (CustomerPOULBQ's AFTER INSERT trigger never
-    created the matching CustomerPOUL row the first time). Re-POSTing the same data
-    straight to insert-from-bigquery (like the dashboard's own Retrigger button) would
-    just hit a duplicate-key error on CustomerPOULBQ itself — the row is still sitting
-    there from the failed attempt, and the trigger only fires ON INSERT, never on a row
-    that already exists. Instead:
+    """Full MSSQL-handoff retry for one PO, by po_ref_number alone — shared by both the
+    Handoff History tab's own Retrigger button (a "not_promoted" record) and the
+    Search tab's Check MSSQL result (either "not found in staging at all", or "in
+    staging but never promoted"). Re-POSTing the same data straight to
+    insert-from-bigquery would just hit a duplicate-key error on CustomerPOULBQ when a
+    row is already sitting there from a prior attempt — the trigger only fires ON
+    INSERT, never on a row that already exists — so this always cleans up first,
+    harmlessly a no-op when nothing was there yet:
 
       1. Re-fetches this PO's current header/detail rows straight from BigQuery — the
          handoff-history record itself only ever stores a po_ref_number, never the

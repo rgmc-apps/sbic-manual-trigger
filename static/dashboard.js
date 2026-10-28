@@ -422,7 +422,7 @@
         } else if (!data.header_in_mssql) {
           resultEl.textContent = "✗ Not found in MSSQL staging tables";
           resultEl.className = "dash-check-result missing";
-          if (isPo) renderRetriggerMssqlAction(bufferActionEl, headerRow, detailRows);
+          if (data.retrigger_supported) renderRetriggerAction(bufferActionEl, ref);
         } else {
           const mssqlDetailRows = data.detail_data || [];
           const comparisonRows = buildComparisonRows(dedupedDetailRows, (bq) => {
@@ -451,6 +451,18 @@
           viewBtn.textContent = "View MSSQL Details";
           viewBtn.addEventListener("click", () => showMssqlDetailsModal(dedupedDetailRows, mssqlDetailRows));
           resultEl.appendChild(viewBtn);
+
+          // In CustomerPOULBQ (checked above) but its own AFTER INSERT trigger never
+          // created the matching CustomerPOUL row — a silent, server-side promotion
+          // failure the staging-table comparison above can't show on its own.
+          if (data.retrigger_supported && data.promoted_in_mssql === false) {
+            const warn = document.createElement("div");
+            warn.className = "dash-check-result warn";
+            warn.style.marginTop = "6px";
+            warn.textContent = "⚠ In staging but never promoted to CustomerPOUL — the insert trigger didn't fire.";
+            resultEl.after(warn);
+            renderRetriggerAction(bufferActionEl, ref);
+          }
         }
       } catch (e) {
         resultEl.textContent = "Error: " + e.message;
@@ -560,10 +572,13 @@
     });
   }
 
-  // Re-sends this PO's BigQuery header/detail rows into MSSQL alone (no buffer/BC
-  // touch) — for a PO Check MSSQL found missing, instead of waiting for the next
-  // automated bridge run or re-running the whole company's bridge.
-  function renderRetriggerMssqlAction(container, headerRow, detailRows) {
+  // Same endpoint the Handoff History tab's own retrigger button uses
+  // (/api/handoff-history/retrigger-mssql) — re-fetches this PO's current header/
+  // detail straight from BigQuery by po_ref_number, deletes any stale CustomerPOULBQ/
+  // CustomerPOULDetailBQ rows first, then re-inserts fresh so the AFTER INSERT trigger
+  // gets a genuinely new row to react to. Safe whether nothing was ever inserted yet
+  // (cleanup is a harmless no-op) or a previous insert got stuck un-promoted.
+  function renderRetriggerAction(container, poRef) {
     container.classList.remove("hidden");
     container.innerHTML = `
       <button class="btn-reprocess dash-retrigger-mssql-btn" type="button">Retrigger Handoff (MSSQL)</button>
@@ -573,17 +588,17 @@
     const resultEl = container.querySelector(".dash-buffer-result");
     btn.addEventListener("click", async () => {
       btn.disabled = true;
-      resultEl.textContent = "Retriggering MSSQL handoff…";
+      resultEl.textContent = "Cleaning up and re-inserting…";
       resultEl.className = "dash-buffer-result";
       try {
-        const res = await fetch("/api/dashboard/retrigger-mssql-handoff", {
+        const res = await fetch("/api/handoff-history/retrigger-mssql", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ header: headerRow, details: detailRows }),
+          body: JSON.stringify({ po_ref_number: poRef }),
         });
         const data = await res.json();
         if (!res.ok || data.status !== "success") throw new Error(data.message || data.error || data.detail || "Retrigger failed");
-        resultEl.textContent = "✓ Re-sent to MSSQL — click Check MSSQL again to confirm.";
+        resultEl.textContent = "✓ Re-inserted — click Check MSSQL again to confirm.";
         resultEl.className = "dash-buffer-result ok";
         btn.remove();
       } catch (e) {

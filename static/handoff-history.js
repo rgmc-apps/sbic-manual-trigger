@@ -99,7 +99,11 @@
       ${rec.bc_error ? `<div class="order-error">BC: ${escapeHtml(rec.bc_error)}</div>` : ""}
       <div class="handoff-history-retrigger-action hidden"></div>
     `;
-    if (rec.trigger_status === "not_promoted" && rec.po_ref_number) {
+    // customerpoul only — the retrigger endpoint re-fetches from BigQuery's
+    // int_document_ai/int_document_ai_detail, which is customerpoul's own source
+    // table, not onlinesalespo's (int_online_sales_data) or customerra's.
+    const needsRetrigger = rec.mssql_status === "error" || rec.trigger_status === "not_promoted";
+    if (rec.group_code === "customerpoul" && needsRetrigger && rec.po_ref_number) {
       renderRetriggerAction(row.querySelector(".handoff-history-retrigger-action"), rec.po_ref_number);
     }
     return row;
