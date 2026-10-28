@@ -3799,6 +3799,17 @@ def api_handoff_history_retrigger_mssql_batch():
     (search_document_ai's response mixes every matched PO's lines together) before
     each PO gets its own independent cleanup+reinsert, so one PO's failure never
     blocks the rest of the batch.
+
+    Headers are deliberately re-fetched by po_ref_number (not read straight off the
+    file-scoped lookup used to build that po_ref list) — confirmed live (2026-10-28)
+    that BigQuery's int_document_ai rows for a given PO can get re-stamped under a
+    brand new file_name by an upstream dbt/export-pipeline rematerialization (the
+    same known watermark/created_at-stamping quirk already documented elsewhere),
+    sometimes while this call is still running — the OLD file_name can drop to zero
+    rows entirely while the SAME data now lives under a new one. Searching by
+    po_ref_number finds the current data regardless of which file_name it's
+    currently filed under; resolving by the original file_name a second time would
+    just 404 once that rename has happened.
     """
     data = request.get_json(silent=True) or {}
     raw_refs = (data.get("po_ref_numbers") or "").strip()
