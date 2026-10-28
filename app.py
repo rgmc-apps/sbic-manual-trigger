@@ -3685,6 +3685,18 @@ def api_handoff_history_retrigger_mssql():
     body, status_code = _insert_mssql_and_log(header, details, po_ref, file_name)
     if isinstance(body, dict):
         body["cleanup"] = cleanup_body
+        if status_code != 200:
+            # Cleanup already committed by this point — the PO now has NO row in
+            # CustomerPOULBQ/CustomerPOULDetailBQ at all (worse than the original
+            # "not_promoted" state, though self-healing: clicking Retrigger again
+            # re-runs cleanup as a harmless no-op and attempts a fresh insert). Said
+            # explicitly so this doesn't read as an ordinary, already-recovered retry
+            # failure.
+            body["error"] = (
+                f"Staging rows were cleaned up, but the re-insert failed: "
+                f"{body.get('message') or body.get('error') or body.get('detail') or f'HTTP {status_code}'}. "
+                f"Click Retrigger again to retry the insert."
+            )
     return jsonify(body), status_code
 
 
