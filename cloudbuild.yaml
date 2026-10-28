@@ -4,14 +4,14 @@ steps:
     args:
       - build
       - -t
-      - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA"
+      - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$BUILD_ID"
       - .
 
   # Push to Artifact Registry
   - name: "gcr.io/cloud-builders/docker"
     args:
       - push
-      - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA"
+      - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$BUILD_ID"
 
   # Deploy to Cloud Run
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
@@ -20,14 +20,14 @@ steps:
       - run
       - deploy
       - "$_SERVICE_NAME"
-      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$BUILD_ID
       - --region=$_REGION
       - --platform=managed
       - --allow-unauthenticated
       - --timeout=600
 
 images:
-  - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA"
+  - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPOSITORY/$_SERVICE_NAME:$BUILD_ID"
 
 substitutions:
   _SERVICE_NAME: sbic-manual-trigger

@@ -3624,6 +3624,39 @@ def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: s
     except requests.RequestException:
         pass  # best-effort — the retrigger result itself is unaffected
 
+    if isinstance(body, dict):
+        body["trigger_status"] = trigger_status
+    return body, status_code
+
+
+def _cleanup_and_reinsert_po(po_ref: str, header: dict, details: list, file_name: str | None):
+    """Shared per-PO retrigger core — cleanup-staging then _insert_mssql_and_log —
+    used by both the single-PO and batch retrigger routes below. Returns
+    (response_body, status_code); response_body is always a dict."""
+    try:
+        cleanup_resp = _gcp_api("POST", "/customerpoul/cleanup-staging",
+                                 params={"po_ref_number": po_ref}, timeout=30)
+        cleanup_body, cleanup_status = _proxy_json(cleanup_resp)
+        if cleanup_status != 200:
+            detail = cleanup_body.get("detail") or cleanup_body.get("error") or f"HTTP {cleanup_status}"
+            return {"error": f"Cleanup of staging rows failed, re-insert not attempted: {detail}"}, 502
+    except requests.RequestException as exc:
+        return {"error": f"Could not reach rgmc-gcp-api (cleanup): {exc}"}, 502
+
+    body, status_code = _insert_mssql_and_log(header, details, po_ref, file_name)
+    if isinstance(body, dict):
+        body["cleanup"] = cleanup_body
+        if status_code != 200:
+            # Cleanup already committed by this point — the PO now has NO row in
+            # CustomerPOULBQ/CustomerPOULDetailBQ at all (worse than the original
+            # "not_promoted" state, though self-healing: a retry re-runs cleanup as a
+            # harmless no-op and attempts a fresh insert). Said explicitly so this
+            # doesn't read as an ordinary, already-recovered retry failure.
+            body["error"] = (
+                f"Staging rows were cleaned up, but the re-insert failed: "
+                f"{body.get('message') or body.get('error') or body.get('detail') or f'HTTP {status_code}'}. "
+                f"Retrigger again to retry the insert."
+            )
     return body, status_code
 
 
@@ -3669,32 +3702,91 @@ def api_handoff_history_retrigger_mssql():
     header = headers[0]
     file_name = header.get("file_name")
 
-    try:
-        cleanup_resp = _gcp_api("POST", "/customerpoul/cleanup-staging",
-                                 params={"po_ref_number": po_ref}, timeout=30)
-        cleanup_body, cleanup_status = _proxy_json(cleanup_resp)
-        if cleanup_status != 200:
-            detail = cleanup_body.get("detail") or cleanup_body.get("error") or f"HTTP {cleanup_status}"
-            return jsonify({"error": f"Cleanup of staging rows failed, re-insert not attempted: {detail}"}), 502
-    except requests.RequestException as exc:
-        return jsonify({"error": f"Could not reach rgmc-gcp-api (cleanup): {exc}"}), 502
-
-    body, status_code = _insert_mssql_and_log(header, details, po_ref, file_name)
-    if isinstance(body, dict):
-        body["cleanup"] = cleanup_body
-        if status_code != 200:
-            # Cleanup already committed by this point — the PO now has NO row in
-            # CustomerPOULBQ/CustomerPOULDetailBQ at all (worse than the original
-            # "not_promoted" state, though self-healing: clicking Retrigger again
-            # re-runs cleanup as a harmless no-op and attempts a fresh insert). Said
-            # explicitly so this doesn't read as an ordinary, already-recovered retry
-            # failure.
-            body["error"] = (
-                f"Staging rows were cleaned up, but the re-insert failed: "
-                f"{body.get('message') or body.get('error') or body.get('detail') or f'HTTP {status_code}'}. "
-                f"Click Retrigger again to retry the insert."
-            )
+    body, status_code = _cleanup_and_reinsert_po(po_ref, header, details, file_name)
     return jsonify(body), status_code
+
+
+@app.route("/api/handoff-history/retrigger-mssql-batch", methods=["POST"])
+def api_handoff_history_retrigger_mssql_batch():
+    """Same cleanup-then-reinsert retrigger as /api/handoff-history/retrigger-mssql,
+    for every PO matching ONE of three selectors (exactly one must be given):
+
+      po_ref_numbers — explicit list (comma/newline/whitespace separated)
+      file_name      — every PO BigQuery's int_document_ai has under this exact
+                        fileName (same lookup /api/dashboard/file-records uses)
+      date_from/date_to — every PO with int_document_ai.created_at in this range
+                           (inclusive), straight from /bigquery_routes/document-ai/search
+
+    PO uploads only (group_code=customerpoul) — same BigQuery source table and
+    insert-from-bigquery/cleanup-staging endpoints the single-PO route depends on,
+    neither of which exist for RA or Online Sales PO.
+
+    Resolves to a po_ref_number list first, then ONE document-ai/search call (it
+    already accepts a comma-separated po_ref_number list) fetches every matching
+    header/detail row in a single round trip — detail rows are then split per po_ref
+    (search_document_ai's response mixes every matched PO's lines together) before
+    each PO gets its own independent cleanup+reinsert, so one PO's failure never
+    blocks the rest of the batch.
+    """
+    data = request.get_json(silent=True) or {}
+    raw_refs = (data.get("po_ref_numbers") or "").strip()
+    file_name = (data.get("file_name") or "").strip()
+    date_from = (data.get("date_from") or "").strip()
+    date_to = (data.get("date_to") or "").strip()
+    selectors_given = sum(bool(x) for x in (raw_refs, file_name, (date_from or date_to)))
+    if selectors_given != 1:
+        return jsonify({"error": "Give exactly one of: po_ref_numbers, file_name, or date_from/date_to"}), 400
+
+    try:
+        if raw_refs:
+            po_refs = sorted(set(_split_po_refs(raw_refs)))
+            search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
+                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=90)
+        elif file_name:
+            file_resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
+                "table_name": "int_document_ai", "where_column": "file_name", "where_value": file_name,
+            }, timeout=60)
+            file_body, file_status = _proxy_json(file_resp)
+            if file_status != 200:
+                return jsonify(file_body), file_status
+            po_refs = sorted({r.get("po_ref_number") for r in (file_body.get("data") or []) if r.get("po_ref_number")})
+            if not po_refs:
+                return jsonify({"error": f"No BigQuery int_document_ai rows found for file_name={file_name!r}."}), 404
+            search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
+                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=90)
+        else:
+            search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
+                                    params={"date_from": date_from, "date_to": date_to, "limit": 1000}, timeout=90)
+        search_body, search_status = _proxy_json(search_resp)
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+    if search_status != 200:
+        return jsonify(search_body), search_status
+
+    headers = search_body.get("data") or []
+    details = search_body.get("detail_data") or []
+    if not headers:
+        return jsonify({"data": [], "total": 0, "ok_count": 0, "error_count": 0,
+                         "message": "No matching BigQuery rows found — nothing to retrigger."})
+
+    results = []
+    for header in headers:
+        po_ref = header.get("po_ref_number")
+        if not po_ref:
+            continue
+        po_details = [d for d in details if d.get("po_ref_number") == po_ref]
+        body, status_code = _cleanup_and_reinsert_po(po_ref, header, po_details, header.get("file_name"))
+        results.append({
+            "po_ref": po_ref, "status": "success" if status_code == 200 else "error",
+            "detail": body.get("error") or body.get("message") or "Re-inserted successfully.",
+            "trigger_status": body.get("trigger_status"),
+        })
+
+    return jsonify({
+        "data": results, "total": len(results),
+        "ok_count": sum(1 for r in results if r["status"] == "success"),
+        "error_count": sum(1 for r in results if r["status"] == "error"),
+    })
 
 
 @app.route("/api/dashboard/source-file")

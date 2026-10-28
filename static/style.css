@@ -295,6 +295,12 @@ body {
 .handoff-history-hint { margin-top: 6px; font-size: .8125rem; color: var(--text-muted); }
 .handoff-history-filters { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
 .handoff-history-filters .select-wrapper { min-width: 180px; }
+.handoff-history-batch-retrigger {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
+}
+.handoff-history-batch-retrigger .form-input { min-width: 220px; flex: 1 1 260px; }
+.handoff-history-batch-retrigger input[type="date"] { min-width: 0; flex: 1 1 140px; }
 .handoff-history-status { margin-top: 10px; font-size: .8125rem; color: var(--text-muted); }
 .handoff-history-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
 .handoff-history-table { margin-top: 8px; }

@@ -122,6 +122,23 @@
           </div>
         </div>
 
+        <div class="handoff-history-batch-retrigger">
+          <div class="select-wrapper">
+            <select class="form-select" id="handoff-batch-mode">
+              <option value="po_refs">PO Ref Number(s)</option>
+              <option value="date_range">Date Range</option>
+            </select>
+          </div>
+          <input class="form-input" type="text" id="handoff-batch-po-refs"
+                 placeholder="e.g. PO414226100110212, PO414226100110213 (comma-separated)" />
+          <input class="form-input hidden" type="date" id="handoff-batch-date-from" />
+          <span class="hidden" id="handoff-batch-date-sep">to</span>
+          <input class="form-input hidden" type="date" id="handoff-batch-date-to" />
+          <button class="btn-reset" id="handoff-batch-retrigger-btn" type="button">Retrigger Batch (MSSQL)</button>
+        </div>
+        <p class="handoff-history-status" id="handoff-batch-status-msg"></p>
+        <div class="handoff-history-list" id="handoff-batch-results"></div>
+
         <p class="handoff-history-status" id="handoff-history-status-msg"></p>
         <div class="handoff-history-list" id="handoff-history-list"></div>
       </div>

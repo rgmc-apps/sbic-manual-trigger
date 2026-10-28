@@ -5,6 +5,14 @@
   const groupCodeSelect = document.getElementById("handoff-history-group-code");
   const mssqlStatusSelect = document.getElementById("handoff-history-mssql-status");
   const bcStatusSelect = document.getElementById("handoff-history-bc-status");
+  const batchModeSelect = document.getElementById("handoff-batch-mode");
+  const batchPoRefsInput = document.getElementById("handoff-batch-po-refs");
+  const batchDateFromInput = document.getElementById("handoff-batch-date-from");
+  const batchDateSepEl = document.getElementById("handoff-batch-date-sep");
+  const batchDateToInput = document.getElementById("handoff-batch-date-to");
+  const batchRetriggerBtn = document.getElementById("handoff-batch-retrigger-btn");
+  const batchStatusMsgEl = document.getElementById("handoff-batch-status-msg");
+  const batchResultsEl = document.getElementById("handoff-batch-results");
   if (!listEl) return; // not on this page
 
   function escapeHtml(s) {
@@ -122,7 +130,23 @@
     groups.forEach(([fileName, recs]) => {
       const head = document.createElement("div");
       head.className = "handoff-history-file-head";
-      head.innerHTML = `<span class="handoff-history-filename">${escapeHtml(fileName)}</span><span class="handoff-history-file-count">${recs.length} PO(s)</span>`;
+      head.innerHTML = `
+        <span class="handoff-history-filename">${escapeHtml(fileName)}</span>
+        <span class="handoff-history-file-count">${recs.length} PO(s)</span>
+      `;
+      // Whole-file retrigger — unknown-file groups have nothing real to key a
+      // BigQuery lookup on, and every record here is already customerpoul-only
+      // (the per-record button above already restricts to that group_code).
+      if (fileName !== "(unknown file)") {
+        const fileBtn = document.createElement("button");
+        fileBtn.type = "button";
+        fileBtn.className = "btn-history-toggle";
+        fileBtn.textContent = `Retrigger whole file (${recs.length})`;
+        fileBtn.addEventListener("click", () => {
+          runBatchRetrigger({ file_name: fileName }, fileBtn, `file ${fileName}`);
+        });
+        head.appendChild(fileBtn);
+      }
       listEl.appendChild(head);
       recs.forEach((rec) => listEl.appendChild(renderRecord(rec)));
     });
@@ -138,6 +162,81 @@
       return;
     }
     renderGroupedByFile(records);
+  }
+
+  // Shared by the panel below (PO ref list / date range) and each file-group header's
+  // own "Retrigger whole file" button — one POST, one results render, one disabled-
+  // button-during-the-call guard, regardless of which selector triggered it.
+  async function runBatchRetrigger(payload, triggerBtn, label) {
+    triggerBtn.disabled = true;
+    const origText = triggerBtn.textContent;
+    triggerBtn.textContent = "Retriggering…";
+    batchStatusMsgEl.textContent = `Retriggering ${label}…`;
+    batchResultsEl.innerHTML = "";
+    try {
+      const res = await fetch("/api/handoff-history/retrigger-mssql-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Batch retrigger failed");
+      const results = data.data || [];
+      batchStatusMsgEl.textContent = data.message
+        || `Retriggered ${data.total} PO(s) for ${label} — ${data.ok_count} succeeded, ${data.error_count} failed.`;
+      results.forEach((r) => {
+        const row = document.createElement("div");
+        row.className = "order-row history-row";
+        row.innerHTML = `
+          <div class="order-row-head">
+            <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
+            <span class="order-badge ${r.status === "success" ? "ready" : "failed"}">${escapeHtml(r.status)}</span>
+          </div>
+          <div class="order-detail">${escapeHtml(r.detail || "")}</div>
+        `;
+        batchResultsEl.appendChild(row);
+      });
+      load(); // the main history list now has new entries for these POs
+    } catch (e) {
+      batchStatusMsgEl.textContent = `Error: ${e.message}`;
+    } finally {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = origText;
+    }
+  }
+
+  if (batchModeSelect) {
+    function updateBatchModeInputs() {
+      const isDateRange = batchModeSelect.value === "date_range";
+      batchPoRefsInput.classList.toggle("hidden", isDateRange);
+      batchDateFromInput.classList.toggle("hidden", !isDateRange);
+      batchDateSepEl.classList.toggle("hidden", !isDateRange);
+      batchDateToInput.classList.toggle("hidden", !isDateRange);
+    }
+    batchModeSelect.addEventListener("change", updateBatchModeInputs);
+    updateBatchModeInputs();
+
+    batchRetriggerBtn.addEventListener("click", () => {
+      if (batchModeSelect.value === "date_range") {
+        const dateFrom = batchDateFromInput.value;
+        const dateTo = batchDateToInput.value;
+        if (!dateFrom && !dateTo) {
+          batchStatusMsgEl.textContent = "Enter at least a start or end date.";
+          return;
+        }
+        runBatchRetrigger(
+          { date_from: dateFrom, date_to: dateTo },
+          batchRetriggerBtn, `date range ${dateFrom || "…"} – ${dateTo || "…"}`,
+        );
+      } else {
+        const raw = batchPoRefsInput.value.trim();
+        if (!raw) {
+          batchStatusMsgEl.textContent = "Enter at least one PO ref number.";
+          return;
+        }
+        runBatchRetrigger({ po_ref_numbers: raw }, batchRetriggerBtn, "the given PO ref(s)");
+      }
+    });
   }
 
   async function load() {
