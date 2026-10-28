@@ -36,6 +36,50 @@
     if (status === "buffered" || status === "error") return "failed";
     return "pending";
   }
+  // The AFTER INSERT trigger's OWN result (did the row actually reach CustomerPOUL/
+  // CustomerRA, not just the _BQ staging table) — "unknown" is neutral (never
+  // checked, or the check itself failed), distinct from a confirmed "not_promoted".
+  function triggerBadgeClass(status) {
+    if (status === "promoted") return "ready";
+    if (status === "not_promoted") return "failed";
+    return "pending";
+  }
+
+  // Only offered for "not_promoted" — the row is confirmed stuck in CustomerPOULBQ/
+  // CustomerPOULDetailBQ with no matching CustomerPOUL row, so a clean-up-then-
+  // re-insert can actually help. Any other trigger_status either doesn't need it
+  // (promoted) or wouldn't be fixed by it (unknown — e.g. the MSSQL insert itself
+  // already failed, so there's nothing stale in the staging tables to clean up).
+  function renderRetriggerAction(container, poRef) {
+    container.classList.remove("hidden");
+    container.innerHTML = `
+      <button class="btn-reset handoff-history-retrigger-btn" type="button">Retrigger (clean up &amp; re-insert)</button>
+      <span class="handoff-history-retrigger-result"></span>
+    `;
+    const btn = container.querySelector(".handoff-history-retrigger-btn");
+    const resultEl = container.querySelector(".handoff-history-retrigger-result");
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      resultEl.textContent = "Cleaning up and re-inserting…";
+      resultEl.className = "handoff-history-retrigger-result";
+      try {
+        const res = await fetch("/api/handoff-history/retrigger-mssql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ po_ref_number: poRef }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.detail || data.message || "Retrigger failed");
+        resultEl.textContent = "✓ Re-inserted — refreshing…";
+        resultEl.className = "handoff-history-retrigger-result ok";
+        load();
+      } catch (e) {
+        resultEl.textContent = "Error: " + e.message;
+        resultEl.className = "handoff-history-retrigger-result warn";
+        btn.disabled = false;
+      }
+    });
+  }
 
   function renderRecord(rec) {
     const row = document.createElement("div");
@@ -44,6 +88,7 @@
       <div class="order-row-head">
         <span class="order-ref">${escapeHtml(rec.po_ref_number || "—")}</span>
         <span class="order-badge ${mssqlBadgeClass(rec.mssql_status)}">MSSQL: ${escapeHtml(rec.mssql_status || "unknown")}</span>
+        <span class="order-badge ${triggerBadgeClass(rec.trigger_status)}">Trigger: ${escapeHtml(rec.trigger_status || "unknown")}</span>
         <span class="order-badge ${bcBadgeClass(rec.bc_status)}">BC: ${escapeHtml(rec.bc_status || "unknown")}${rec.bc_order_no ? " (" + escapeHtml(rec.bc_order_no) + ")" : ""}</span>
       </div>
       <div class="order-detail">
@@ -52,7 +97,11 @@
       </div>
       ${rec.mssql_error ? `<div class="order-error">MSSQL: ${escapeHtml(rec.mssql_error)}</div>` : ""}
       ${rec.bc_error ? `<div class="order-error">BC: ${escapeHtml(rec.bc_error)}</div>` : ""}
+      <div class="handoff-history-retrigger-action hidden"></div>
     `;
+    if (rec.trigger_status === "not_promoted" && rec.po_ref_number) {
+      renderRetriggerAction(row.querySelector(".handoff-history-retrigger-action"), rec.po_ref_number);
+    }
     return row;
   }
 

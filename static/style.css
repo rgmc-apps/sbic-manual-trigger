@@ -319,6 +319,10 @@ body {
   border-radius: 6px;
   word-break: break-word;
 }
+.handoff-history-retrigger-action { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.handoff-history-retrigger-result { font-size: .8125rem; font-weight: 600; }
+.handoff-history-retrigger-result.ok { color: var(--success-text); }
+.handoff-history-retrigger-result.warn { color: var(--error-text); }
 
 /* Shared row/badge styles mirrored from reconcile.css's Buffered Orders / History
    tabs, so this card looks consistent with the rest of the app's history views. */

@@ -3560,6 +3560,54 @@ def api_dashboard_add_to_buffer():
     return jsonify(_insert_and_buffer([header], details, employee))
 
 
+def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: str | None):
+    """Shared MSSQL-insert-then-verify-then-log core of both /api/dashboard/
+    retrigger-mssql-handoff (used standalone) and /api/handoff-history/retrigger-mssql
+    (used after that route's own cleanup step). Returns (response_body, status_code).
+
+    Re-sends header/details into CustomerPOULBQ/CustomerPOULDetailBQ via
+    insert-from-bigquery, then verifies CustomerPOULBQ's own AFTER INSERT trigger's
+    ACTUAL result with a direct CustomerPOUL lookup — the insert call alone only
+    confirms the staging-table write succeeded, never whether the trigger that
+    follows it actually promoted the row (it runs server-side with no return value) —
+    and logs both outcomes into bridge_handoff_history_{env} (via rgmc-bc-api),
+    best-effort, so a logging failure never fails the already-decided retrigger result.
+    """
+    header = {k: v for k, v in header.items() if k not in BQ_UI_ONLY_HEADER_FIELDS}
+    try:
+        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
+                         json={"headers": [header], "details": details}, timeout=90)
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException as exc:
+        return {"error": f"Could not reach rgmc-gcp-api: {exc}"}, 502
+
+    mssql_status = "inserted" if status_code == 200 and body.get("status") == "success" else "error"
+    error_detail = None if mssql_status == "inserted" else (body.get("message") or f"HTTP {status_code}")
+
+    trigger_status = "unknown"
+    if mssql_status == "inserted" and po_ref:
+        try:
+            check_resp = _gcp_api("GET", "/sbic/by_table/value", params={
+                "table_name": "CustomerPOUL", "where_column": "poRefNumber", "where_value": po_ref,
+            }, timeout=30)
+            check_body, check_status = _proxy_json(check_resp)
+            if check_status == 200:
+                trigger_status = "promoted" if check_body.get("data") else "not_promoted"
+        except requests.RequestException:
+            pass  # stays "unknown"
+
+    try:
+        _bc_api("POST", "/bc/custom/v2/so-buffer/handoff-history/manual-entry", json={
+            "po_ref_number": po_ref, "file_name": file_name,
+            "mssql_status": mssql_status, "error": error_detail,
+            "trigger_status": trigger_status,
+        })
+    except requests.RequestException:
+        pass  # best-effort — the retrigger result itself is unaffected
+
+    return body, status_code
+
+
 @app.route("/api/dashboard/retrigger-mssql-handoff", methods=["POST"])
 def api_dashboard_retrigger_mssql_handoff():
     """Re-send one PO's BigQuery header/detail rows into CustomerPOULBQ/
@@ -3568,10 +3616,10 @@ def api_dashboard_retrigger_mssql_handoff():
     for the dashboard's Check MSSQL "not found" case, without also touching the buffer
     or BC. PO uploads only — rgmc-gcp-api has no RA equivalent of insert-from-bigquery.
 
-    Also logs this attempt into the same bridge_handoff_history_{env} collection the
-    automated BigQuery bridge writes to (via rgmc-bc-api), best-effort — a logging
-    failure here must not fail the retrigger itself, which already succeeded or failed
-    on its own terms by the time this runs."""
+    Only safe when nothing is already sitting in the _BQ staging tables for this PO —
+    a row that's already there (e.g. the trigger failed to promote it last time, see
+    /api/handoff-history/retrigger-mssql) makes this hit a duplicate-key error instead
+    of giving the trigger a fresh INSERT to react to."""
     data = request.get_json(silent=True) or {}
     header = data.get("header")
     details = data.get("details") or []
@@ -3579,24 +3627,64 @@ def api_dashboard_retrigger_mssql_handoff():
         return jsonify({"error": "header is required"}), 400
     po_ref = header.get("po_ref_number")
     file_name = header.get("file_name")
-    header = {k: v for k, v in header.items() if k not in BQ_UI_ONLY_HEADER_FIELDS}
+    body, status_code = _insert_mssql_and_log(header, details, po_ref, file_name)
+    return jsonify(body), status_code
+
+
+@app.route("/api/handoff-history/retrigger-mssql", methods=["POST"])
+def api_handoff_history_retrigger_mssql():
+    """Full MSSQL-handoff retry for one PO from the Handoff History log — for a
+    trigger_status "not_promoted" record (CustomerPOULBQ's AFTER INSERT trigger never
+    created the matching CustomerPOUL row the first time). Re-POSTing the same data
+    straight to insert-from-bigquery (like the dashboard's own Retrigger button) would
+    just hit a duplicate-key error on CustomerPOULBQ itself — the row is still sitting
+    there from the failed attempt, and the trigger only fires ON INSERT, never on a row
+    that already exists. Instead:
+
+      1. Re-fetches this PO's current header/detail rows straight from BigQuery — the
+         handoff-history record itself only ever stores a po_ref_number, never the
+         actual rows.
+      2. Deletes the stale CustomerPOULBQ/CustomerPOULDetailBQ rows via rgmc-gcp-api's
+         POST /customerpoul/cleanup-staging (staging tables only — never the promoted
+         CustomerPOUL/CustomerPOULDetail tables, which for a "not_promoted" record
+         have no row for this PO yet anyway).
+      3. Re-inserts fresh via the same insert-from-bigquery call + trigger-verification
+         + history logging every other MSSQL handoff here uses (_insert_mssql_and_log),
+         giving the trigger a brand-new INSERT to actually react to.
+    """
+    data = request.get_json(silent=True) or {}
+    po_ref = (data.get("po_ref_number") or "").strip()
+    if not po_ref:
+        return jsonify({"error": "po_ref_number is required"}), 400
+
     try:
-        resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
-                         json={"headers": [header], "details": details}, timeout=90)
-        body, status_code = _proxy_json(resp)
+        search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
+                                params={"po_ref_number": po_ref}, timeout=60)
+        search_body, search_status = _proxy_json(search_resp)
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+    if search_status != 200:
+        return jsonify(search_body), search_status
+    headers = search_body.get("data") or []
+    details = search_body.get("detail_data") or []
+    if not headers:
+        return jsonify({"error": f"No BigQuery int_document_ai row found for po_ref_number={po_ref!r} — nothing to re-insert."}), 404
+    header = headers[0]
+    file_name = header.get("file_name")
 
-    mssql_status = "inserted" if status_code == 200 and body.get("status") == "success" else "error"
-    error_detail = None if mssql_status == "inserted" else (body.get("message") or f"HTTP {status_code}")
     try:
-        _bc_api("POST", "/bc/custom/v2/so-buffer/handoff-history/manual-entry", json={
-            "po_ref_number": po_ref, "file_name": file_name,
-            "mssql_status": mssql_status, "error": error_detail,
-        })
-    except requests.RequestException:
-        pass  # best-effort — the retrigger result itself is unaffected
+        cleanup_resp = _gcp_api("POST", "/customerpoul/cleanup-staging",
+                                 params={"po_ref_number": po_ref}, timeout=30)
+        cleanup_body, cleanup_status = _proxy_json(cleanup_resp)
+        if cleanup_status != 200:
+            detail = cleanup_body.get("detail") or cleanup_body.get("error") or f"HTTP {cleanup_status}"
+            return jsonify({"error": f"Cleanup of staging rows failed, re-insert not attempted: {detail}"}), 502
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api (cleanup): {exc}"}), 502
 
+    body, status_code = _insert_mssql_and_log(header, details, po_ref, file_name)
+    if isinstance(body, dict):
+        body["cleanup"] = cleanup_body
     return jsonify(body), status_code
 
 
