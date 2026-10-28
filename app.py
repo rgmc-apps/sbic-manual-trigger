@@ -1039,7 +1039,7 @@ def api_handoff_history():
     All filters are optional; omit everything to list the whole log (most recent first).
     """
     params = {}
-    for key in ("group_code", "status", "date"):
+    for key in ("group_code", "mssql_status", "bc_status", "date"):
         value = (request.args.get(key) or "").strip()
         if value:
             params[key] = value
@@ -3566,20 +3566,38 @@ def api_dashboard_retrigger_mssql_handoff():
     CustomerPOULDetailBQ (promoted into CustomerPOUL/CustomerPOULDetail by MSSQL's own
     AFTER INSERT trigger) — the MSSQL half of _insert_and_buffer, used standalone here
     for the dashboard's Check MSSQL "not found" case, without also touching the buffer
-    or BC. PO uploads only — rgmc-gcp-api has no RA equivalent of insert-from-bigquery."""
+    or BC. PO uploads only — rgmc-gcp-api has no RA equivalent of insert-from-bigquery.
+
+    Also logs this attempt into the same bridge_handoff_history_{env} collection the
+    automated BigQuery bridge writes to (via rgmc-bc-api), best-effort — a logging
+    failure here must not fail the retrigger itself, which already succeeded or failed
+    on its own terms by the time this runs."""
     data = request.get_json(silent=True) or {}
     header = data.get("header")
     details = data.get("details") or []
     if not header:
         return jsonify({"error": "header is required"}), 400
+    po_ref = header.get("po_ref_number")
+    file_name = header.get("file_name")
     header = {k: v for k, v in header.items() if k not in BQ_UI_ONLY_HEADER_FIELDS}
     try:
         resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
                          json={"headers": [header], "details": details}, timeout=90)
         body, status_code = _proxy_json(resp)
-        return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+    mssql_status = "inserted" if status_code == 200 and body.get("status") == "success" else "error"
+    error_detail = None if mssql_status == "inserted" else (body.get("message") or f"HTTP {status_code}")
+    try:
+        _bc_api("POST", "/bc/custom/v2/so-buffer/handoff-history/manual-entry", json={
+            "po_ref_number": po_ref, "file_name": file_name,
+            "mssql_status": mssql_status, "error": error_detail,
+        })
+    except requests.RequestException:
+        pass  # best-effort — the retrigger result itself is unaffected
+
+    return jsonify(body), status_code
 
 
 @app.route("/api/dashboard/source-file")

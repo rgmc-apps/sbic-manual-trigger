@@ -129,8 +129,9 @@
         <button class="btn-reset" id="handoff-history-refresh">Refresh</button>
       </div>
       <p class="handoff-history-hint">
-        Every BigQuery &rarr; MSSQL handoff run — just the PO ref numbers inserted per
-        target table, not the full records (already in BigQuery/MSSQL).
+        Every PO handed off from BigQuery toward MSSQL and Business Central — automated
+        bridge runs and manual Upload Dashboard retriggers alike — with its own MSSQL
+        insert status and BC Sales Order status.
       </p>
 
       <div class="handoff-history-filters">
@@ -143,10 +144,20 @@
           </select>
         </div>
         <div class="select-wrapper">
-          <select class="form-select" id="handoff-history-status">
-            <option value="">Any status</option>
-            <option value="success">Success</option>
+          <select class="form-select" id="handoff-history-mssql-status">
+            <option value="">Any MSSQL status</option>
+            <option value="inserted">Inserted</option>
             <option value="error">Error</option>
+          </select>
+        </div>
+        <div class="select-wrapper">
+          <select class="form-select" id="handoff-history-bc-status">
+            <option value="">Any BC status</option>
+            <option value="pending">Pending</option>
+            <option value="created">Created</option>
+            <option value="buffered">Buffered</option>
+            <option value="error">Error</option>
+            <option value="not_attempted">Not attempted</option>
           </select>
         </div>
       </div>

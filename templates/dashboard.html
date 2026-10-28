@@ -30,51 +30,101 @@
   <main class="main main-wide">
 
     <section class="card">
-      <div class="toolbar dash-toolbar">
-        <div class="form-group toolbar-select">
-          <label class="form-label" for="dash-upload-type">Upload Type</label>
-          <div class="select-wrapper">
-            <select class="form-select" id="dash-upload-type">
-              <option value="po">PO Upload</option>
-              <option value="ra">RA Upload</option>
-              <option value="ra_xml">RA Upload (xml)</option>
-            </select>
-          </div>
-        </div>
-        <div class="form-group">
-          <label class="form-label" for="dash-ref-input" id="dash-ref-label">PO Ref Number(s)</label>
-          <input class="form-input" type="text" id="dash-ref-input" placeholder="e.g. PO414226100110212 (comma-separated for multiple)" />
-        </div>
-        <div class="form-group toolbar-select">
-          <label class="form-label" for="dash-company">Company</label>
-          <div class="select-wrapper">
-            <select class="form-select" id="dash-company">
-              <option value="">— All companies —</option>
-              {% for c in companies %}
-              <option value="{{ c }}">{{ c }}</option>
-              {% endfor %}
-            </select>
-          </div>
-        </div>
-        <div class="dash-date-range">
-          <div class="form-group">
-            <label class="form-label" for="dash-date-from">Date from</label>
-            <input class="form-input" type="date" id="dash-date-from" />
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="dash-date-to">Date to</label>
-            <input class="form-input" type="date" id="dash-date-to" />
-          </div>
-        </div>
-        <button class="btn-reprocess" id="dash-search-btn" type="button">
-          <span class="btn-spinner hidden" id="dash-search-spinner"></span>
-          <span id="dash-search-btn-label">Search</span>
-        </button>
+      <div class="action-tabs">
+        <button class="action-tab-btn active" data-action-tab="search" type="button">Search</button>
+        <button class="action-tab-btn" data-action-tab="handoff-history" type="button">Handoff History</button>
       </div>
 
-      <p class="details-hint hidden" id="dash-company-hint"></p>
-      <p class="status-line" id="dash-status-line"></p>
-      <div class="dash-file-list" id="dash-file-list"></div>
+      <div class="action-tab-panel" id="action-panel-search">
+        <div class="toolbar dash-toolbar">
+          <div class="form-group toolbar-select">
+            <label class="form-label" for="dash-upload-type">Upload Type</label>
+            <div class="select-wrapper">
+              <select class="form-select" id="dash-upload-type">
+                <option value="po">PO Upload</option>
+                <option value="ra">RA Upload</option>
+                <option value="ra_xml">RA Upload (xml)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="dash-ref-input" id="dash-ref-label">PO Ref Number(s)</label>
+            <input class="form-input" type="text" id="dash-ref-input" placeholder="e.g. PO414226100110212 (comma-separated for multiple)" />
+          </div>
+          <div class="form-group toolbar-select">
+            <label class="form-label" for="dash-company">Company</label>
+            <div class="select-wrapper">
+              <select class="form-select" id="dash-company">
+                <option value="">— All companies —</option>
+                {% for c in companies %}
+                <option value="{{ c }}">{{ c }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+          <div class="dash-date-range">
+            <div class="form-group">
+              <label class="form-label" for="dash-date-from">Date from</label>
+              <input class="form-input" type="date" id="dash-date-from" />
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="dash-date-to">Date to</label>
+              <input class="form-input" type="date" id="dash-date-to" />
+            </div>
+          </div>
+          <button class="btn-reprocess" id="dash-search-btn" type="button">
+            <span class="btn-spinner hidden" id="dash-search-spinner"></span>
+            <span id="dash-search-btn-label">Search</span>
+          </button>
+        </div>
+
+        <p class="details-hint hidden" id="dash-company-hint"></p>
+        <p class="status-line" id="dash-status-line"></p>
+        <div class="dash-file-list" id="dash-file-list"></div>
+      </div>
+
+      <div class="action-tab-panel hidden" id="action-panel-handoff-history">
+        <div class="handoff-history-header">
+          <h2 class="card-title">BigQuery Bridge Handoff History</h2>
+          <button class="btn-reset" id="handoff-history-refresh">Refresh</button>
+        </div>
+        <p class="handoff-history-hint">
+          Every PO handed off from BigQuery toward MSSQL and Business Central — automated
+          bridge runs and manual Retrigger Handoff (MSSQL) actions alike — with its own
+          MSSQL insert status and BC Sales Order status.
+        </p>
+
+        <div class="handoff-history-filters">
+          <div class="select-wrapper">
+            <select class="form-select" id="handoff-history-group-code">
+              <option value="">All processes</option>
+              <option value="customerpoul">CustomerPOUL</option>
+              <option value="customerra">CustomerRA</option>
+              <option value="onlinesalespo">Online Sales PO</option>
+            </select>
+          </div>
+          <div class="select-wrapper">
+            <select class="form-select" id="handoff-history-mssql-status">
+              <option value="">Any MSSQL status</option>
+              <option value="inserted">Inserted</option>
+              <option value="error">Error</option>
+            </select>
+          </div>
+          <div class="select-wrapper">
+            <select class="form-select" id="handoff-history-bc-status">
+              <option value="">Any BC status</option>
+              <option value="pending">Pending</option>
+              <option value="created">Created</option>
+              <option value="buffered">Buffered</option>
+              <option value="error">Error</option>
+              <option value="not_attempted">Not attempted</option>
+            </select>
+          </div>
+        </div>
+
+        <p class="handoff-history-status" id="handoff-history-status-msg"></p>
+        <div class="handoff-history-list" id="handoff-history-list"></div>
+      </div>
     </section>
 
   </main>
@@ -92,5 +142,6 @@
   </div>
 
   <script src="/static/dashboard.js"></script>
+  <script src="/static/handoff-history.js"></script>
 </body>
 </html>

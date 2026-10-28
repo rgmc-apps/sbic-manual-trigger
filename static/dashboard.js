@@ -1,6 +1,21 @@
 (function () {
   "use strict";
 
+  // ── Tabs (Search vs Handoff History) — plain instant swap, same convention as
+  // reconcile.js's activateActionTab, no crossfade needed for one-off page sections.
+  // Handoff History's own content/data loading lives entirely in handoff-history.js
+  // (included separately below); this only toggles which panel is visible.
+  document.querySelectorAll(".action-tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tabKey = btn.dataset.actionTab;
+      const next = document.getElementById(`action-panel-${tabKey}`);
+      if (!next || btn.classList.contains("active")) return;
+      document.querySelectorAll(".action-tab-btn").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      document.querySelectorAll(".action-tab-panel").forEach((p) => p.classList.toggle("hidden", p !== next));
+    });
+  });
+
   const uploadTypeSelect = document.getElementById("dash-upload-type");
   const refInput         = document.getElementById("dash-ref-input");
   const refLabel         = document.getElementById("dash-ref-label");

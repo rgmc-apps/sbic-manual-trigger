@@ -3,7 +3,8 @@
   const statusMsgEl = document.getElementById("handoff-history-status-msg");
   const refreshBtn = document.getElementById("handoff-history-refresh");
   const groupCodeSelect = document.getElementById("handoff-history-group-code");
-  const statusSelect = document.getElementById("handoff-history-status");
+  const mssqlStatusSelect = document.getElementById("handoff-history-mssql-status");
+  const bcStatusSelect = document.getElementById("handoff-history-bc-status");
   if (!listEl) return; // not on this page
 
   function escapeHtml(s) {
@@ -24,69 +25,54 @@
     }
   }
 
-  function renderFileGroups(byFile) {
-    const fileEntries = Object.entries(byFile || {});
-    if (!fileEntries.length) return "";
-    // Largest files first so the most significant uploads surface without scrolling.
-    fileEntries.sort((a, b) => (b[1] || []).length - (a[1] || []).length);
-    return fileEntries.map(([fileName, refs]) => {
-      refs = refs || [];
-      const id = `handoff-refs-${Math.random().toString(36).slice(2, 10)}`;
-      return `
-        <div class="handoff-history-file">
-          <div class="handoff-history-file-head">
-            <span class="handoff-history-filename">${escapeHtml(fileName)}</span>
-            <span class="handoff-history-file-count">${refs.length} PO(s)</span>
-            ${refs.length ? `<button class="btn-history-toggle" type="button" data-target="${id}">Show PO refs</button>` : ""}
-          </div>
-          ${refs.length ? `<div class="handoff-history-refs hidden" id="${id}">${refs.map(escapeHtml).join(", ")}</div>` : ""}
-        </div>
-      `;
-    }).join("");
+  // MSSQL: "inserted" is the only non-error outcome. BC: "created" is the only fully
+  // resolved outcome — "pending"/"not_attempted" are neutral (nothing has gone wrong
+  // yet), "buffered"/"error" are the ones worth flagging.
+  function mssqlBadgeClass(status) {
+    return status === "inserted" ? "ready" : "failed";
   }
-
-  function renderTables(tables) {
-    const entries = Object.entries(tables || {});
-    if (!entries.length) return '<p class="tab-empty">No tables recorded.</p>';
-    return entries.map(([tableName, info]) => {
-      const byFile = (info && info.by_file) || {};
-      const count = (info && info.count) ?? 0;
-      return `
-        <div class="handoff-history-table">
-          <div class="handoff-history-table-head">
-            <strong>${escapeHtml(tableName)}</strong> — ${count} PO ref(s) across ${Object.keys(byFile).length} file(s)
-          </div>
-          ${renderFileGroups(byFile) || '<p class="tab-empty">No PO refs recorded.</p>'}
-        </div>
-      `;
-    }).join("");
+  function bcBadgeClass(status) {
+    if (status === "created") return "ready";
+    if (status === "buffered" || status === "error") return "failed";
+    return "pending";
   }
 
   function renderRecord(rec) {
-    const isError = rec.status === "error";
     const row = document.createElement("div");
     row.className = "order-row history-row";
     row.innerHTML = `
       <div class="order-row-head">
-        <span class="order-ref">${escapeHtml(rec.group_code || "—")} &middot; ${escapeHtml(rec.method || "—")}</span>
-        <span class="order-badge ${isError ? "failed" : "ready"}">${escapeHtml(rec.status || "unknown")}</span>
+        <span class="order-ref">${escapeHtml(rec.po_ref_number || "—")}</span>
+        <span class="order-badge ${mssqlBadgeClass(rec.mssql_status)}">MSSQL: ${escapeHtml(rec.mssql_status || "unknown")}</span>
+        <span class="order-badge ${bcBadgeClass(rec.bc_status)}">BC: ${escapeHtml(rec.bc_status || "unknown")}${rec.bc_order_no ? " (" + escapeHtml(rec.bc_order_no) + ")" : ""}</span>
       </div>
       <div class="order-detail">
-        ${escapeHtml(rec.date || "—")} ${escapeHtml(rec.time || "")} &middot; ${formatTimestamp(rec.timestamp)}
+        ${escapeHtml(rec.group_code || "—")} &middot; ${escapeHtml(rec.method || "—")} &middot;
+        ${escapeHtml(rec.file_name || "—")} &middot; ${formatTimestamp(rec.timestamp)}
       </div>
-      ${renderTables(rec.tables)}
-      ${rec.error ? `<div class="order-error">${escapeHtml(rec.error)}</div>` : ""}
+      ${rec.mssql_error ? `<div class="order-error">MSSQL: ${escapeHtml(rec.mssql_error)}</div>` : ""}
+      ${rec.bc_error ? `<div class="order-error">BC: ${escapeHtml(rec.bc_error)}</div>` : ""}
     `;
-    row.querySelectorAll(".btn-history-toggle").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const target = document.getElementById(btn.dataset.target);
-        if (!target) return;
-        const show = target.classList.contains("hidden");
-        target.classList.toggle("hidden", !show);
-        btn.textContent = show ? "Hide PO refs" : "Show PO refs";
-      });
-    });
     return row;
+  }
+
+  // Groups the flat per-PO list by source file so related POs still read together,
+  // largest files first — same convention the previous by-table/by-file view used.
+  function renderGroupedByFile(records) {
+    const byFile = new Map();
+    records.forEach((rec) => {
+      const key = rec.file_name || "(unknown file)";
+      if (!byFile.has(key)) byFile.set(key, []);
+      byFile.get(key).push(rec);
+    });
+    const groups = [...byFile.entries()].sort((a, b) => b[1].length - a[1].length);
+    groups.forEach(([fileName, recs]) => {
+      const head = document.createElement("div");
+      head.className = "handoff-history-file-head";
+      head.innerHTML = `<span class="handoff-history-filename">${escapeHtml(fileName)}</span><span class="handoff-history-file-count">${recs.length} PO(s)</span>`;
+      listEl.appendChild(head);
+      recs.forEach((rec) => listEl.appendChild(renderRecord(rec)));
+    });
   }
 
   function render(records) {
@@ -98,13 +84,14 @@
       listEl.appendChild(empty);
       return;
     }
-    records.forEach((rec) => listEl.appendChild(renderRecord(rec)));
+    renderGroupedByFile(records);
   }
 
   async function load() {
     const params = new URLSearchParams();
     if (groupCodeSelect.value) params.set("group_code", groupCodeSelect.value);
-    if (statusSelect.value) params.set("status", statusSelect.value);
+    if (mssqlStatusSelect.value) params.set("mssql_status", mssqlStatusSelect.value);
+    if (bcStatusSelect.value) params.set("bc_status", bcStatusSelect.value);
 
     refreshBtn.disabled = true;
     statusMsgEl.textContent = "Loading…";
@@ -123,6 +110,7 @@
 
   refreshBtn.addEventListener("click", load);
   groupCodeSelect.addEventListener("change", load);
-  statusSelect.addEventListener("change", load);
+  mssqlStatusSelect.addEventListener("change", load);
+  bcStatusSelect.addEventListener("change", load);
   load();
 })();
