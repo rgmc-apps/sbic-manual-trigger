@@ -3654,7 +3654,19 @@ def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: s
     """
     header = {k: v for k, v in header.items() if k not in BQ_UI_ONLY_HEADER_FIELDS}
     try:
+        # insert-from-bigquery is rate_limit-gated in rgmc-gcp-api, keyed on
+        # path+groupcode with NO groupcode given here defaulting every call to the
+        # SAME "customerpoul" bucket (30s cooldown) — harmless for a single retrigger,
+        # but the batch route below calls this once per PO back-to-back, so without a
+        # per-PO groupcode every PO after the first in any 30s window gets a 429 AFTER
+        # its staging rows were already deleted by cleanup-staging (confirmed live,
+        # 2026-10-28 MTC batch: 1 of 54 POs succeeded, the other 53 lost their staging
+        # rows for nothing). A distinct groupcode per po_ref gives each call its own
+        # bucket — still only ever called once per po_ref here, so the actual
+        # protection this rate limit exists for (repeated hammering of the SAME PO)
+        # is untouched.
         resp = _gcp_api("POST", "/customerpoul/insert-from-bigquery",
+                         params={"groupcode": f"retrigger-{po_ref}"},
                          json={"headers": [header], "details": details}, timeout=90)
         body, status_code = _proxy_json(resp)
     except requests.RequestException as exc:
