@@ -107,6 +107,17 @@
               <span id="reprocess-btn-label">Reprocess Buffer</span>
             </button>
           </div>
+
+          <div class="toolbar file-scope-toolbar">
+            <div class="form-group">
+              <label class="form-label" for="file-scope-input">Filter to one file (filename or a sample PO ref)</label>
+              <input class="form-input" type="text" id="file-scope-input"
+                     placeholder="e.g. portal/PO-upload-2026-10-28.pdf or PO414226100110212" />
+            </div>
+            <button class="btn-history-toggle" id="file-scope-apply-btn" type="button">Filter</button>
+            <button class="btn-history-toggle hidden" id="file-scope-clear-btn" type="button">Clear filter</button>
+          </div>
+          <p class="status-line" id="file-scope-status"></p>
         </div>
 
         <div class="action-tab-panel hidden" id="action-panel-cloudsql">
@@ -742,6 +753,7 @@
         Linked to <strong class="resolved-text"></strong>
         <span class="resolved-by"></span>
         <button class="btn-unlink" type="button">Undo</button>
+        <div class="resolved-queued-note">Saved — click <strong>Reprocess Buffer</strong> to send these PO(s) to Business Central.</div>
       </div>
       <div class="group-blocked-note hidden"></div>
       <div class="group-ambiguous-note hidden"></div>

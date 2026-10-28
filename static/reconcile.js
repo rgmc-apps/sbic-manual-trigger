@@ -95,6 +95,10 @@
   const soUpdateModalConfirm   = document.getElementById("so-update-modal-confirm");
   const loadBtn       = document.getElementById("load-btn");
   const reprocessBtn  = document.getElementById("reprocess-btn");
+  const fileScopeInput    = document.getElementById("file-scope-input");
+  const fileScopeApplyBtn = document.getElementById("file-scope-apply-btn");
+  const fileScopeClearBtn = document.getElementById("file-scope-clear-btn");
+  const fileScopeStatus   = document.getElementById("file-scope-status");
   const syncBtn       = document.getElementById("sync-btn");
   const backfillBtn   = document.getElementById("backfill-btn");
   const backfillDateFrom = document.getElementById("backfill-date-from");
@@ -198,6 +202,27 @@
   // { company, order_count, orders, groups: { sku: [...], branch: [...], customer: [...] } }
   let state = null;
 
+  // Buffer tab's "filter to one file" scope — { fileName, poRefs: Set<upper string> } |
+  // null. Narrows which groups visibleGroups() shows (a group stays visible if ANY of
+  // its po_refs falls in scope — resolving it still applies to every PO it covers,
+  // in or out of scope; this only narrows the DISPLAY list, never what a Link action
+  // affects). Lookups/mutations that need the real, complete data (findGroup,
+  // groupResolvedFor, highlightHighConfidenceMatches) deliberately keep reading
+  // state.groups[type] directly, never this filtered view.
+  let fileScope = null;
+
+  function visibleGroups(type) {
+    const list = (state && state.groups[type]) || [];
+    if (!fileScope) return list;
+    return list.filter((g) => (g.po_refs || []).some((ref) => fileScope.poRefs.has(String(ref).trim().toUpperCase())));
+  }
+
+  function visibleOrders() {
+    const list = (state && state.orders) || [];
+    if (!fileScope) return list;
+    return list.filter((o) => fileScope.poRefs.has(String((o.header || {}).poRefNumber || "").trim().toUpperCase()));
+  }
+
   // ── Shared motion helpers ────────────────────────────────────────────────
   // Reveal an element the first time it goes visible (state entry), never on
   // repeat re-renders — repeated reveal animation is decoration, not state.
@@ -259,7 +284,7 @@
 
     let totalGroups = 0, totalResolved = 0;
     ["sku", "branch", "customer", "uom"].forEach((type) => {
-      const list = state.groups[type];
+      const list = visibleGroups(type);
       const done = resolvedCount(list);
       setStatText(`stat-${type}`, `${done}/${list.length}`);
       document.getElementById(`tab-count-${type}`).textContent = list.length ? `(${done}/${list.length})` : "";
@@ -330,8 +355,13 @@
     });
   }
 
-  function resolvedPayload(type, candidate) {
-    if (type === "sku") return { itemNo: candidate.code, description: candidate.name };
+  // `key` (the raw customerSKUCode this link is for, when known) is stored as
+  // referenceNo on a "sku" resolution — the same raw-text identity BC's own Item
+  // Reference entity (referenceNo/itemNo) uses, so a human's manual link here reads
+  // the same way a real BC item reference would if this SKU ever gets registered as
+  // one. Never fetched/looked up from BC — just the override's own key, carried along.
+  function resolvedPayload(type, candidate, key) {
+    if (type === "sku") return { itemNo: candidate.code, description: candidate.name, referenceNo: key || "" };
     if (type === "branch") return { customerNo: candidate.extra, shipToCode: candidate.code, name: candidate.name };
     if (type === "uom") return { uomCode: candidate.code, description: candidate.name };
     return { customerNo: candidate.code, displayName: candidate.name };
@@ -457,7 +487,7 @@
   // Returns { customerLinkError, customerScopedToBranch } rather than throwing on the
   // secondary save, since the branch link itself still succeeded either way.
   async function applyLinkToGroup(type, group, candidate, resolvedBy) {
-    const resolved = resolvedPayload(type, candidate);
+    const resolved = resolvedPayload(type, candidate, group.key);
     const data = await saveOverride(type, group.key, resolved, resolvedBy, group.buffer_ids);
     applyResolvedFields(group, resolved, data);
 
@@ -1306,11 +1336,13 @@
     const panel = document.getElementById(`panel-${type}`);
     panel.innerHTML = "";
     if (type === "sku") panel.appendChild(buildSkuResolveHint());
-    const groups = state.groups[type];
+    const groups = visibleGroups(type);
     if (!groups.length) {
       const empty = document.createElement("div");
       empty.className = "tab-empty";
-      empty.textContent = "Nothing to reconcile — no buffered orders reference this.";
+      empty.textContent = fileScope
+        ? "No buffered orders from this file reference this."
+        : "Nothing to reconcile — no buffered orders reference this.";
       panel.appendChild(empty);
       return;
     }
@@ -1437,16 +1469,17 @@
   function renderOrdersPanel() {
     const panel = document.getElementById("panel-orders");
     panel.innerHTML = "";
-    if (!state.orders.length) {
+    const orders = visibleOrders();
+    if (!orders.length) {
       const empty = document.createElement("div");
       empty.className = "tab-empty";
-      empty.textContent = "No buffered orders for this company.";
+      empty.textContent = fileScope ? "No buffered orders match this file filter." : "No buffered orders for this company.";
       panel.appendChild(empty);
       return;
     }
     // Not-ready first, then by attempt_count descending — the orders that have been
     // stuck the longest lead the list instead of being buried among resolved ones.
-    const sortedOrders = [...state.orders].sort((a, b) => {
+    const sortedOrders = [...orders].sort((a, b) => {
       const aReady = orderReadiness(a).ready, bReady = orderReadiness(b).ready;
       if (aReady !== bReady) return aReady ? 1 : -1;
       return (b.attempt_count || 0) - (a.attempt_count || 0);
@@ -1620,6 +1653,46 @@
   }
 
   loadBtn.addEventListener("click", loadBuffer);
+
+  // ── Buffer tab: filter to one file (by fileName or a sample PO ref) ────────
+  async function applyFileScope() {
+    const query = fileScopeInput.value.trim();
+    if (!query) {
+      fileScopeStatus.textContent = "Enter a filename or PO ref number first.";
+      fileScopeStatus.classList.add("error");
+      return;
+    }
+    fileScopeApplyBtn.disabled = true;
+    fileScopeStatus.classList.remove("error");
+    fileScopeStatus.textContent = "Resolving…";
+    try {
+      const res = await fetch(`/api/buffer/resolve-file-scope?query=${encodeURIComponent(query)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Could not resolve this file/PO ref");
+      fileScope = { fileName: data.file_name, poRefs: new Set(data.po_ref_numbers.map((r) => r.toUpperCase())) };
+      fileScopeStatus.textContent = `Filtered to "${data.file_name}" — ${data.count} PO(s).`;
+      fileScopeClearBtn.classList.remove("hidden");
+      if (state) renderAll();
+    } catch (e) {
+      fileScopeStatus.textContent = "Error: " + e.message;
+      fileScopeStatus.classList.add("error");
+    } finally {
+      fileScopeApplyBtn.disabled = false;
+    }
+  }
+
+  function clearFileScope() {
+    fileScope = null;
+    fileScopeInput.value = "";
+    fileScopeStatus.textContent = "";
+    fileScopeStatus.classList.remove("error");
+    fileScopeClearBtn.classList.add("hidden");
+    if (state) renderAll();
+  }
+
+  fileScopeApplyBtn.addEventListener("click", applyFileScope);
+  fileScopeClearBtn.addEventListener("click", clearFileScope);
+  fileScopeInput.addEventListener("keydown", (e) => { if (e.key === "Enter") applyFileScope(); });
 
   // Deep link from the BC Alignment Report's "Open Buffer tab — {company}" links
   // (?tab=buffer&company=SBIC) — jumps straight to that tab with the company
@@ -2287,7 +2360,7 @@
       linkPanel.classList.add("is-saving");
       try {
         const resolvedBy = getEmployeeDetails().employee_name;
-        const resolved = resolvedPayload(ov.type, candidate);
+        const resolved = resolvedPayload(ov.type, candidate, ov.key);
         const data = await saveOverride(ov.type, ov.key, resolved, resolvedBy, []);
         ov.resolved = resolved;
         ov.resolved_by = data.resolved_by || "";
@@ -3547,7 +3620,7 @@
     });
 
     async function pickCandidate(candidate) {
-      const resolved = resolvedPayload("sku", candidate);
+      const resolved = resolvedPayload("sku", candidate, item.sku_key);
       // Linking also saves the override (so future searches see this SKU as "ready"
       // automatically) — same /api/overrides endpoint the Overrides tab's SKU links use.
       try {

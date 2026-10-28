@@ -299,6 +299,23 @@ def _extract_uom_issues(order: dict) -> list[dict]:
     return list(issues.values())
 
 
+_NUMERIC_SKU_FLOAT_ARTIFACT_RE = re.compile(r"^(\d+)\.0$")
+
+
+def _canonical_sku_code(sku: str) -> str:
+    """Strips a numeric SKU's "ragged" trailing ".0" — a pandas/BigQuery float-
+    coercion artifact (an all-digit SKU like "218720608619709" that passed through a
+    pandas Series/DataFrame anywhere upstream, e.g. _recover_lines_for_order's
+    BigQuery int_document_ai_detail fallback, serializes back out as
+    "218720608619709.0") — so a line recovered that way groups with the same SKU's
+    clean-string occurrences instead of showing up as a separate, duplicate-looking
+    SKU group for the same item. Only strips when the whole value is digits plus
+    exactly one trailing ".0" — never touches an alphanumeric SKU or a genuine
+    decimal value (anything with other digits after the decimal point)."""
+    m = _NUMERIC_SKU_FLOAT_ARTIFACT_RE.match(sku)
+    return m.group(1) if m else sku
+
+
 def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = None) -> dict:
     """Group buffered orders by shared SKU code / customer branch name / customer name.
 
@@ -369,6 +386,7 @@ def _group_buffer(orders: list, overrides: list, inactive_skus: list | None = No
             qty_ok = _positive(line.get("poQtyPcs")) or _positive(line.get("poQty"))
 
             if sku:
+                sku = _canonical_sku_code(sku)
                 dict_key = sku.upper()
                 display_key = sku
             else:
@@ -598,6 +616,48 @@ def api_buffer_lines():
         return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
+@app.route("/api/buffer/resolve-file-scope")
+def api_buffer_resolve_file_scope():
+    """Resolves the Buffer tab's "filter to one file" search box: `query` is either an
+    exact BigQuery fileName, or a sample PO ref number from that file — either way,
+    returns every po_ref_number BigQuery's int_document_ai has under that file, so the
+    frontend can narrow the already-loaded buffer groups down to just those POs
+    without a second full buffer fetch.
+
+    PO uploads only (int_document_ai) — this is the Buffer tab's own SBIC/SUNCOAST
+    PO-import scope, same as every other BigQuery lookup already in this file.
+    """
+    query = (request.args.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+
+    file_name = query
+    try:
+        search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
+                                params={"po_ref_number": query}, timeout=30)
+        search_body, search_status = _proxy_json(search_resp)
+        if search_status == 200 and (search_body.get("data") or []):
+            # query matched an exact PO ref — use ITS file, not the raw query text.
+            file_name = search_body["data"][0].get("file_name") or query
+    except requests.RequestException:
+        pass  # fall through and try query as a literal file_name instead
+
+    try:
+        file_resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
+            "table_name": "int_document_ai", "where_column": "file_name", "where_value": file_name,
+        }, timeout=60)
+        file_body, file_status = _proxy_json(file_resp)
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+    if file_status != 200:
+        return jsonify(file_body), file_status
+
+    po_refs = sorted({r.get("po_ref_number") for r in (file_body.get("data") or []) if r.get("po_ref_number")})
+    if not po_refs:
+        return jsonify({"error": f"No PO found for {query!r} — not a known fileName or PO ref number."}), 404
+    return jsonify({"file_name": file_name, "po_ref_numbers": po_refs, "count": len(po_refs)})
 
 
 def _multi_field_contains_search(path: str, company: str, search: str, fields: list) -> list:

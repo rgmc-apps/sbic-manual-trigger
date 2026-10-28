@@ -149,6 +149,8 @@
 .toolbar-select { margin-bottom: 0; min-width: 220px; }
 .backfill-toolbar { margin-top: 14px; }
 .backfill-toolbar .form-group { margin-bottom: 0; }
+.file-scope-toolbar { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.file-scope-toolbar .form-group { margin-bottom: 0; flex: 1 1 360px; }
 /* From/To here are plain .form-group (no .toolbar-select — a date input doesn't need
    its 220px min-width), which left them carrying the page-wide 20px bottom margin
    while every .toolbar-select sibling (PO Ref/Customer/Company) overrides it to 0 —
