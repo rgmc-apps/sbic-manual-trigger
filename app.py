@@ -3461,7 +3461,7 @@ def api_dashboard_files():
             params[key] = value
 
     try:
-        resp = _gcp_api("GET", "/bigquery_routes/upload-dashboard/files", params=params, timeout=60)
+        resp = _gcp_api("GET", "/bigquery_routes/upload-dashboard/files", params=params, timeout=BQ_PROXY_TIMEOUT)
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
     except requests.RequestException as exc:
