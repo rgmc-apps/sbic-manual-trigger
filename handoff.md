@@ -9,307 +9,236 @@ Pub/Sub-driven BC writes, the BigQuery bridge itself), `rgmc-bc-api`
 (`C:\claude\rgmc-bc-api` — BC/Firestore buffer API), `rgmc-it-bot`
 (`C:\claude\rgmc-it-bot` — MS Teams bot, untouched this session), and
 `sbic-manual-trigger-page` (`C:\claude\sbic-manual-trigger-page`, this repo — the `/`,
-`/trigger`, `/dashboard`, and `/reconcile` Flask UI). This session picked up from a
-prior handoff and tackled, in order:
+`/trigger`, `/dashboard`, and `/reconcile` Flask UI).
 
-1. Investigated a live production bug: PO ref "CSS #320647" got **32 duplicate Sales
-   Orders** in BC (31 empty, one real). Root-caused to a `#` character in the PO ref
-   silently truncating a URL in `bc_client.py`'s existing-order dedup check (`requests`/
-   `urllib` treats a bare `#` as a URL fragment and drops everything after it).
-2. Added a "Retrigger Handoff (MSSQL)" button (single-PO, then batch) to let a human
-   manually re-send a stuck PO's BigQuery data into MSSQL's staging tables.
-3. Built a full "BigQuery Bridge Handoff History" log — Firestore-backed, one record
-   per PO, showing three independent statuses: did it land in MSSQL, did the AFTER
-   INSERT trigger actually promote it to the real table, did Business Central
-   creation succeed — displayed on both `/trigger` and `/dashboard`.
-4. Fixed a second live crash (`'dict' object has no attribute 'drop'`) in the
-   BigQuery bridge's `main()`, and added a 5-minute cooldown + in-progress lock to
-   stop automated bridge triggers from re-firing back-to-back and spamming
-   notifications.
-5. Disabled email/Teams notifications for the noisy 2-hourly `customerpoul-backfill-
-   held-back` Cloud Scheduler job, while keeping real upload/handoff notifications.
-6. Investigated (and found NOT a bug, but a UX clarity gap) why linked SKUs on the
-   Buffer Reconciliation page "don't seem to apply" without clicking Reprocess
-   Buffer — added an explicit "Saved — click Reprocess Buffer to send to BC" note.
-7. Fixed a real duplicate-SKU-group display bug (a numeric SKU's pandas/BigQuery
-   float-coercion artifact, e.g. `"218720608619709"` vs `"218720608619709.0"`,
-   showing as two separate groups).
-8. Added a "filter to one file" search box on the Buffer Reconciliation page
-   (by filename or a sample PO ref number).
-9. Added `referenceNo` (the raw linked SKU code) to saved SKU overrides in Firestore.
+This session picked up from a prior handoff (which built the Retrigger/Handoff
+History feature set) and, after everything was confirmed deployed, moved into a live
+production investigation: **why do some POs in a given upload batch never make it
+from MSSQL's staging tables (`CustomerPOULBQ`/`CustomerPOULDetailBQ`) into the real
+`CustomerPOUL`/`CustomerPOULDetail` tables via the AFTER INSERT trigger**, using a
+specific Manila Taste Curators (MTC) file as the concrete case:
+`portal/batch/manila_taste/20261028-112455-9583/7198588257917888432/0/20261028-112455-74bd09-PO_DETAIL_0 (28) (3)-0.json`
+(50 POs). This investigation found and fixed a real bug in this session's own batch
+retrigger code, and surfaced a structural root-cause issue in the MSSQL trigger
+itself that is **out of scope for application-code fixes** — needs a DBA.
 
 ## Current State
 
-**Everything from this session is committed AND deployed, confirmed live.** This is
-a major change from where the session started (nothing deployed) — the user
-committed and deployed repeatedly throughout, out-of-band, as has been their pattern
-all along. Verified directly against production:
+**All application code this session is committed and deployed, confirmed live**
+(`sbic-manual-trigger-page` HEAD `a2eecb1`, Cloud Run revision
+`sbic-manual-trigger-00099-59l`). The MTC file batch is now **52 of 54 POs
+successfully promoted** into `CustomerPOUL` (up from 21 before this session's work) —
+2 PO refs remain stubbornly stuck with no identified root cause yet (see below). The
+underlying MSSQL trigger design flaw that caused the original mass-failure is fully
+diagnosed but **not fixed** — fixing it requires DBA access to `tr_CustomerPOBQ`
+(the trigger itself), which nobody in this session's toolchain has write access to.
 
-- **`sbic-manual-trigger-page`** (this repo, branch `master`): clean working tree,
-  HEAD = `f393405` "DI-0229 added manual trigger for handoff and other fixes". Cloud
-  Run revision `sbic-manual-trigger-00097-m26` is live and serving — confirmed by
-  curling `/api/buffer/resolve-file-scope` (added in the LAST commit) and getting a
-  proper JSON 404, not an HTML error page.
-- **`rgmc-gcp-api`**: clean, HEAD = `db1a67d` "DI-0229 added handoff retrigger with
-  cleanup". Confirmed live: `POST /customerpoul/cleanup-staging` responds correctly.
-- **`rgmc-bc-api`** (branch `staging`): clean, HEAD = `19ca7fc` "DI-0229 added mssql
-  handoff retrigger with cleanup". Confirmed live: `GET .../handoff-history
-  ?mssql_status=inserted` returns the new per-PO schema (`mssql_status`,
-  `trigger_status`, `bc_status` fields) — **and already has a real record** from the
-  user testing the retrigger button live (`PO407026102301579`, `trigger_status:
-  "promoted"`, `method: "manual-dashboard-retrigger"`), so the single-PO retrigger
-  flow is confirmed working end-to-end in production.
-- **`rgmc-worker-pool`**: clean, HEAD = `1edcc52` "DI-0229 added handoff retrigger
-  with cleanup". Worker-pool revision `rgmc-worker-pool-00112-8kh`, created
-  2026-10-28T10:30:46Z (today, recent — consistent with this session's commits being
-  live).
-- **`rgmc-it-bot`**: untouched this session.
+### What's fixed and confirmed working
+- **Rate-limit collision bug in the batch retrigger** (`app.py`,
+  `_insert_mssql_and_log`): `/customerpoul/insert-from-bigquery` in rgmc-gcp-api is
+  rate-limited 30s per `path+groupcode`, defaulting every call to the same
+  `"customerpoul"` bucket. The batch retrigger calls this once per PO, back-to-back —
+  without a distinct `groupcode` per PO, every call after the first in any 30s window
+  got a 429 **after** `cleanup-staging` had already deleted that PO's staging rows,
+  net effect: data loss with no insert to replace it. **Fixed** by passing
+  `params={"groupcode": f"retrigger-{po_ref}"}` on that call, giving each PO its own
+  rate-limit bucket (the actual protection the limiter exists for — stopping repeated
+  hammering of the *same* PO — is untouched). Confirmed live: re-ran the batch after
+  deploying this fix and got 54/54 successful inserts, 52/54 promoted.
+- **Read/investigated `tr_CustomerPOBQ`'s actual SQL** directly from MSSQL via
+  `sys.tables` → `sys.triggers` → `sys.sql_modules` (read-only, through the existing
+  generic `GET /sbic/by_table/value` endpoint, which interpolates `table_name`/
+  `where_column` unescaped — usable for diagnostic system-catalog queries by setting
+  `table_name=sys.triggers` etc.; see Context & Gotchas).
 
-**Not independently confirmed working** (built and deployed, but not yet observed
-live by either the user or this session):
-- The Batch Retrigger panel (PO Ref Number(s) / Date Range modes) and the
-  per-file-group "Retrigger whole file" button on the Handoff History tab.
-- The Buffer page's new "filter to one file" search box.
-- The 5-minute bridge-run cooldown lock (`bridge_run_lock.py`) actually preventing a
-  real back-to-back trigger storm — no bridge run has been observed since deploy.
-- Whether the `customerpoul-backfill-held-back` Scheduler job's next run (every 2h,
-  7am-8pm Mon-Fri Asia/Manila) is actually silent now (no email/Teams notification).
-- Whether the "CSS #320647"-style duplicate-order bug is actually fixed in a live
-  re-trigger scenario (the fix itself — `params=` instead of raw URL interpolation —
-  was verified via a local `requests` test proving the `#` now survives intact, but
-  not re-tested against a live duplicate-prone PO).
+### Root cause of the original "most of the batch not promoted" symptom (diagnosed, not fixed)
+`tr_CustomerPOBQ` (AFTER INSERT trigger on `CustomerPOULBQ`) has two compounding
+design issues:
+1. It does **not** scope to the newly-inserted rows at all — its very first
+   statement is `SELECT ... INTO #tmpPO FROM CustomerPOULBQ Header INNER JOIN
+   CustomerPOULDetailBQ Detail ON ... WHERE poStatus = 'NEW'` — it reprocesses
+   **every row in the whole table still marked `'NEW'`**, every single time it
+   fires, regardless of company or file.
+2. The final section (`BEGIN TRANSACTION` / two `INSERT`s into `CustomerPOUL`/
+   `CustomerPOULDetail` / `UPDATE CustomerPOULBQ SET poStatus = 'DONE'` /
+   `COMMIT TRANSACTION`) runs under `SET XACT_ABORT ON` with **no TRY/CATCH
+   anywhere in the trigger**. If any single row in that combined `#tmpPO` set
+   throws a DB-level error during the INSERT, the **entire transaction rolls
+   back** — nothing gets promoted, and `poStatus` never gets flipped to `'DONE'`
+   for anyone in that run, including perfectly good rows.
 
-**Still unresolved from a prior handoff, carried forward, never addressed this
-session**: whether the Supabase migration for `rgmc-it-bot`'s new
-`po_upload_subscriptions` table was ever actually run. The user said "I'll run it
-now" early in this session; no confirmation was given afterward, and it was never
-circled back to. The PO-upload Teams chat notifications feature (built in an earlier
-session) still depends on this table existing.
+Since a failed row's `poStatus` stays `'NEW'` forever, every future insert
+re-triggers reprocessing of the same accumulated backlog, which only grows. **Live-
+confirmed 127 rows stuck at `poStatus = 'NEW'` across the whole table** (not just
+MTC — old `SUNCOAST BRANDS` rows too), explaining why every multi-row automated/
+manual bridge run for this MTC file promoted exactly 0 of ~30 rows, every time,
+while single-row inserts (via the Retrigger button, which does `cleanup-staging`
+then one isolated `insert-from-bigquery` per PO) worked — a single-row batch is far
+less likely to collide with whatever's poisoning the shared backlog, and once the
+rate-limit bug above was fixed, doing the whole file one-row-at-a-time via the batch
+retrigger got 52/54 through.
+
+### Unresolved: 2 PO refs that still won't promote
+`PO407026102111893` and `PO407026102304020` — retried individually, repeatedly,
+after the rate-limit fix was live. Every attempt shows the identical, reproducible
+pattern:
+- `insert-from-bigquery` reports HTTP 200 / `status: "success"`.
+- **Detail** rows (5 and 3 respectively) land in `CustomerPOULDetailBQ` every time —
+  confirmed by direct read immediately after.
+- The **header** row **never persists** in `CustomerPOULBQ` afterward at all — not
+  an error, just silently absent on the next read. `cleanup-staging`'s own response
+  confirms this: `header_rows_deleted: 0` every time (there was never one there to
+  delete before the "successful" insert that's about to not-persist again).
+- `trigger_status: not_promoted` (expected — there's no header for the trigger to
+  act on).
+
+**This was NOT a cross-file duplicate-upload bug** (an earlier, disproven
+hypothesis — see Failed Attempts) — it's specific to these two PO refs' header
+insert itself failing to commit, for an unknown reason, every single time, via the
+exact same code path that worked for the other 52. No tool available in this
+session's toolchain can show the actual SQL Server error for a write statement
+(only read-only equality lookups) — a DBA with direct query/profiler access to
+MSSQL is needed to find out why.
 
 ## Files Actively Being Edited
 
-All committed — listed for reference on what changed and why, newest work first.
+- **`sbic-manual-trigger-page/app.py`** — committed (`a2eecb1`, `f5ddd34`), deployed
+  (revision `-00099-59l`). Net change from this session's investigation:
+  - `_insert_mssql_and_log`: added `params={"groupcode": f"retrigger-{po_ref}"}` on
+    the `/customerpoul/insert-from-bigquery` call (the rate-limit collision fix —
+    permanent, keep this).
+  - `api_handoff_history_retrigger_mssql_batch`'s docstring updated to document
+    *why* headers are re-fetched by `po_ref_number` (not read directly from the
+    file-scoped lookup) — this was almost "fixed" to do the opposite during this
+    session (see Failed Attempts) and reverted; the docstring now explains why that
+    direction is wrong, to stop a future session from re-attempting it.
+  - No other code changes this session — everything else (routes, UI) is exactly
+    what was already deployed per the prior handoff.
 
-**`sbic-manual-trigger-page`** (commits `428563d`..`f393405`):
-- `app.py` — major additions: `_canonical_sku_code()`/`_NUMERIC_SKU_FLOAT_ARTIFACT_RE`
-  (strips a numeric SKU's trailing ".0" artifact before grouping, used in
-  `_group_buffer`); `/api/buffer/resolve-file-scope` (resolves a filename-or-PO-ref
-  query to the full po_ref_number set for that BigQuery upload); `/api/handoff-history/
-  retrigger-mssql` + `/api/handoff-history/retrigger-mssql-batch` (the latter accepts
-  exactly one of `po_ref_numbers`/`file_name`/`date_from`+`date_to`) plus shared
-  helpers `_insert_mssql_and_log`/`_cleanup_and_reinsert_po`; `/api/dashboard/
-  mssql-status` extended with `promoted_in_mssql`/`retrigger_supported`; `/api/handoff-
-  history` proxy updated for the new `mssql_status`/`bc_status` filter shape. The OLD
-  `/api/dashboard/retrigger-mssql-handoff` route was removed (superseded by the
-  shared retrigger-mssql endpoint, nothing else called it).
-- `static/reconcile.js` — `visibleGroups()`/`visibleOrders()` (client-side file-scope
-  filtering, never mutates `state.groups` itself — lookups like `findGroup`/
-  `groupResolvedFor`/`highlightHighConfidenceMatches` deliberately still read
-  `state.groups[type]` directly, unfiltered); `applyFileScope()`/`clearFileScope()`;
-  `resolvedPayload()` now takes an optional `key` param, stored as `referenceNo` for
-  "sku"-type resolutions.
-- `templates/reconcile.html` — new file-scope filter toolbar in `#action-panel-
-  buffer`; the `group-resolved` badge in `#group-row-template` now includes a
-  `.resolved-queued-note` explaining Reprocess Buffer is still required.
-- `static/reconcile.css` — `.file-scope-toolbar` styling.
-- `static/dashboard.js` — `renderRetriggerAction()` (renamed/rewritten from
-  `renderRetriggerMssqlAction`, now calls the shared `/api/handoff-history/
-  retrigger-mssql` by `po_ref_number` alone instead of header+details); Check MSSQL
-  now also checks `promoted_in_mssql` and offers retrigger for the "staged but never
-  promoted" case, not just "not found at all".
-- `static/handoff-history.js` — shared by `/trigger` and `/dashboard` (both load this
-  file + matching card markup): per-PO MSSQL/Trigger/BC status badges; per-record
-  retrigger button (gated on `group_code === "customerpoul"` and `mssql_status ===
-  "error" || trigger_status === "not_promoted"`); per-file-group "Retrigger whole
-  file (N)" button; new Batch Retrigger panel (PO Ref Number(s) / Date Range modes)
-  wired to the batch endpoint.
-- `templates/index.html` / `templates/dashboard.html` — Handoff History card markup
-  updated: `mssql_status`/`bc_status` filter dropdowns (replacing one generic
-  `status` dropdown), new Batch Retrigger panel markup.
-- `static/style.css` — `.order-badge.pending`, `.handoff-history-retrigger-action`/
-  `-result`, `.handoff-history-batch-retrigger` rules.
-- `cloudbuild.yaml` — **real bug fix, not just a workaround**: image tag changed from
-  `$COMMIT_SHA` to `$BUILD_ID`. `$COMMIT_SHA` is only populated for trigger-based Cloud
-  Build runs; a manual `gcloud builds submit` left it empty, producing an invalid
-  image reference (`...sbic-manual-trigger:` with no tag) and failing outright.
-  `$BUILD_ID` is always populated regardless of how the build was started.
-
-**`rgmc-gcp-api`** (commit `db1a67d`):
-- `src/services/bc_client.py` — `v2_find_sales_order_by_external_doc_no` and
-  `v2_find_sales_order_by_number` now pass their OData `$filter` via `params=`
-  instead of hand-interpolating it into the URL string. Root cause of the CSS
-  #320647 duplicate-orders bug: a raw `#` in the URL is treated as a fragment
-  delimiter and silently dropped by `requests`/`urllib`, truncating the filter to an
-  unterminated string literal that matched nothing — so the existing-order dedup
-  check always reported "not found," and `_create_order` kept creating a fresh
-  duplicate header every automated run.
-- `src/routers/sbic_routes/_db.py` — new `run_execute()` (commits writes; the
-  pre-existing `run_query()` never calls `.commit()`, which is fine for SELECTs but
-  would silently roll back a DELETE/UPDATE).
-- `src/routers/sbic_routes/CustomerPOUL.py` — new `POST /customerpoul/cleanup-staging
-  ?po_ref_number=X` — deletes a PO's rows from `CustomerPOULDetailBQ`/`CustomerPOULBQ`
-  (staging only, never the promoted tables) so a follow-up insert gets a genuinely
-  fresh `INSERT` for the AFTER INSERT trigger to react to.
-
-**`rgmc-bc-api`** (commits `c00fafe`, `19ca7fc`, branch `staging`):
-- `src/services/so_buffer_service.py` — `list_handoff_history` now filters on
-  `mssql_status`/`bc_status` (was a single generic `status`); new
-  `record_manual_handoff(po_ref_number, file_name, mssql_status, error, trigger_status)`.
-- `src/routers/bc_routes/so_buffer_routes.py` — `GET .../handoff-history` updated;
-  new `POST .../handoff-history/manual-entry`.
-
-**`rgmc-worker-pool`** (commits `2b2b5fc`..`1edcc52`):
-- `src/services/bridge_handoff_history.py` — **redesigned from run-level/table-
-  grouped docs to one Firestore document per PO ref**. `record_handoff(group_code,
-  method, mssql_status, po_refs_by_file, error=None, trigger_results=None)` —
-  `mssql_status` is `"inserted"`/`"error"`; a duplicate-key skip (PO already in MSSQL
-  from an earlier run) is deliberately never re-recorded, to avoid spamming the
-  history every time BigQuery re-serves an already-ingested row (a known, accepted
-  upstream limitation — see Context & Gotchas). New `update_bc_status(po_ref_number,
-  bc_status, so_number=None, error=None)` — patches whichever doc is still
-  `bc_status: "pending"` for that po_ref, called from `so_import_worker.py`.
-- `src/services/bigquery_bridge.py` — **two fixes**: (1) `main()` now bails out
-  immediately with the original fetch's own error if either `header_table` or
-  `detail_table` isn't a real DataFrame (i.e. `__get_bigquery_data` returned its
-  `{"status":"error",...}` sentinel dict) — previously only bailed when BOTH were
-  invalid, so a header-fetch-succeeds/detail-fetch-fails split sailed into
-  `__rename_columns`, which crashed calling `.drop()` on a dict. (2) new
-  `__verify_trigger_promotion(header_table, mssql_header_table_name, main_key)` — one
-  bulk SELECT against the PROMOTED table (`CustomerPOUL`/`CustomerRA`, mapped via
-  `_PROMOTED_TABLE_BY_STAGING_TABLE`) confirming which po_refs the AFTER INSERT
-  trigger actually promoted; wired into the success-path `record_handoff` call as
-  `trigger_results`. Also removed now-dead `po_to_file` local (only needed for a
-  detail-table grouping call site that no longer exists after the redesign).
-- `src/workers/bigquery_bridge_worker.py` — new `bridge_run_lock` gate: for
-  `method == "triggered"` messages only (never manual), skips (acks, drops) a run if
-  one is already in progress for that `group_code` or the last one started <5 minutes
-  ago; calls `bridge_run_lock.finish()` in a `finally` block once the real run
-  completes either way.
-- `src/services/bridge_run_lock.py` (**new**) — the lock itself. Firestore collection
-  `bridge_run_lock_{env}`, one doc per `group_code`, fields `status`/`started_at`/
-  `finished_at`. Fails OPEN on any Firestore error (never permanently blocks a real
-  run).
-- `src/workers/so_import_worker.py` — `_run_backfill_from_cloudsql` (the hourly
-  Scheduler job's handler) had ALL its notification calls removed (`_send_batch_
-  notification`, `_send_unmatched_items_notification`, `bot_notify.notify_po_batch`,
-  `bot_notify.notify_po_unmatched`, and the two "skipped (already in BC)"/"nothing to
-  backfill" success emails) — plus the now-dead `extra_recipients`/`requested_by`/
-  `total_headers_considered` locals that only existed to build those. `_run_batch`'s
-  per-order loop (the function that actually talks to BC, used by both live inbound
-  batches AND Reprocess Buffer) now calls `update_bc_status` at all 4 outcome points
-  (created/buffered/BC-locked/exception) to patch the handoff-history record's
-  `bc_status`.
+No other repo's files were modified this session — this was investigation +
+fixing a self-inflicted bug in already-shipped code, not new feature work.
 
 ## Failed Attempts
 
-- **`gcloud builds submit --config cloudbuild.yaml .` with the original cloudbuild.yaml** —
-  **Failed**: `INVALID_ARGUMENT: invalid build: invalid image name
-  "...sbic-manual-trigger:": could not parse reference` — `$COMMIT_SHA` is empty on a
-  manual (non-trigger) submit. Fixed by switching to `$BUILD_ID` in cloudbuild.yaml
-  (see Files section) — this is a permanent fix to the file, not a one-off flag.
-- **`curl -X POST .../customerpoul/cleanup-staging` with no body/headers** —
-  **Failed**: `411 Length Required` from Google's front-end proxy, before even
-  reaching Cloud Run. Known, already-documented gotcha from a prior session: add
-  `-H "Content-Length: 0"` to any bodyless POST against these Cloud Run services.
-- **Treating "linked SKUs don't apply without Reprocess Buffer" as a bug** — spent
-  two rounds of sub-agent investigation; concluded it is NOT a bug, it's the
-  intentional queue-then-apply design (`[[feedback_queue_vs_apply_pattern]]`) —
-  `_run_batch` (Reprocess Buffer or a live inbound batch) is the ONLY code path that
-  ever talks to BC, by design, confirmed in `so_import_worker.py`'s own comments
-  re-deriving overrides fresh rather than trusting the earlier Firestore patch. Fix
-  was a UX clarity note, not a logic change. **Do not re-investigate this as a code
-  bug in a future session** without new evidence.
-- **Assuming the LIPTON duplicate-SKU report could be reproduced live** — queried the
-  live `/api/buffer?company=SBIC` and found no LIPTON line at all (buffer state had
-  moved on since the user's report). The fix (`_canonical_sku_code`) was applied on
-  code-path reasoning alone, not a live-confirmed repro — flagged as unconfirmed in
-  the commit/PR sense, but low-risk and clearly correct given how `_recover_lines_
-  for_order`'s BigQuery fallback works.
+- **Diagnosed a `SUBSTRING`/`PATINDEX` "Invalid length parameter" hypothesis** for
+  the trigger's numeric-branch-code extraction (lines ~155-163 of
+  `tr_CustomerPOBQ`: `SUBSTRING(Header.customerBranchName, PATINDEX('%[0-9]%', ...),
+  PATINDEX('%[0-9][^0-9]%', ... + 't') - PATINDEX('%[0-9]%', ...) + 1)` for a
+  digit-prefixed branch name). Wrote a Python simulation of this exact logic against
+  all 127 live stuck `poStatus='NEW'` rows' `customerBranchName` values — **zero**
+  would produce a non-positive SUBSTRING length. Hypothesis not confirmed by current
+  data (doesn't rule it out for a row that's since been fixed/removed, but not
+  evidenced) — **don't re-pursue this specific computation as the culprit without
+  new evidence.**
+- **Hypothesized the 2 final stuck POs were a cross-file duplicate-upload problem**
+  — found via `document-ai/search?po_ref_number=X` that these two POs' BigQuery row
+  showed a *different* `file_name`
+  (`.../20261028-122502-b5da/.../20261028-122502-a59ff8-PO_DETAIL_0 (28) (3)-0.json`)
+  than the file originally asked about
+  (`.../20261028-112455-9583/.../20261028-112455-74bd09-PO_DETAIL_0 (28) (3)-0.json`).
+  Started fixing the batch retrigger to read headers directly from the file-scoped
+  lookup instead of re-searching by `po_ref_number`. **Then disproved it**: re-queried
+  the ORIGINAL file_name directly — it now returns **0 rows** (all 50 POs' data had
+  moved to the new file_name). This is the *already-known, already-documented*
+  upstream dbt/export-pipeline quirk that re-stamps metadata (now confirmed: not just
+  `created_at`, but `file_name` itself) on every BigQuery materialization — **not** a
+  genuine duplicate upload. **Reverted the fix** — scoping batch retrigger headers to
+  a specific file_name would make it *more* fragile against this known, accepted
+  quirk (a retrigger started right as a rematerialization happens would 404 instead
+  of still finding the data via po_ref search). The code now explicitly documents
+  this reasoning so a future session doesn't re-attempt the same "fix."
+- **Assumed a `curl` empty-response / silent timeout on retrigger-mssql** meant
+  something new was broken — it was rgmc-gcp-api being transiently slow under the
+  repeated load of this session's own testing (one call read-timed out at 60s,
+  immediate retry succeeded). Not a code bug — just retry once before assuming
+  regression.
+- **(Prior turn) Ran the batch retrigger once before the rate-limit `groupcode` fix
+  was deployed** — 1 of 54 succeeded, the other 53 had their staging rows deleted by
+  `cleanup-staging` and then failed to re-insert (429), leaving them in a *worse*
+  state (nothing in staging at all) than before. Self-healing (a later retry just
+  re-cleans-up as a no-op and retries the insert) but worth knowing this failure mode
+  existed — **always confirm the rate-limit fix is live before re-running a large
+  batch retrigger.**
 
 ## Next Step
 
-Nothing is blocking — everything built this session is committed and deployed. The
-most valuable next action is **live verification of the pieces that were deployed
-but never actually exercised**, roughly in this order:
-
-1. **Confirm the Supabase migration** for `rgmc-it-bot`'s `po_upload_subscriptions`
-   table was actually run (carried over from before this session, never confirmed
-   — ask the user directly, or check via the Supabase dashboard/API if credentials
-   are available).
-2. **Watch the next automated `customerpoul-backfill-held-back` Scheduler run**
-   (fires every 2h, 7am-8pm Mon-Fri Asia/Manila — `gcloud scheduler jobs describe
-   customerpoul-backfill-held-back --location=asia-southeast1` to check `lastAttempt
-   Time`/next schedule) to confirm: (a) no email/Teams notification fires for a
-   routine run, (b) no regression in the actual backfill behavior itself.
-3. **Watch Cloud Logging for the next Eventarc-triggered bridge run** (`method=
-   "triggered"`, `group_code=customerpoul`) to confirm the `bridge_run_lock` 5-minute
-   cooldown is actually preventing back-to-back runs, and that the earlier `'dict'
-   object has no attribute 'drop'` crash class is gone.
-4. **Exercise the Batch Retrigger panel and file-scope filter in a real browser**
-   (`/trigger` or `/dashboard`'s Handoff History tab; `/reconcile`'s Buffer tab) —
-   these were built and deployed but never clicked through live this session.
-5. If a new real duplicate-order PO ref surfaces, use it to confirm the `#`-
-   character URL-encoding fix actually prevents a repeat of the CSS #320647 incident.
+1. **Get a DBA (or whoever owns the `sbic_prod` MSSQL database) to look at
+   `tr_CustomerPOBQ`** (on `CustomerPOULBQ`) with the findings above: it reprocesses
+   the entire `poStatus='NEW'` backlog on every firing, under `XACT_ABORT ON` with no
+   per-row error isolation, so one bad row anywhere in the system can zero out an
+   entire batch's promotions, and failures accumulate forever (127 currently stuck).
+   The real fix needs to either (a) scope the trigger to only the `inserted`
+   pseudo-table rows instead of the whole `'NEW'` backlog, and/or (b) wrap the
+   per-row promotion logic in a way that isolates one row's failure from the rest
+   (e.g. a cursor with TRY/CATCH per row, or pre-filtering out rows that are known to
+   be bad before the INSERT). This is **not fixable from any of these 4 repos** —
+   it's a database object, not application code.
+2. **Investigate the 2 remaining stuck POs** (`PO407026102111893`,
+   `PO407026102304020`) with direct SQL Server access (SSMS, or whatever the DBA
+   uses) — try the exact same single-row `INSERT INTO CustomerPOULBQ` manually and
+   see what error (if any) SQL Server actually throws. This needs write/execute SQL
+   access this session's tools don't have (only read-only equality lookups via
+   `GET /sbic/by_table/value`).
+3. **Consider cleaning up the 127-row `poStatus='NEW'` backlog** once the trigger
+   itself is fixed — these rows will keep getting reprocessed (and keep being a risk
+   to every future batch) until either promoted or manually triaged/marked `'DONE'`/
+   deleted. Don't do this before the trigger fix ships, or the backlog will just
+   regrow.
+4. No code changes are pending in any of the 4 repos — this session's only app-code
+   change (the rate-limit `groupcode` fix) is already committed and deployed.
 
 ## Context & Gotchas
 
-- **The user commits AND deploys this session's work themselves, out-of-band,
-  repeatedly** — reconfirmed strongly this session: every repo's git log and Cloud
-  Run/worker-pool revision history showed fresh commits/deploys the assistant never
-  ran (except the one explicit, user-approved `sbic-manual-trigger-page` deploy via
-  `gcloud builds submit`, which the user then deployed AGAIN after on top of, taking
-  it from revision `-00095-5bt` to `-00097-m26`). **Always re-check `git log`/`git
-  status`/live endpoints fresh at the start of a session** before assuming anything
-  is undeployed — this session nearly over-reported "nothing is deployed" again
-  before directly verifying against production.
-- **`#` in a PO ref number is a real, recurring hazard** — "CSS #320647" is a genuine
-  customer PO number; any future code that builds a URL by string interpolation
-  (rather than `requests`' `params=`) risks the exact same silent-truncation bug.
-  Grep for `?$filter=` or similar raw-interpolated OData URLs before trusting a new
-  BC lookup function — `rgmc-worker-pool/src/services/bc_client.py`'s
-  `v2_list_records_by_filter` (used by the user's own separate, unrelated
-  "session-history verification" feature) still has this exact same raw-URL pattern
-  and was deliberately NOT touched this session (out of scope, and risked stepping
-  on the user's own in-progress work) — worth fixing if it's ever reported.
-- **Known, accepted tradeoff, reconfirmed**: BigQuery's upstream `int_document_ai`/
-  `int_document_ai_detail` tables keep re-serving already-ingested rows past the
-  bridge's own watermark (root cause outside these repos). The handoff-history
-  redesign this session deliberately does NOT re-record a duplicate-key skip as a
-  new "inserted" event (to avoid spamming the log), but the bridge still re-attempts
-  `__trigger_so_import` for these rows every run — now safely idempotent thanks to
-  the `#`-encoding fix, just still repetitive. Not fixed, not expected to be fixed
-  here.
-- **Firestore collection naming, now FOUR deep**: `so_buffer_{env}`,
-  `so_buffer_history_{env}`, `bridge_handoff_history_{env}` (redesigned this session
-  to per-PO docs), and `bridge_run_lock_{env}` (new this session) — all keyed off
-  `GCP_ENV` lowercased (e.g. `_production`). Keep using this convention.
-- **The dashboard's existing "Check MSSQL" feature has a narrower scope than its
-  name suggests**: it only ever checked the `_BQ` STAGING tables
-  (`CustomerPOULBQ`/`CustomerRABQ`), never the PROMOTED tables
-  (`CustomerPOUL`/`CustomerRA`) — this was a deliberate earlier design choice
-  ("per the dashboard's own spec," per its original docstring) that this session
-  extended (not reverted) by adding a SEPARATE `promoted_in_mssql` field alongside
-  the existing staging check, rather than changing what "Check MSSQL" has always
-  meant.
-- **Retrigger is PO-uploads-only (`group_code == "customerpoul"`), never RA or
-  Online Sales PO** — `rgmc-gcp-api` has no RA equivalent of `insert-from-bigquery`/
-  `cleanup-staging`, and Online Sales PO's BigQuery source table
-  (`int_online_sales_data`) is different from `int_document_ai`, which the retrigger
-  endpoints hard-code. Both the Search tab's gating (`retrigger_supported`) and the
-  History tab's per-record/per-file-group buttons (`group_code === "customerpoul"`)
-  enforce this — don't relax it without also building the RA/online-sales
-  equivalents server-side first.
-- **The file-scope filter on the Buffer page is purely a client-side DISPLAY
-  filter** (`visibleGroups()`/`visibleOrders()` in `reconcile.js`) — it does not
-  change what a "Link" action affects. A SKU group spanning POs both inside and
-  outside the current file filter still shows (since it has ≥1 in-scope PO) with
-  its FULL po_refs list, and resolving it still applies to every PO sharing that
-  key, not just the visible ones. This is intentional, not a bug — flagged
-  explicitly to the user as a known behavior.
-- **`gcloud` CLI quirks, reconfirmed**: `gcloud run worker-pools` needs `gcloud
-  beta` (actually `gcloud beta run worker-pools ...`); a bodyless POST against these
-  Cloud Run services needs `-H "Content-Length: 0"` or you get a `411`; a manual
-  `gcloud builds submit` has `$COMMIT_SHA` empty (use `$BUILD_ID` in
-  `cloudbuild.yaml` instead, already fixed here).
-- **Project/region for all `gcloud` operations this session**: project
-  `durable-woods-465907-n1`, region `asia-southeast1`.
+- **A previously-undocumented diagnostic capability**: `GET /sbic/by_table/value`
+  (and the generic `GET /{db_name}/by_table/value` in `rgmc-gcp-api/src/routers/
+  mssql_routes/mssql_routes.py`) builds its SQL as
+  `"SELECT * FROM {} WHERE {} = :where_value".format(table_name, where_column)` —
+  **`table_name` and `where_column` are interpolated completely unescaped, with no
+  bracketing**. This means it can be pointed at MSSQL system catalog views for
+  read-only diagnostics: `table_name=sys.tables` / `sys.triggers` / `sys.sql_modules`
+  work fine (used this session to pull a trigger's full source — see the pattern:
+  `sys.tables WHERE name=X` → get `object_id` → `sys.triggers WHERE parent_id=<id>`
+  → get the trigger's own `object_id` → `sys.sql_modules WHERE object_id=<id>` →
+  read the `definition` column for the full CREATE TRIGGER text). Extremely useful
+  for this kind of investigation, but also a real SQL-injection-shaped surface in
+  production code — worth flagging to whoever owns `rgmc-gcp-api` as something to
+  harden eventually (out of scope to fix here without breaking its legitimate
+  generic-lookup purpose).
+- **BigQuery's `file_name` field is NOT stable** — confirmed this session that an
+  upstream dbt/export-pipeline rematerialization can re-stamp a PO's `file_name` to
+  a brand new value (not just `created_at`, which was the only previously-documented
+  instance of this quirk). A `file_name` you queried five minutes ago can return 0
+  rows now, with the exact same data sitting under a new, different-looking
+  `file_name` path. **Never build a feature that assumes a given `file_name` stays
+  valid/stable for the duration of a multi-step operation** — always re-resolve by
+  `po_ref_number` for anything that needs the current, live data.
+- **Rate limiting in `rgmc-gcp-api`** (`src/routers/sbic_routes/rate_limiter.py`) is
+  global-in-memory, keyed on `request.url.path + "::" + (groupcode query param or
+  "customerpoul")`, 30s cooldown. It reads `request.query_params` directly — a route
+  doesn't need to declare `groupcode` as one of its own parameters for the limiter to
+  see and key on it. Any future code that calls a rate-limited endpoint **more than
+  once in a loop** (batch operations) must pass a distinct `groupcode` per call, or
+  every call after the first in the same 30s window silently 429s — and if that
+  rate-limited call comes *after* a destructive step (like this session's
+  `cleanup-staging` → `insert-from-bigquery` sequence), the net effect is **data
+  loss**, not just a slow retry. Check every batch-loop caller of a
+  `Depends(rate_limit)`-protected endpoint for this.
+- **MTC (Manila Taste Curators) has no BC company** — confirmed again this session.
+  `__trigger_so_import` in `bigquery_bridge.py` only ever considers a PO for BC
+  Sales Order creation if `companyName` contains `SUNCOAST` or `SBIC`; MTC orders
+  never enter `so_buffer_{env}` at all. **"Reprocess Buffer" does nothing for MTC
+  POs and will never log anything for them** — this is by design, not a bug, and
+  was a source of confusion this session ("why no logs after reprocess" — answer:
+  reprocess only ever applied to SBIC/SUNCOAST in the first place). The MSSQL
+  staging→promoted trigger (`tr_CustomerPOBQ`) is a completely separate, BC-
+  independent mechanism, and the only one that actually matters for MTC.
+- **Project/region for all `gcloud`/MSSQL operations**: project
+  `durable-woods-465907-n1`, region `asia-southeast1`. Live service URLs used this
+  session: `https://sbic-manual-trigger-935246372408.asia-southeast1.run.app`,
+  `https://rgmc-gcp-api-935246372408.asia-southeast1.run.app`,
+  `https://rgmc-bc-api-prod-935246372408.asia-southeast1.run.app`.
+- **The user deploys promptly after committing, consistently** — re-confirmed again
+  this session (committed `a2eecb1`/`f5ddd34` themselves, then deployed to revision
+  `-00099-59l`, all without this session running a deploy command). Always verify
+  live state directly (curl the actual endpoint / check `gcloud run services
+  describe`) rather than trusting `git log` alone to infer what's deployed.

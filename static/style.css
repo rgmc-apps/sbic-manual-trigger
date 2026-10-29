@@ -299,9 +299,17 @@ body {
   display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
   margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
 }
+/* Mode select has no min-width of its own (unlike the filters row above), so its
+   widest option ("PO Ref Number(s)") sizes the box with zero spare room for the
+   ::after caret — the caret was rendering directly on top of the trailing "s)". */
+.handoff-history-batch-retrigger .select-wrapper { min-width: 180px; }
 .handoff-history-batch-retrigger .form-input { min-width: 220px; flex: 1 1 260px; }
 .handoff-history-batch-retrigger input[type="date"] { min-width: 0; flex: 1 1 140px; }
+/* .btn-reset's own margin-top: 20px (meant for a button sitting alone below a form)
+   dropped this button visibly below the select/input beside it in this inline row. */
+.handoff-history-batch-retrigger .btn-reset { margin-top: 0; }
 .handoff-history-status { margin-top: 10px; font-size: .8125rem; color: var(--text-muted); }
+.handoff-history-status.search-loading { display: inline-flex; align-items: center; gap: 8px; }
 .handoff-history-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
 .handoff-history-table { margin-top: 8px; }
 .handoff-history-table-head { font-size: .8125rem; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -312,9 +320,14 @@ body {
   border-radius: 8px;
   background: var(--bg);
 }
-.handoff-history-file-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: .78rem; }
-.handoff-history-filename { font-weight: 700; word-break: break-all; }
-.handoff-history-file-count { color: var(--text-muted); }
+/* space-between + a shrinkable, truncating info group (mirrors .dash-file-head on the
+   Search tab) keeps the retrigger button pinned to the right on its own line instead of
+   wrapping underneath the filename as an orphaned, disconnected-looking link whenever
+   the filename is long enough to fill the row. */
+.handoff-history-file-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: .78rem; }
+.handoff-history-file-info { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 260px; }
+.handoff-history-filename { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.handoff-history-file-count { color: var(--text-muted); flex-shrink: 0; white-space: nowrap; }
 .handoff-history-refs {
   margin-top: 6px;
   font-size: .76rem;
@@ -326,9 +339,13 @@ body {
   word-break: break-word;
 }
 .handoff-history-retrigger-action { margin-top: 10px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.handoff-history-retrigger-action .btn-reset { margin-top: 0; }
 .handoff-history-retrigger-result { font-size: .8125rem; font-weight: 600; }
 .handoff-history-retrigger-result.ok { color: var(--success-text); }
 .handoff-history-retrigger-result.warn { color: var(--error-text); }
+/* Compact modifier for a .btn-reset sitting inside a tight inline row (the per-file
+   "Retrigger whole file" action) instead of standing alone below a form. */
+.btn-reset.btn-compact { margin-top: 0; padding: 6px 14px; font-size: .74rem; flex-shrink: 0; white-space: nowrap; }
 
 /* Shared row/badge styles mirrored from reconcile.css's Buffered Orders / History
    tabs, so this card looks consistent with the rest of the app's history views. */

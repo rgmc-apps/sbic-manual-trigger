@@ -131,8 +131,10 @@
       const head = document.createElement("div");
       head.className = "handoff-history-file-head";
       head.innerHTML = `
-        <span class="handoff-history-filename">${escapeHtml(fileName)}</span>
-        <span class="handoff-history-file-count">${recs.length} PO(s)</span>
+        <div class="handoff-history-file-info">
+          <span class="handoff-history-filename" title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</span>
+          <span class="handoff-history-file-count">${recs.length} PO(s)</span>
+        </div>
       `;
       // Whole-file retrigger — unknown-file groups have nothing real to key a
       // BigQuery lookup on, and every record here is already customerpoul-only
@@ -140,7 +142,7 @@
       if (fileName !== "(unknown file)") {
         const fileBtn = document.createElement("button");
         fileBtn.type = "button";
-        fileBtn.className = "btn-history-toggle";
+        fileBtn.className = "btn-reset btn-compact";
         fileBtn.textContent = `Retrigger whole file (${recs.length})`;
         fileBtn.addEventListener("click", () => {
           runBatchRetrigger({ file_name: fileName }, fileBtn, `file ${fileName}`);
@@ -246,14 +248,17 @@
     if (bcStatusSelect.value) params.set("bc_status", bcStatusSelect.value);
 
     refreshBtn.disabled = true;
-    statusMsgEl.textContent = "Loading…";
+    statusMsgEl.classList.add("search-loading");
+    statusMsgEl.innerHTML = `<span class="btn-spinner"></span> Searching…`;
     try {
       const res = await fetch(`/api/handoff-history?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.detail || "Failed to load handoff history");
       render(data.data || []);
+      statusMsgEl.classList.remove("search-loading");
       statusMsgEl.textContent = `Loaded ${data.total != null ? data.total : (data.data || []).length} record(s).`;
     } catch (e) {
+      statusMsgEl.classList.remove("search-loading");
       statusMsgEl.textContent = `Error: ${e.message}`;
     } finally {
       refreshBtn.disabled = false;

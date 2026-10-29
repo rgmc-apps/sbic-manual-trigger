@@ -169,16 +169,20 @@
         <div class="dash-file-actions">
           <button class="btn-link-toggle dash-view-file-btn" type="button">View file</button>
           ${uploadType === "po" ? `<button class="btn-reprocess dash-queue-file-btn" type="button">Queue Missing Items</button>` : ""}
+          ${uploadType === "po" ? `<button class="btn-reset dash-retrigger-file-btn" type="button">Retrigger Handoff (cleanup &amp; re-insert all)</button>` : ""}
           <button class="btn-history-toggle dash-expand-btn" type="button">Expand ▾</button>
         </div>
       </div>
       <div class="dash-refs-list hidden"></div>
+      <div class="handoff-history-list dash-retrigger-results hidden"></div>
     `;
 
     const viewFileBtn = row.querySelector(".dash-view-file-btn");
     const queueFileBtn = row.querySelector(".dash-queue-file-btn");
+    const retriggerFileBtn = row.querySelector(".dash-retrigger-file-btn");
     const expandBtn = row.querySelector(".dash-expand-btn");
     const refsListEl = row.querySelector(".dash-refs-list");
+    const retriggerResultsEl = row.querySelector(".dash-retrigger-results");
 
     viewFileBtn.addEventListener("click", async () => {
       viewFileBtn.disabled = true;
@@ -260,6 +264,42 @@
         } finally {
           queueFileBtn.disabled = false;
           queueFileBtn.textContent = orig;
+        }
+      });
+    }
+
+    if (retriggerFileBtn) {
+      retriggerFileBtn.addEventListener("click", async () => {
+        retriggerFileBtn.disabled = true;
+        const orig = retriggerFileBtn.textContent;
+        retriggerFileBtn.textContent = "Retriggering…";
+        retriggerResultsEl.classList.remove("hidden");
+        retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Cleaning up and re-inserting every PO in this file…</div>`;
+        try {
+          const res = await fetch("/api/handoff-history/retrigger-mssql-batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file_name: file.file_name }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || data.detail || "Retrigger failed");
+          const results = data.data || [];
+          const summary = data.message
+            || `Retriggered ${data.total} PO(s) — ${data.ok_count} succeeded, ${data.error_count} failed.`;
+          retriggerResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(summary)}</div>` + results.map((r) => `
+            <div class="order-row history-row">
+              <div class="order-row-head">
+                <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
+                <span class="order-badge ${r.status === "success" ? "ready" : "failed"}">${escapeHtml(r.status)}</span>
+              </div>
+              <div class="order-detail">${escapeHtml(r.detail || "")}</div>
+            </div>
+          `).join("");
+        } catch (e) {
+          retriggerResultsEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
+        } finally {
+          retriggerFileBtn.disabled = false;
+          retriggerFileBtn.textContent = orig;
         }
       });
     }
