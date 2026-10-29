@@ -1099,7 +1099,7 @@ def api_handoff_history():
     All filters are optional; omit everything to list the whole log (most recent first).
     """
     params = {}
-    for key in ("group_code", "mssql_status", "bc_status", "date"):
+    for key in ("group_code", "mssql_status", "bc_status", "date", "date_from", "date_to"):
         value = (request.args.get(key) or "").strip()
         if value:
             params[key] = value

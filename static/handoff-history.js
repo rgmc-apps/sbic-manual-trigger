@@ -246,6 +246,8 @@
     if (groupCodeSelect.value) params.set("group_code", groupCodeSelect.value);
     if (mssqlStatusSelect.value) params.set("mssql_status", mssqlStatusSelect.value);
     if (bcStatusSelect.value) params.set("bc_status", bcStatusSelect.value);
+    if (batchDateFromInput.value) params.set("date_from", batchDateFromInput.value);
+    if (batchDateToInput.value) params.set("date_to", batchDateToInput.value);
 
     refreshBtn.disabled = true;
     statusMsgEl.classList.add("search-loading");
@@ -269,5 +271,7 @@
   groupCodeSelect.addEventListener("change", load);
   mssqlStatusSelect.addEventListener("change", load);
   bcStatusSelect.addEventListener("change", load);
+  batchDateFromInput.addEventListener("change", load);
+  batchDateToInput.addEventListener("change", load);
   load();
 })();
