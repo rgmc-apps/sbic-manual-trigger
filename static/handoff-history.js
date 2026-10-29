@@ -115,8 +115,9 @@
       </div>
       <div class="order-detail">
         ${escapeHtml(rec.group_code || "—")} &middot; ${escapeHtml(rec.method || "—")} &middot;
-        ${escapeHtml(rec.file_name || "—")} &middot; ${formatTimestamp(rec.timestamp)}
+        ${escapeHtml(rec.file_name || "—")} &middot; Handoff logged ${formatTimestamp(rec.timestamp)}
       </div>
+      <div class="order-detail">BigQuery inserted: ${rec.bq_created_at ? formatTimestamp(rec.bq_created_at) : "—"}</div>
       ${rec.mssql_error ? `<div class="order-error">MSSQL: ${escapeHtml(rec.mssql_error)}</div>` : ""}
       ${rec.bc_error ? `<div class="order-error">BC: ${escapeHtml(rec.bc_error)}</div>` : ""}
       <div class="handoff-history-retrigger-action hidden"></div>

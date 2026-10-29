@@ -22,6 +22,17 @@ BC_API_BASE = os.environ.get("BC_API_BASE", "https://rgmc-bc-api-prod-9352463724
 GCP_API_BASE = os.environ.get("GCP_API_BASE", "https://rgmc-gcp-api-935246372408.asia-southeast1.run.app")
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 
+# Client-side timeout for every call to rgmc-gcp-api's two generic BigQuery-backed
+# lookup routes (/bigquery_routes/by_table/value, /bigquery_routes/document-ai/search).
+# Those routes' own internal BigQuery read has a 120s cap (bumped from 60s on
+# 2026-10-29 — confirmed live that a multi-PO lookup across one large uploaded file,
+# e.g. the "Retrigger Handoff (cleanup & re-insert all)" batch action, can genuinely
+# take longer than 60s against int_document_ai_detail's current size). This must stay
+# comfortably above that cap so a slow-but-successful query — or the backend's own
+# clean 504 once ITS timeout fires — has time to actually come back, instead of this
+# app's own socket read timing out first and surfacing a raw connection error instead.
+BQ_PROXY_TIMEOUT = int(os.environ.get("BQ_PROXY_TIMEOUT", "150"))
+
 # Display-only fields _enrich_document_ai_status/the BigQuery search route stamp onto
 # each header for the UI — never real int_document_ai columns. Must be stripped before
 # a header dict is sent on to rgmc-gcp-api's MSSQL insert (see api_bigquery_insert_and_buffer),
@@ -636,7 +647,7 @@ def api_buffer_resolve_file_scope():
     file_name = query
     try:
         search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
-                                params={"po_ref_number": query}, timeout=30)
+                                params={"po_ref_number": query}, timeout=BQ_PROXY_TIMEOUT)
         search_body, search_status = _proxy_json(search_resp)
         if search_status == 200 and (search_body.get("data") or []):
             # query matched an exact PO ref — use ITS file, not the raw query text.
@@ -645,11 +656,9 @@ def api_buffer_resolve_file_scope():
         pass  # fall through and try query as a literal file_name instead
 
     try:
-        # timeout=90, not 60 — see api_dashboard_file_records' comment on this same
-        # /bigquery_routes/by_table/value race against rgmc-gcp-api's internal 60s cap.
         file_resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
             "table_name": "int_document_ai", "where_column": "file_name", "where_value": file_name,
-        }, timeout=90)
+        }, timeout=BQ_PROXY_TIMEOUT)
         file_body, file_status = _proxy_json(file_resp)
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
@@ -1108,9 +1117,50 @@ def api_handoff_history():
     try:
         resp = _bc_api("GET", "/bc/custom/v2/so-buffer/handoff-history", params=params)
         body, status_code = _proxy_json(resp)
-        return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+    if status_code == 200 and isinstance(body, dict):
+        _enrich_handoff_history_with_bq_created_at(body.get("data") or [])
+    return jsonify(body), status_code
+
+
+def _enrich_handoff_history_with_bq_created_at(records: list) -> None:
+    """Stamps each customerpoul record with bq_created_at — when its underlying row was
+    actually inserted into BigQuery's int_document_ai, as opposed to `timestamp`
+    (already on the record), which is when THIS handoff/retrigger was logged. Firestore
+    never stores this itself (bridge_handoff_history.record_handoff/record_manual_handoff
+    only ever log the handoff event's own timestamp), so it's looked up fresh here in one
+    batched call — works for every historical record, not just ones logged after some
+    future schema change.
+
+    customerpoul only: its po_ref_number maps unambiguously to one BigQuery table
+    (int_document_ai). customerra/onlinesalespo's po_ref_number field actually holds a
+    RA ref or online-sales key against a *different* source table each, and group_code
+    alone can't disambiguate RA from RA(xml) (both log as "customerra") — left as "—" in
+    the UI rather than guessed at. Best-effort: any failure here just leaves
+    bq_created_at unset, never breaks the history list itself.
+    """
+    po_refs = sorted({
+        r.get("po_ref_number") for r in records
+        if r.get("group_code") == "customerpoul" and r.get("po_ref_number")
+    })
+    if not po_refs:
+        return
+    try:
+        resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
+                         params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=BQ_PROXY_TIMEOUT)
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException:
+        return  # best-effort enrichment — the history list still renders without it
+    if status_code != 200:
+        return
+    created_at_by_ref = {
+        h.get("po_ref_number"): h.get("created_at")
+        for h in (body.get("data") or []) if h.get("po_ref_number")
+    }
+    for r in records:
+        if r.get("group_code") == "customerpoul":
+            r["bq_created_at"] = created_at_by_ref.get(r.get("po_ref_number"))
 
 
 # Sales Orders eligible for the Overrides tab's "Find previous orders"/"Update these
@@ -1539,7 +1589,7 @@ def _fetch_expected_lines_batch(po_refs: list) -> dict:
         try:
             resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params={
                 "po_ref_number": ",".join(chunk),
-            }, timeout=90)
+            }, timeout=BQ_PROXY_TIMEOUT)
             body, status_code = _proxy_json(resp)
             if status_code == 200:
                 return body.get("detail_data") or []
@@ -1948,7 +1998,7 @@ def _fetch_bq_customer_branch_names(po_refs: list) -> dict:
         try:
             resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params={
                 "po_ref_number": ",".join(chunk),
-            }, timeout=90)
+            }, timeout=BQ_PROXY_TIMEOUT)
             body, status_code = _proxy_json(resp)
             if status_code == 200:
                 return body.get("data") or []
@@ -2541,7 +2591,7 @@ def api_bigquery_document_ai_search():
         # (header, then detail) — slower and far more variable than every other call
         # this app makes, so it gets its own longer timeout instead of API_TIMEOUT's
         # 30s (already too short in practice — confirmed by a live read-timeout error).
-        resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params=params, timeout=90)
+        resp = _gcp_api("GET", "/bigquery_routes/document-ai/search", params=params, timeout=BQ_PROXY_TIMEOUT)
         body, status_code = _proxy_json(resp)
         if status_code != 200:
             return jsonify(body), status_code
@@ -3431,14 +3481,9 @@ def api_dashboard_file_records():
         return jsonify({"error": "file_name is required"}), 400
 
     try:
-        # timeout > 60s (not the usual API_TIMEOUT/60) — rgmc-gcp-api's own BigQuery read
-        # has its own internal 60s cap (BQ_READ_TIMEOUT_SECONDS), so a client timeout of
-        # exactly 60s races it: the client's socket can read-timeout right at (or just
-        # before) the server would have returned its own clean 504, surfacing a raw
-        # "Read timed out" instead. Matches /api/bigquery/document-ai/search's timeout=90.
         resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
             "table_name": config_["header_table"], "where_column": "file_name", "where_value": file_name,
-        }, timeout=90)
+        }, timeout=BQ_PROXY_TIMEOUT)
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
     except requests.RequestException as exc:
@@ -3457,11 +3502,9 @@ def api_dashboard_detail_records():
         return jsonify({"error": "ref_value is required"}), 400
 
     try:
-        # See api_dashboard_file_records above — same race against rgmc-gcp-api's own
-        # internal 60s BigQuery timeout.
         resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
             "table_name": config_["detail_table"], "where_column": config_["ref_column"], "where_value": ref_value,
-        }, timeout=90)
+        }, timeout=BQ_PROXY_TIMEOUT)
         body, status_code = _proxy_json(resp)
         return jsonify(body), status_code
     except requests.RequestException as exc:
@@ -3782,7 +3825,7 @@ def api_handoff_history_retrigger_mssql():
 
     try:
         search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
-                                params={"po_ref_number": po_ref}, timeout=60)
+                                params={"po_ref_number": po_ref}, timeout=BQ_PROXY_TIMEOUT)
         search_body, search_status = _proxy_json(search_resp)
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
@@ -3845,13 +3888,11 @@ def api_handoff_history_retrigger_mssql_batch():
         if raw_refs:
             po_refs = sorted(set(_split_po_refs(raw_refs)))
             search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
-                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=90)
+                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=BQ_PROXY_TIMEOUT)
         elif file_name:
-            # timeout=90 — see api_dashboard_file_records' comment on this same
-            # /bigquery_routes/by_table/value race against rgmc-gcp-api's internal 60s cap.
             file_resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
                 "table_name": "int_document_ai", "where_column": "file_name", "where_value": file_name,
-            }, timeout=90)
+            }, timeout=BQ_PROXY_TIMEOUT)
             file_body, file_status = _proxy_json(file_resp)
             if file_status != 200:
                 return jsonify(file_body), file_status
@@ -3859,10 +3900,10 @@ def api_handoff_history_retrigger_mssql_batch():
             if not po_refs:
                 return jsonify({"error": f"No BigQuery int_document_ai rows found for file_name={file_name!r}."}), 404
             search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
-                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=90)
+                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=BQ_PROXY_TIMEOUT)
         else:
             search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
-                                    params={"date_from": date_from, "date_to": date_to, "limit": 1000}, timeout=90)
+                                    params={"date_from": date_from, "date_to": date_to, "limit": 1000}, timeout=BQ_PROXY_TIMEOUT)
         search_body, search_status = _proxy_json(search_resp)
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
