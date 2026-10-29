@@ -2,6 +2,7 @@
   const listEl = document.getElementById("handoff-history-list");
   const statusMsgEl = document.getElementById("handoff-history-status-msg");
   const refreshBtn = document.getElementById("handoff-history-refresh");
+  const searchBtn = document.getElementById("handoff-history-search-btn");
   const groupCodeSelect = document.getElementById("handoff-history-group-code");
   const mssqlStatusSelect = document.getElementById("handoff-history-mssql-status");
   const bcStatusSelect = document.getElementById("handoff-history-bc-status");
@@ -77,9 +78,22 @@
           body: JSON.stringify({ po_ref_number: poRef }),
         });
         const data = await res.json();
+        // res.ok now reliably reflects mssql_status (the app.py proxy normalizes a
+        // "200 with an internal error payload" response from insert-from-bigquery
+        // into a real non-200) — but a successful insert whose trigger never promoted
+        // the row still comes back 200, so that case needs its own, non-"ok" message
+        // instead of reading as a full success.
         if (!res.ok) throw new Error(data.error || data.detail || data.message || "Retrigger failed");
-        resultEl.textContent = "✓ Re-inserted — refreshing…";
-        resultEl.className = "handoff-history-retrigger-result ok";
+        if (data.trigger_status === "not_promoted") {
+          resultEl.textContent = "⚠ Inserted, but still not promoted by the MSSQL trigger — retry later.";
+          resultEl.className = "handoff-history-retrigger-result warn";
+        } else if (data.trigger_status === "promoted") {
+          resultEl.textContent = "✓ Inserted and promoted — refreshing…";
+          resultEl.className = "handoff-history-retrigger-result ok";
+        } else {
+          resultEl.textContent = "✓ Re-inserted (promotion status unknown) — refreshing…";
+          resultEl.className = "handoff-history-retrigger-result ok";
+        }
         load();
       } catch (e) {
         resultEl.textContent = "Error: " + e.message;
@@ -189,10 +203,15 @@
       results.forEach((r) => {
         const row = document.createElement("div");
         row.className = "order-row history-row";
+        // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger
+        // never promoted it) / "error" (the insert itself failed) — three distinct
+        // outcomes, not just a pass/fail pair, so each gets its own badge color.
+        const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
+        const label = r.status === "not_promoted" ? "not promoted" : r.status;
         row.innerHTML = `
           <div class="order-row-head">
             <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-            <span class="order-badge ${r.status === "success" ? "ready" : "failed"}">${escapeHtml(r.status)}</span>
+            <span class="order-badge ${badgeClass}">${escapeHtml(label)}</span>
           </div>
           <div class="order-detail">${escapeHtml(r.detail || "")}</div>
         `;
@@ -250,6 +269,7 @@
     if (batchDateToInput.value) params.set("date_to", batchDateToInput.value);
 
     refreshBtn.disabled = true;
+    searchBtn.disabled = true;
     statusMsgEl.classList.add("search-loading");
     statusMsgEl.innerHTML = `<span class="btn-spinner"></span> Searching…`;
     try {
@@ -264,10 +284,12 @@
       statusMsgEl.textContent = `Error: ${e.message}`;
     } finally {
       refreshBtn.disabled = false;
+      searchBtn.disabled = false;
     }
   }
 
   refreshBtn.addEventListener("click", load);
+  searchBtn.addEventListener("click", load);
   groupCodeSelect.addEventListener("change", load);
   mssqlStatusSelect.addEventListener("change", load);
   bcStatusSelect.addEventListener("change", load);

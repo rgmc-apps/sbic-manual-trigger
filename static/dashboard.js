@@ -286,15 +286,22 @@
           const results = data.data || [];
           const summary = data.message
             || `Retriggered ${data.total} PO(s) — ${data.ok_count} succeeded, ${data.error_count} failed.`;
-          retriggerResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(summary)}</div>` + results.map((r) => `
+          // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger
+          // never promoted it) / "error" (the insert itself failed) — three distinct
+          // outcomes, not just a pass/fail pair, so each gets its own badge color.
+          retriggerResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(summary)}</div>` + results.map((r) => {
+            const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
+            const label = r.status === "not_promoted" ? "not promoted" : r.status;
+            return `
             <div class="order-row history-row">
               <div class="order-row-head">
                 <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-                <span class="order-badge ${r.status === "success" ? "ready" : "failed"}">${escapeHtml(r.status)}</span>
+                <span class="order-badge ${badgeClass}">${escapeHtml(label)}</span>
               </div>
               <div class="order-detail">${escapeHtml(r.detail || "")}</div>
             </div>
-          `).join("");
+          `;
+          }).join("");
         } catch (e) {
           retriggerResultsEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
         } finally {

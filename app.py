@@ -3706,7 +3706,19 @@ def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: s
         pass  # best-effort — the retrigger result itself is unaffected
 
     if isinstance(body, dict):
+        # insert-from-bigquery can return HTTP 200 with an internal
+        # {"status": "error", ...} payload (a business-logic failure, not a transport
+        # one) — mssql_status/error here are the only reliable signal of that; every
+        # caller (single-PO route, batch route, their JS) must check mssql_status
+        # instead of the raw HTTP status, so normalize status_code to match it too,
+        # so a plain `if status_code != 200` check downstream is no longer fooled by a
+        # masked-as-200 failure.
+        body["mssql_status"] = mssql_status
         body["trigger_status"] = trigger_status
+        if error_detail and not body.get("error"):
+            body["error"] = error_detail
+    if mssql_status == "error" and status_code == 200:
+        status_code = 502
     return body, status_code
 
 
@@ -3870,16 +3882,35 @@ def api_handoff_history_retrigger_mssql_batch():
             continue
         po_details = [d for d in details if d.get("po_ref_number") == po_ref]
         body, status_code = _cleanup_and_reinsert_po(po_ref, header, po_details, header.get("file_name"))
+        # mssql_status (not the raw HTTP status_code) is the authoritative signal —
+        # insert-from-bigquery can return HTTP 200 with an internal {"status": "error"}
+        # payload, which _insert_mssql_and_log now normalizes into mssql_status/error
+        # (and status_code) consistently, but check mssql_status directly here anyway
+        # rather than relying on that normalization alone. A successful insert whose
+        # trigger never promoted the row is reported as its own "not_promoted" status,
+        # not lumped in with either a clean success or an outright insert failure.
+        inserted = body.get("mssql_status") == "inserted"
+        trigger_status = body.get("trigger_status")
+        if not inserted:
+            po_status = "error"
+        elif trigger_status == "not_promoted":
+            po_status = "not_promoted"
+        else:
+            po_status = "success"
         results.append({
-            "po_ref": po_ref, "status": "success" if status_code == 200 else "error",
-            "detail": body.get("error") or body.get("message") or "Re-inserted successfully.",
-            "trigger_status": body.get("trigger_status"),
+            "po_ref": po_ref, "status": po_status,
+            "detail": body.get("error") or body.get("message") or (
+                "Inserted and promoted." if trigger_status == "promoted" else
+                "Inserted — trigger promotion status unknown." if trigger_status == "unknown" else
+                "Re-inserted successfully."
+            ),
+            "trigger_status": trigger_status,
         })
 
     return jsonify({
         "data": results, "total": len(results),
         "ok_count": sum(1 for r in results if r["status"] == "success"),
-        "error_count": sum(1 for r in results if r["status"] == "error"),
+        "error_count": sum(1 for r in results if r["status"] in ("error", "not_promoted")),
     })
 
 
