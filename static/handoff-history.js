@@ -22,6 +22,26 @@
     }[c]));
   }
 
+  // Polls /api/reprocess-status/<run_id> (generic — shared with Reprocess Buffer/Sync
+  // on the reconcile page) until rgmc-worker-pool reports "done" or "error". Used by
+  // the file-scoped retrigger below, which now runs in the worker pool instead of this
+  // app's own request path (confirmed live, 2026-10-29: a large file's BigQuery lookups
+  // can take several minutes — no HTTP request deadline should have to survive that).
+  async function pollRunStatus(runId, onTick) {
+    const POLL_INTERVAL_MS = 3000;
+    const MAX_WAIT_MS = 20 * 60 * 1000; // generous — this worker has no deadline of its own
+    const deadline = Date.now() + MAX_WAIT_MS;
+    while (Date.now() < deadline) {
+      const res = await fetch(`/api/reprocess-status/${encodeURIComponent(runId)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Failed to check retrigger status");
+      if (onTick) onTick(data);
+      if (data.status === "done" || data.status === "error") return data;
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    throw new Error("Still running after 20 minutes — check back later for results.");
+  }
+
   function formatTimestamp(iso) {
     if (!iso) return "—";
     try {
@@ -184,7 +204,67 @@
   // Shared by the panel below (PO ref list / date range) and each file-group header's
   // own "Retrigger whole file" button — one POST, one results render, one disabled-
   // button-during-the-call guard, regardless of which selector triggered it.
+  // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger never
+  // promoted it) / "error" (the insert itself failed) — three distinct outcomes, not
+  // just a pass/fail pair, so each gets its own badge color.
+  function renderBatchRetriggerResults(results) {
+    results.forEach((r) => {
+      const row = document.createElement("div");
+      row.className = "order-row history-row";
+      const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
+      const rowLabel = r.status === "not_promoted" ? "not promoted" : r.status;
+      row.innerHTML = `
+        <div class="order-row-head">
+          <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
+          <span class="order-badge ${badgeClass}">${escapeHtml(rowLabel)}</span>
+        </div>
+        <div class="order-detail">${escapeHtml(r.detail || "")}</div>
+      `;
+      batchResultsEl.appendChild(row);
+    });
+  }
+
+  // file_name runs in rgmc-worker-pool (no HTTP request deadline) instead of this
+  // app's own request path — confirmed live, 2026-10-29, that a large file's BigQuery
+  // lookups can take several minutes. po_ref_numbers/date_range batches stay
+  // synchronous below; they're small enough in practice that this hasn't been needed.
+  async function runFileRetriggerAsync(fileName, triggerBtn, label) {
+    triggerBtn.disabled = true;
+    const origText = triggerBtn.textContent;
+    triggerBtn.textContent = "Retriggering…";
+    batchStatusMsgEl.textContent = `Starting retrigger for ${label}…`;
+    batchResultsEl.innerHTML = "";
+    try {
+      const startRes = await fetch("/api/handoff-history/retrigger-file-async", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_name: fileName }),
+      });
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.error || startData.detail || "Could not start retrigger");
+
+      const finalData = await pollRunStatus(startData.run_id, (d) => {
+        batchStatusMsgEl.textContent = `Retriggering ${label}… (${d.status === "queued" ? "queued, waiting for the worker pool" : "processing in the background"})`;
+      });
+      if (finalData.status === "error") throw new Error(finalData.error || "Retrigger failed");
+
+      const summary = finalData.summary || {};
+      const results = summary.results || [];
+      batchStatusMsgEl.textContent = `Retriggered ${summary.total ?? results.length} PO(s) for ${label} — ${summary.ok_count ?? 0} succeeded, ${summary.error_count ?? 0} failed.`;
+      renderBatchRetriggerResults(results);
+      load(); // the main history list now has new entries for these POs
+    } catch (e) {
+      batchStatusMsgEl.textContent = `Error: ${e.message}`;
+    } finally {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = origText;
+    }
+  }
+
   async function runBatchRetrigger(payload, triggerBtn, label) {
+    if (payload.file_name) {
+      return runFileRetriggerAsync(payload.file_name, triggerBtn, label);
+    }
     triggerBtn.disabled = true;
     const origText = triggerBtn.textContent;
     triggerBtn.textContent = "Retriggering…";
@@ -201,23 +281,7 @@
       const results = data.data || [];
       batchStatusMsgEl.textContent = data.message
         || `Retriggered ${data.total} PO(s) for ${label} — ${data.ok_count} succeeded, ${data.error_count} failed.`;
-      results.forEach((r) => {
-        const row = document.createElement("div");
-        row.className = "order-row history-row";
-        // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger
-        // never promoted it) / "error" (the insert itself failed) — three distinct
-        // outcomes, not just a pass/fail pair, so each gets its own badge color.
-        const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
-        const label = r.status === "not_promoted" ? "not promoted" : r.status;
-        row.innerHTML = `
-          <div class="order-row-head">
-            <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-            <span class="order-badge ${badgeClass}">${escapeHtml(label)}</span>
-          </div>
-          <div class="order-detail">${escapeHtml(r.detail || "")}</div>
-        `;
-        batchResultsEl.appendChild(row);
-      });
+      renderBatchRetriggerResults(results);
       load(); // the main history list now has new entries for these POs
     } catch (e) {
       batchStatusMsgEl.textContent = `Error: ${e.message}`;

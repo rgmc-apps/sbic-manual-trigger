@@ -7,7 +7,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, render_template, request, jsonify, url_for
 from markupsafe import escape as _esc
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -3460,9 +3460,22 @@ def api_dashboard_files():
         if value:
             params[key] = value
 
+    # A search with no date range AND no ref_values is an unbounded GROUP BY scan over
+    # the entire header table — confirmed live (2026-10-29) that this now exceeds even a
+    # 150s timeout against int_document_ai's current size, while the identical search
+    # scoped to a single day returns in ~2s. A ref_values search is already narrow/fast
+    # regardless of date range (an IN UNNEST(...) lookup, not a full scan), so it's
+    # exempted — only a truly unscoped "browse everything" search gets this default.
+    defaulted_date_window = False
+    if "date_from" not in params and "date_to" not in params and "ref_values" not in params:
+        params["date_from"] = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+        defaulted_date_window = True
+
     try:
         resp = _gcp_api("GET", "/bigquery_routes/upload-dashboard/files", params=params, timeout=BQ_PROXY_TIMEOUT)
         body, status_code = _proxy_json(resp)
+        if status_code == 200 and isinstance(body, dict):
+            body["defaulted_date_window"] = defaulted_date_window
         return jsonify(body), status_code
     except requests.RequestException as exc:
         return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
@@ -3845,13 +3858,18 @@ def api_handoff_history_retrigger_mssql():
 @app.route("/api/handoff-history/retrigger-mssql-batch", methods=["POST"])
 def api_handoff_history_retrigger_mssql_batch():
     """Same cleanup-then-reinsert retrigger as /api/handoff-history/retrigger-mssql,
-    for every PO matching ONE of three selectors (exactly one must be given):
+    for every PO matching ONE of two selectors (exactly one must be given):
 
       po_ref_numbers — explicit list (comma/newline/whitespace separated)
-      file_name      — every PO BigQuery's int_document_ai has under this exact
-                        fileName (same lookup /api/dashboard/file-records uses)
       date_from/date_to — every PO with int_document_ai.created_at in this range
                            (inclusive), straight from /bigquery_routes/document-ai/search
+
+    A file_name selector used to be a third option here, but a file-scoped batch can
+    mean 100+ POs' worth of BigQuery lookups — confirmed live (2026-10-29) that this
+    can exceed even a 150s HTTP request timeout. That case now goes through
+    /api/handoff-history/retrigger-file-async (Pub/Sub -> rgmc-worker-pool, no request
+    deadline) instead; see that route. po_ref_numbers/date_range batches here are
+    small enough in practice that moving them too hasn't been needed.
 
     PO uploads only (group_code=customerpoul) — same BigQuery source table and
     insert-from-bigquery/cleanup-staging endpoints the single-PO route depends on,
@@ -3863,42 +3881,18 @@ def api_handoff_history_retrigger_mssql_batch():
     (search_document_ai's response mixes every matched PO's lines together) before
     each PO gets its own independent cleanup+reinsert, so one PO's failure never
     blocks the rest of the batch.
-
-    Headers are deliberately re-fetched by po_ref_number (not read straight off the
-    file-scoped lookup used to build that po_ref list) — confirmed live (2026-10-28)
-    that BigQuery's int_document_ai rows for a given PO can get re-stamped under a
-    brand new file_name by an upstream dbt/export-pipeline rematerialization (the
-    same known watermark/created_at-stamping quirk already documented elsewhere),
-    sometimes while this call is still running — the OLD file_name can drop to zero
-    rows entirely while the SAME data now lives under a new one. Searching by
-    po_ref_number finds the current data regardless of which file_name it's
-    currently filed under; resolving by the original file_name a second time would
-    just 404 once that rename has happened.
     """
     data = request.get_json(silent=True) or {}
     raw_refs = (data.get("po_ref_numbers") or "").strip()
-    file_name = (data.get("file_name") or "").strip()
     date_from = (data.get("date_from") or "").strip()
     date_to = (data.get("date_to") or "").strip()
-    selectors_given = sum(bool(x) for x in (raw_refs, file_name, (date_from or date_to)))
+    selectors_given = sum(bool(x) for x in (raw_refs, (date_from or date_to)))
     if selectors_given != 1:
-        return jsonify({"error": "Give exactly one of: po_ref_numbers, file_name, or date_from/date_to"}), 400
+        return jsonify({"error": "Give exactly one of: po_ref_numbers or date_from/date_to"}), 400
 
     try:
         if raw_refs:
             po_refs = sorted(set(_split_po_refs(raw_refs)))
-            search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
-                                    params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=BQ_PROXY_TIMEOUT)
-        elif file_name:
-            file_resp = _gcp_api("GET", "/bigquery_routes/by_table/value", params={
-                "table_name": "int_document_ai", "where_column": "file_name", "where_value": file_name,
-            }, timeout=BQ_PROXY_TIMEOUT)
-            file_body, file_status = _proxy_json(file_resp)
-            if file_status != 200:
-                return jsonify(file_body), file_status
-            po_refs = sorted({r.get("po_ref_number") for r in (file_body.get("data") or []) if r.get("po_ref_number")})
-            if not po_refs:
-                return jsonify({"error": f"No BigQuery int_document_ai rows found for file_name={file_name!r}."}), 404
             search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
                                     params={"po_ref_number": ",".join(po_refs), "limit": 1000}, timeout=BQ_PROXY_TIMEOUT)
         else:
@@ -3953,6 +3947,34 @@ def api_handoff_history_retrigger_mssql_batch():
         "ok_count": sum(1 for r in results if r["status"] == "success"),
         "error_count": sum(1 for r in results if r["status"] in ("error", "not_promoted")),
     })
+
+
+@app.route("/api/handoff-history/retrigger-file-async", methods=["POST"])
+def api_handoff_history_retrigger_file_async():
+    """Starts an async, worker-pool-driven cleanup+reinsert retrigger for every PO
+    under one BigQuery file_name — the file-scoped sibling of
+    /api/handoff-history/retrigger-mssql-batch, moved off this app's (and
+    rgmc-gcp-api's) own request path entirely. Confirmed live (2026-10-29) that a file
+    with 100+ POs' worth of BigQuery lookups can take several minutes — far past any
+    reasonable HTTP request deadline, even after raising it to 150s.
+
+    Publishes a poul-so-retrigger-file message (via rgmc-gcp-api's POST
+    /customerpoul/retrigger-file) and returns immediately with a run_id. The caller
+    polls GET /api/reprocess-status/<run_id> (already generic — shared with Reprocess
+    Buffer/Sync) for progress and the final per-PO results, in the finished doc's
+    `summary.results` (same {po_ref, status, trigger_status, detail} shape
+    /api/handoff-history/retrigger-mssql-batch already returns).
+    """
+    data = request.get_json(silent=True) or {}
+    file_name = (data.get("file_name") or "").strip()
+    if not file_name:
+        return jsonify({"error": "file_name is required"}), 400
+    try:
+        resp = _gcp_api("POST", "/customerpoul/retrigger-file", params={"file_name": file_name}, timeout=30)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
 
 
 @app.route("/api/dashboard/source-file")

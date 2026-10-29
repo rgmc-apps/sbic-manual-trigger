@@ -37,6 +37,26 @@
     })[ch]);
   }
 
+  // Polls /api/reprocess-status/<run_id> (generic — shared with Reprocess Buffer/Sync
+  // on the reconcile page) until rgmc-worker-pool reports "done" or "error". Used by
+  // the file-scoped retrigger below, which now runs in the worker pool instead of this
+  // app's own request path (confirmed live, 2026-10-29: a large file's BigQuery lookups
+  // can take several minutes — no HTTP request deadline should have to survive that).
+  async function pollRunStatus(runId, onTick) {
+    const POLL_INTERVAL_MS = 3000;
+    const MAX_WAIT_MS = 20 * 60 * 1000; // generous — this worker has no deadline of its own
+    const deadline = Date.now() + MAX_WAIT_MS;
+    while (Date.now() < deadline) {
+      const res = await fetch(`/api/reprocess-status/${encodeURIComponent(runId)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Failed to check retrigger status");
+      if (onTick) onTick(data);
+      if (data.status === "done" || data.status === "error") return data;
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    throw new Error("Still running after 20 minutes — check the Handoff History tab later for results.");
+  }
+
   function setStatus(msg, isError) {
     statusLine.textContent = msg || "";
     statusLine.classList.toggle("error", !!isError);
@@ -125,11 +145,15 @@
       if (!res.ok) throw new Error(data.error || data.detail || "Search failed");
       const files = data.data || [];
       renderFileList(files, uploadType, highlightRefs);
-      setStatus(
-        refs.length
-          ? `Found ${files.length} file(s) containing the searched ref number(s).`
-          : `Found ${files.length} uploaded file(s).`
-      );
+      let msg = refs.length
+        ? `Found ${files.length} file(s) containing the searched ref number(s).`
+        : `Found ${files.length} uploaded file(s).`;
+      // Set server-side (api_dashboard_files) whenever no date range and no ref search
+      // was given — an unfiltered search is an unbounded scan over the entire table, so
+      // it's silently narrowed to the last 30 days instead. Said explicitly here so the
+      // result count doesn't read as "that's everything" when it isn't.
+      if (data.defaulted_date_window) msg += " Showing uploads from the last 30 days — set Date from to look further back.";
+      setStatus(msg);
     } catch (e) {
       fileListEl.innerHTML = "";
       setStatus("Error: " + e.message, true);
@@ -274,22 +298,33 @@
         const orig = retriggerFileBtn.textContent;
         retriggerFileBtn.textContent = "Retriggering…";
         retriggerResultsEl.classList.remove("hidden");
-        retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Cleaning up and re-inserting every PO in this file…</div>`;
+        retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Starting retrigger for every PO in this file…</div>`;
         try {
-          const res = await fetch("/api/handoff-history/retrigger-mssql-batch", {
+          // Runs in rgmc-worker-pool, not this app's own request — a large file's
+          // BigQuery lookups can take several minutes (confirmed live, 2026-10-29).
+          // Start the job, then poll for its result instead of waiting on one HTTP call.
+          const startRes = await fetch("/api/handoff-history/retrigger-file-async", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ file_name: file.file_name }),
           });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || data.detail || "Retrigger failed");
-          const results = data.data || [];
-          const summary = data.message
-            || `Retriggered ${data.total} PO(s) — ${data.ok_count} succeeded, ${data.error_count} failed.`;
+          const startData = await startRes.json();
+          if (!startRes.ok) throw new Error(startData.error || startData.detail || "Could not start retrigger");
+
+          const finalData = await pollRunStatus(startData.run_id, (d) => {
+            retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> ${
+              d.status === "queued" ? "Queued — waiting for the worker pool…" : "Cleaning up and re-inserting in the background…"
+            }</div>`;
+          });
+          if (finalData.status === "error") throw new Error(finalData.error || "Retrigger failed");
+
+          const summary = finalData.summary || {};
+          const results = summary.results || [];
+          const summaryMsg = `Retriggered ${summary.total ?? results.length} PO(s) — ${summary.ok_count ?? 0} succeeded, ${summary.error_count ?? 0} failed.`;
           // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger
           // never promoted it) / "error" (the insert itself failed) — three distinct
           // outcomes, not just a pass/fail pair, so each gets its own badge color.
-          retriggerResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(summary)}</div>` + results.map((r) => {
+          retriggerResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(summaryMsg)}</div>` + results.map((r) => {
             const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
             const label = r.status === "not_promoted" ? "not promoted" : r.status;
             return `
