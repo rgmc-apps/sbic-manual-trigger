@@ -3393,6 +3393,23 @@ def api_reprocess_status(run_id):
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/bridge-run-locks")
+def api_bridge_run_locks():
+    """Status of every BigQuery-bridge automated-trigger lock (one per group_code —
+    customerpoul/customerra/onlinesalespo): running/idle, since when, and whether it's
+    stale (stuck "running" past rgmc-worker-pool's own 20-minute staleness threshold,
+    silently blocking every automated trigger for that group_code). Proxies
+    rgmc-bc-api, which reads the Firestore doc rgmc-worker-pool's bridge_run_lock.py
+    owns. For the Monitoring page's trigger-status modal.
+    """
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/bridge-run-locks")
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/trigger", methods=["POST"])
 def trigger():
     data = request.get_json(silent=True) or {}

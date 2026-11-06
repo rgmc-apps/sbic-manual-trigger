@@ -30,6 +30,7 @@
   const detailsModalBody    = document.getElementById("dash-details-modal-body");
   const detailsModalTitle   = document.getElementById("dash-details-modal-title");
   const detailsModalClose   = document.getElementById("dash-details-modal-close");
+  const triggerStatusBtn    = document.getElementById("dash-trigger-status-btn");
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (ch) => ({
@@ -776,9 +777,15 @@
 
   // ── Shared details/variance modal — avoids cramming order headers, line items,
   // and BQ-vs-other comparisons inline into the already 3-level-deep tree. ────────
+  let activeModalRefreshTimer = null; // set by openTriggerStatusModal; cleared here
+                                       // regardless of why/how the modal closes.
   function closeDetailsModal() {
     detailsModalOverlay.classList.add("hidden");
     detailsModalBody.innerHTML = "";
+    if (activeModalRefreshTimer) {
+      clearInterval(activeModalRefreshTimer);
+      activeModalRefreshTimer = null;
+    }
   }
   detailsModalClose.addEventListener("click", closeDetailsModal);
   detailsModalOverlay.addEventListener("click", (e) => { if (e.target === detailsModalOverlay) closeDetailsModal(); });
@@ -790,6 +797,68 @@
     detailsModalTitle.textContent = title;
     detailsModalBody.innerHTML = bodyHtml;
     detailsModalOverlay.classList.remove("hidden");
+  }
+
+  // ── Trigger status modal — one row per BigQuery-bridge group_code, read from
+  // rgmc-worker-pool's bridge_run_lock_{env} via rgmc-bc-api. Surfaces a stuck
+  // "running" lock (the ~23-hour stall confirmed live 2026-11-05/06) instead of
+  // uploaders only noticing once their PO is conspicuously late. ──────────────────
+  function humanizeSeconds(totalSeconds) {
+    const s = Math.max(0, Math.round(totalSeconds));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m`;
+  }
+
+  function renderTriggerStatus(locks) {
+    return locks.map((lock) => {
+      const isRunning = lock.status === "running";
+      const badgeClass = lock.is_stale ? "failed" : isRunning ? "pending" : "ready";
+      const badgeLabel = lock.is_stale ? "stuck" : isRunning ? "running" : "idle";
+      const sinceLine = isRunning && lock.running_for_seconds != null
+        ? `running for ${humanizeSeconds(lock.running_for_seconds)}`
+        : lock.finished_at
+          ? `last finished ${escapeHtml(fmtDate(lock.finished_at))}`
+          : "never triggered yet";
+      const staleNote = lock.is_stale
+        ? `<div class="order-detail">Stuck past the 20-minute staleness threshold — the next automated trigger for this process will reclaim it automatically, or use "Run Bridge Now" on the Manual Trigger page to force it now.</div>`
+        : "";
+      return `
+        <div class="order-row history-row">
+          <div class="order-row-head">
+            <span class="order-ref">${escapeHtml(lock.label || lock.group_code)}</span>
+            <span class="order-badge ${badgeClass}">${escapeHtml(badgeLabel)}</span>
+          </div>
+          <div class="order-detail">${escapeHtml(sinceLine)}</div>
+          ${staleNote}
+        </div>
+      `;
+    }).join("");
+  }
+
+  async function loadTriggerStatus() {
+    try {
+      const res = await fetch("/api/bridge-run-locks");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.detail || "Lookup failed");
+      detailsModalBody.innerHTML = renderTriggerStatus(data.locks || []);
+    } catch (e) {
+      detailsModalBody.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  function openTriggerStatusModal() {
+    detailsModalTitle.textContent = "Automated Trigger Status";
+    detailsModalBody.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Loading…</div>`;
+    detailsModalOverlay.classList.remove("hidden");
+    loadTriggerStatus();
+    activeModalRefreshTimer = setInterval(loadTriggerStatus, 15000);
+  }
+
+  if (triggerStatusBtn) {
+    triggerStatusBtn.addEventListener("click", openTriggerStatusModal);
   }
 
   // ── BQ-vs-other-system line comparison — shared by Check MSSQL and Check
