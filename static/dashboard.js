@@ -709,7 +709,8 @@
         });
         const data = await res.json();
         if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || "BC retrigger failed");
-        bcResultEl.textContent = "✓ " + (data.detail || "Business Central checked/updated.");
+        const icon = data.status === "pending" ? "⏳ " : "✓ ";
+        bcResultEl.textContent = icon + (data.detail || "Business Central checked/updated.");
         bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result " + (data.status === "pending" ? "warn" : "ok");
       } catch (e) {
         bcResultEl.textContent = "Error: " + e.message;

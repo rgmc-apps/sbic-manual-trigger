@@ -96,10 +96,11 @@ def _merge_duplicate_headers(headers: list, details: list) -> list:
     both the BigQuery Lookup tab's Insert action and the batch retrigger route would
     act on every duplicate independently instead of once.
 
-    Tie-break, most-preferred first: company_name resolves to a BC-postable company
-    (via _resolve_bc_company — contains SUNCOAST/SBIC), has >=1 matching row in
-    details, latest created_at. Returns one header per po_ref_number, in first-seen
-    order.
+    Tie-break, most-preferred first: company_name (+company_id, if present) resolves to
+    a BC-postable company (via _resolve_bc_company), has >=1 matching row in details,
+    has a non-blank company_name at all (even if not BC-routable — keeps this tier
+    instead of dropping it when BC-routability was added), latest created_at. Returns
+    one header per po_ref_number, in first-seen order.
 
     BC-routability deliberately outranks "has items": confirmed live 2026-11-06 that a
     po_ref's duplicates can split exactly this way — a BC-routable "SUNCOAST BRANDS"
@@ -114,9 +115,10 @@ def _merge_duplicate_headers(headers: list, details: list) -> list:
     detail_refs = {d.get("po_ref_number") for d in details if d.get("po_ref_number")}
 
     def _score(h: dict):
-        is_bc_routable = _resolve_bc_company(h.get("company_name")) is not None
+        is_bc_routable = _resolve_bc_company(h.get("company_name"), h.get("company_id")) is not None
         has_items = h.get("po_ref_number") in detail_refs
-        return (is_bc_routable, has_items, h.get("created_at") or "")
+        has_company = bool((h.get("company_name") or "").strip())
+        return (is_bc_routable, has_items, has_company, h.get("created_at") or "")
 
     best_by_ref: dict = {}
     order: list = []
@@ -3943,12 +3945,27 @@ def api_handoff_history_retrigger_bc_only():
     if not run_ids:
         return jsonify({"error": "Could not start the BC retrigger — no run_id returned."}), 502
 
-    results = [_poll_reprocess_run(run_id) for run_id in run_ids]
+    # Polled concurrently, not sequentially — each poll can take up to its own
+    # timeout_s, and sequential polling would double the worst-case wait for no reason
+    # (same ThreadPoolExecutor fan-out pattern already used elsewhere in this file).
+    with ThreadPoolExecutor(max_workers=len(run_ids)) as ex:
+        results = list(ex.map(_poll_reprocess_run, run_ids))
+
     if any(r.get("status") == "error" for r in results):
         detail = "; ".join(r.get("error") or str(r.get("summary") or "") for r in results if r.get("status") == "error")
         return jsonify({"status": "error", "detail": detail or "BC retrigger failed.", "runs": results})
     if all(r.get("status") == "done" for r in results):
         return jsonify({"status": "done", "detail": "Business Central checked/updated for this PO.", "runs": results})
+    if any(r.get("status") in (None, "unknown") for r in results):
+        # The status endpoint never returned a usable response for at least one run —
+        # a genuine failure (bad run_id, rgmc-bc-api unreachable), not legitimately
+        # still processing. Reporting this as "pending" would tell the user to wait for
+        # a retrigger that will never complete.
+        return jsonify({
+            "status": "error",
+            "detail": "Could not confirm the BC retrigger's outcome — check Handoff History or try again.",
+            "runs": results,
+        })
     return jsonify({
         "status": "pending",
         "detail": "Still processing in the background — check Handoff History shortly.",

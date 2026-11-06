@@ -149,7 +149,8 @@
         });
         const data = await res.json();
         if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || "BC retrigger failed");
-        resultEl.textContent = "✓ " + (data.detail || "Business Central checked/updated.") + " — refreshing…";
+        const icon = data.status === "pending" ? "⏳ " : "✓ ";
+        resultEl.textContent = icon + (data.detail || "Business Central checked/updated.") + " — refreshing…";
         resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result " +
           (data.status === "pending" ? "warn" : "ok");
         load();
