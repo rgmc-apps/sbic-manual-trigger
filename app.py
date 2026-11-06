@@ -61,13 +61,64 @@ _COMPANY_KEYWORD_MAP = [
     ("SBIC", "SBIC"),
 ]
 
+# Fallback for rows whose companyName text is blank — confirmed live 2026-11-05/06 on
+# several PO407xxxx refs: CustomerPOUL headers manually encoded through SBIC's legacy
+# app carry a correct, non-blank companyId but an empty companyName string, which
+# _resolve_bc_company used to reject outright ("could not resolve a BC company"),
+# excluding otherwise-good MSSQL data from Handoff/buffering. companyId is a clean
+# numeric key (see rgmc-gcp-api's CustomerPOUL.py: "companyId=6 on sbic_prod" etc.).
+# Deliberately no entry for 12 (MTC) — see RECONCILE_COMPANIES above: BC Production has
+# no MTC company, so this must never resolve an MTC row to a BC company either.
+_COMPANY_ID_MAP = {6: "SBIC"}
 
-def _resolve_bc_company(source_company_name: str | None) -> str | None:
+
+def _resolve_bc_company(source_company_name: str | None, company_id: int | None = None) -> str | None:
     upper = (source_company_name or "").upper()
     for keyword, bc_company in _COMPANY_KEYWORD_MAP:
         if keyword in upper:
             return bc_company
+    if company_id is not None:
+        return _COMPANY_ID_MAP.get(company_id)
     return None
+
+
+def _merge_duplicate_headers(headers: list, details: list) -> list:
+    """Collapses duplicate BigQuery int_document_ai header rows sharing the same
+    po_ref_number down to one per ref — same merge rule as rgmc-worker-pool's
+    retrigger_client.merge_duplicate_headers / bigquery_bridge.py's
+    __merge_duplicate_po_refs (duplicated here for the same reason the SUNCOAST/SBIC
+    company map is duplicated across these repos, see _COMPANY_KEYWORD_MAP above).
+
+    Confirmed live 2026-11-05/06: the same PO can land in int_document_ai more than
+    once under a different company_name (e.g. a "SUNCOAST BRANDS" ghost-tag row with
+    zero matching detail lines, alongside the real row with real lines) — without this,
+    both the BigQuery Lookup tab's Insert action and the batch retrigger route would
+    act on every duplicate independently instead of once.
+
+    Tie-break, most-preferred first: has >=1 matching row in details, has a non-blank
+    company_name, latest created_at. Returns one header per po_ref_number, in
+    first-seen order.
+    """
+    detail_refs = {d.get("po_ref_number") for d in details if d.get("po_ref_number")}
+
+    def _score(h: dict):
+        has_items = h.get("po_ref_number") in detail_refs
+        has_company = bool((h.get("company_name") or "").strip())
+        return (has_items, has_company, h.get("created_at") or "")
+
+    best_by_ref: dict = {}
+    order: list = []
+    for h in headers:
+        ref = h.get("po_ref_number")
+        if not ref:
+            continue
+        current = best_by_ref.get(ref)
+        if current is None:
+            order.append(ref)
+            best_by_ref[ref] = h
+        elif _score(h) > _score(current):
+            best_by_ref[ref] = h
+    return [best_by_ref[ref] for ref in order]
 
 
 # Known acceptable raw company-name text variants per BC company, for the BigQuery
@@ -2428,7 +2479,7 @@ def _enrich_document_ai_status(headers: list) -> None:
     by_company: dict[str, list[str]] = {}
     for h in headers:
         ref = h.get("po_ref_number")
-        company = _resolve_bc_company(h.get("company_name"))
+        company = _resolve_bc_company(h.get("company_name"), h.get("company_id"))
         if ref and company:
             by_company.setdefault(company, []).append(ref)
 
@@ -2519,6 +2570,7 @@ def _customerpoul_row_to_search_header(row: dict) -> dict:
         "customer_branch_name": row.get("customerBranchName"),
         "customer_branch_lookup_code": row.get("customerBranchLookUpCode"),
         "company_name": row.get("companyName"),
+        "company_id": row.get("companyId"),
         "po_date": row.get("poDate"),
         "delivery_date": row.get("deliveryDate"),
         "cancellation_date": row.get("cancellationDate"),
@@ -2726,7 +2778,7 @@ def _bq_report_row(h: dict, details: list) -> dict:
     need a short string (e.g. /api/bigquery/quick-align's "no action taken" rows).
     """
     po_ref = h.get("po_ref_number") or ""
-    company = _resolve_bc_company(h.get("company_name"))
+    company = _resolve_bc_company(h.get("company_name"), h.get("company_id"))
     total_lines = len(_bq_lines_for_po(details, po_ref))
     in_bigquery = h.get("_source") != "mssql"
     in_mssql = h.get("in_mssql")
@@ -2926,7 +2978,9 @@ def _insert_and_buffer(headers: list, details: list, employee: dict) -> dict:
         "email": employee.get("email") or "",
     } if employee else None
 
-    bq_headers = [h for h in headers if h.get("_source") != "mssql"]
+    bq_headers = _merge_duplicate_headers(
+        [h for h in headers if h.get("_source") != "mssql"], details,
+    )
     mssql_only_headers = [h for h in headers if h.get("_source") == "mssql"]
     results = []
 
@@ -2956,12 +3010,12 @@ def _insert_and_buffer(headers: list, details: list, employee: dict) -> dict:
 
     for h in bq_headers + mssql_only_headers:
         po_ref = h.get("po_ref_number")
-        company = _resolve_bc_company(h.get("company_name"))
+        company = _resolve_bc_company(h.get("company_name"), h.get("company_id"))
         already_in_mssql = h.get("_source") == "mssql"
         if not company:
             results.append({
                 "po_ref": po_ref, "status": "failed",
-                "detail": f"Could not resolve a BC company from companyName={h.get('company_name')!r} — not added to any buffer.",
+                "detail": f"Could not resolve a BC company from companyName={h.get('company_name')!r} companyId={h.get('company_id')!r} — not added to any buffer.",
             })
             continue
 
@@ -3116,8 +3170,8 @@ def api_bigquery_quick_align():
             })
 
         companies_touched = sorted({
-            _resolve_bc_company(h.get("company_name")) for h in not_in_bc_headers
-            if _resolve_bc_company(h.get("company_name"))
+            _resolve_bc_company(h.get("company_name"), h.get("company_id")) for h in not_in_bc_headers
+            if _resolve_bc_company(h.get("company_name"), h.get("company_id"))
         })
         if companies_touched:
             # One call covering every company touched, not one call per company —
@@ -3778,6 +3832,32 @@ def _insert_mssql_and_log(header: dict, details: list, po_ref: str, file_name: s
     return body, status_code
 
 
+def _trigger_bc_followup(company_name: str | None, po_refs: list, company_id: int | None = None) -> None:
+    """Automatic BC-exists + missing-items follow-up, fired right after a retrigger's
+    MSSQL insert succeeds — publishes the existing sync-from-cloudsql (backfill missing
+    lines onto a BC order that already exists) and backfill-from-cloudsql (create a
+    fresh order for a ref that still has none) messages, scoped to exactly these
+    po_refs, instead of leaving BC correct only when a human separately clicks Cloud SQL
+    Sync/Backfill on /reconcile.
+
+    Both endpoints just publish a Pub/Sub message and return a run_id immediately — the
+    actual BC work happens moments later in rgmc-worker-pool — so this stays a quick,
+    best-effort fire-and-forget call that never blocks or fails the retrigger response
+    itself (same best-effort convention as the handoff-history logging call above it).
+    """
+    company = _resolve_bc_company(company_name, company_id)
+    if not company or not po_refs:
+        return
+    refs_param = ",".join(po_refs)
+    for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
+        try:
+            _gcp_api("POST", path, params={
+                "companies": company, "create_by": "trigger", "po_ref_numbers": refs_param,
+            }, timeout=15)
+        except requests.RequestException as exc:
+            app.logger.warning(f"_trigger_bc_followup: {path} failed for po_refs={refs_param}: {exc}")
+
+
 def _cleanup_and_reinsert_po(po_ref: str, header: dict, details: list, file_name: str | None):
     """Shared per-PO retrigger core — cleanup-staging then _insert_mssql_and_log —
     used by both the single-PO and batch retrigger routes below. Returns
@@ -3848,10 +3928,12 @@ def api_handoff_history_retrigger_mssql():
     details = search_body.get("detail_data") or []
     if not headers:
         return jsonify({"error": f"No BigQuery int_document_ai row found for po_ref_number={po_ref!r} — nothing to re-insert."}), 404
-    header = headers[0]
+    header = _merge_duplicate_headers(headers, details)[0]
     file_name = header.get("file_name")
 
     body, status_code = _cleanup_and_reinsert_po(po_ref, header, details, file_name)
+    if isinstance(body, dict) and body.get("mssql_status") == "inserted":
+        _trigger_bc_followup(header.get("company_name"), [po_ref])
     return jsonify(body), status_code
 
 
@@ -3910,7 +3992,10 @@ def api_handoff_history_retrigger_mssql_batch():
         return jsonify({"data": [], "total": 0, "ok_count": 0, "error_count": 0,
                          "message": "No matching BigQuery rows found — nothing to retrigger."})
 
+    headers = _merge_duplicate_headers(headers, details)
+
     results = []
+    successful_refs_by_company: dict = {}
     for header in headers:
         po_ref = header.get("po_ref_number")
         if not po_ref:
@@ -3941,6 +4026,13 @@ def api_handoff_history_retrigger_mssql_batch():
             ),
             "trigger_status": trigger_status,
         })
+        if po_status == "success":
+            company = _resolve_bc_company(header.get("company_name"), header.get("company_id"))
+            if company:
+                successful_refs_by_company.setdefault(company, []).append(po_ref)
+
+    for company, refs in successful_refs_by_company.items():
+        _trigger_bc_followup(company, refs)
 
     return jsonify({
         "data": results, "total": len(results),
