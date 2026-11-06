@@ -194,19 +194,23 @@
           <button class="btn-link-toggle dash-view-file-btn" type="button">View file</button>
           ${uploadType === "po" ? `<button class="btn-reprocess dash-queue-file-btn" type="button">Queue Missing Items</button>` : ""}
           ${uploadType === "po" ? `<button class="btn-reset dash-retrigger-file-btn" type="button">Retrigger Handoff (cleanup &amp; re-insert all)</button>` : ""}
+          ${uploadType === "po" ? `<button class="btn-reset dash-retrigger-bc-file-btn" type="button">Retrigger BC only</button>` : ""}
           <button class="btn-history-toggle dash-expand-btn" type="button">Expand ▾</button>
         </div>
       </div>
       <div class="dash-refs-list hidden"></div>
       <div class="handoff-history-list dash-retrigger-results hidden"></div>
+      <div class="handoff-history-list dash-retrigger-bc-results hidden"></div>
     `;
 
     const viewFileBtn = row.querySelector(".dash-view-file-btn");
     const queueFileBtn = row.querySelector(".dash-queue-file-btn");
     const retriggerFileBtn = row.querySelector(".dash-retrigger-file-btn");
+    const retriggerBcFileBtn = row.querySelector(".dash-retrigger-bc-file-btn");
     const expandBtn = row.querySelector(".dash-expand-btn");
     const refsListEl = row.querySelector(".dash-refs-list");
     const retriggerResultsEl = row.querySelector(".dash-retrigger-results");
+    const retriggerBcResultsEl = row.querySelector(".dash-retrigger-bc-results");
 
     viewFileBtn.addEventListener("click", async () => {
       viewFileBtn.disabled = true;
@@ -342,6 +346,55 @@
         } finally {
           retriggerFileBtn.disabled = false;
           retriggerFileBtn.textContent = orig;
+        }
+      });
+    }
+
+    if (retriggerBcFileBtn) {
+      retriggerBcFileBtn.addEventListener("click", async () => {
+        retriggerBcFileBtn.disabled = true;
+        const orig = retriggerBcFileBtn.textContent;
+        retriggerBcFileBtn.textContent = "Checking BC…";
+        retriggerBcResultsEl.classList.remove("hidden");
+        retriggerBcResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Resolving POs for this file and checking Business Central…</div>`;
+        try {
+          // Unlike the full retrigger above, this never touches BigQuery (MSSQL +
+          // BC only), so the server blocks on the result instead of a second
+          // poll-based flow — see /api/handoff-history/retrigger-bc-only-file.
+          const res = await fetch("/api/handoff-history/retrigger-bc-only-file", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file_name: file.file_name }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || data.detail || "Could not start BC retrigger");
+
+          const icon = data.status === "pending" ? "⏳ " : data.status === "error" ? "✗ " : "✓ ";
+          let html = `<div class="search-hint">${icon}${escapeHtml(data.detail || data.status)}</div>`;
+          if ((data.present || []).length) {
+            html += `<div class="order-row history-row">
+              <div class="order-row-head"><span class="order-badge ready">checked against BC</span></div>
+              <div class="order-detail">${escapeHtml(data.present.join(", "))}</div>
+            </div>`;
+          }
+          if ((data.missing || []).length) {
+            html += `<div class="order-row history-row">
+              <div class="order-row-head"><span class="order-badge pending">not in MSSQL (CustomerPOUL)</span></div>
+              <div class="order-detail">${escapeHtml(data.missing.join(", "))}</div>
+            </div>`;
+          }
+          if ((data.company_unresolved || []).length) {
+            html += `<div class="order-row history-row">
+              <div class="order-row-head"><span class="order-badge failed">company not BC-routable</span></div>
+              <div class="order-detail">${escapeHtml(data.company_unresolved.join(", "))}</div>
+            </div>`;
+          }
+          retriggerBcResultsEl.innerHTML = html;
+        } catch (e) {
+          retriggerBcResultsEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
+        } finally {
+          retriggerBcFileBtn.disabled = false;
+          retriggerBcFileBtn.textContent = orig;
         }
       });
     }

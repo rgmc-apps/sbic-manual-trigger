@@ -3933,8 +3933,12 @@ def api_handoff_history_retrigger_bc_only():
     run_ids = []
     for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
         try:
+            # create_by="trigger-bc-only" (distinct from _trigger_bc_followup's plain
+            # "trigger") is what rgmc-worker-pool's dispatcher gates its new BC-only-only
+            # Teams notification on — see so_import_worker.py's poul-so-sync-from-cloudsql
+            # / poul-so-backfill-from-cloudsql handlers.
             resp = _gcp_api("POST", path, params={
-                "companies": company, "create_by": "trigger", "po_ref_numbers": po_ref,
+                "companies": company, "create_by": "trigger-bc-only", "po_ref_numbers": po_ref,
             }, timeout=15)
             body, status_code = _proxy_json(resp)
             if status_code == 200 and body.get("run_id"):
@@ -3969,6 +3973,109 @@ def api_handoff_history_retrigger_bc_only():
     return jsonify({
         "status": "pending",
         "detail": "Still processing in the background — check Handoff History shortly.",
+        "runs": results,
+    })
+
+
+def _resolve_po_refs_for_file(file_name: str) -> list[str]:
+    """Every distinct po_ref_number CustomerPOULBQ (MSSQL staging — carries fileName,
+    unlike the promoted CustomerPOUL table) has under this exact file_name. MSSQL-only,
+    no BigQuery read — this is what lets the file-scoped BC-only retrigger below skip
+    BigQuery entirely, same as the single-PO version above."""
+    try:
+        resp = _gcp_api("GET", "/sbic/by_table/value", params={
+            "table_name": "CustomerPOULBQ", "where_column": "fileName", "where_value": file_name,
+        }, timeout=30)
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException:
+        return []
+    if status_code != 200:
+        return []
+    return sorted({r.get("poRefNumber") for r in (body.get("data") or []) if r.get("poRefNumber")})
+
+
+@app.route("/api/handoff-history/retrigger-bc-only-file", methods=["POST"])
+def api_handoff_history_retrigger_bc_only_file():
+    """File-scoped "Retrigger BC only" — re-checks every PO under one uploaded file
+    against Business Central in one pass, still without touching BigQuery.
+
+    Resolves the file's po_refs from CustomerPOULBQ (staging), then checks each one's
+    presence in the PROMOTED CustomerPOUL table via _fetch_from_customerpoul. A po_ref
+    resolved here but missing from CustomerPOUL means it's stuck in staging (the AFTER
+    INSERT trigger never promoted it) or was deleted — sync-inserted-orders/
+    backfill-from-cloudsql both read CustomerPOUL, not the staging tables, so BC-only
+    retrigger genuinely can't do anything for it; reported back as "missing" instead of
+    silently skipped. Present refs are grouped by resolved BC company and sent as ONE
+    sync + ONE backfill call per company (both already accept a comma-separated
+    po_ref_numbers), not one call per PO.
+    """
+    data = request.get_json(silent=True) or {}
+    file_name = (data.get("file_name") or "").strip()
+    if not file_name:
+        return jsonify({"error": "file_name is required"}), 400
+
+    po_refs = _resolve_po_refs_for_file(file_name)
+    if not po_refs:
+        return jsonify({"error": f"No POs found in MSSQL (CustomerPOULBQ) for file {file_name!r}."}), 404
+
+    with ThreadPoolExecutor(max_workers=min(20, len(po_refs))) as ex:
+        headers = list(ex.map(lambda ref: _fetch_from_customerpoul(ref)[0], po_refs))
+
+    present_refs_by_company: dict[str, list[str]] = {}
+    missing: list[str] = []
+    company_unresolved: list[str] = []
+    for po_ref, header in zip(po_refs, headers):
+        if not header:
+            missing.append(po_ref)
+            continue
+        company = _resolve_bc_company(header.get("company_name"), header.get("company_id"))
+        if not company:
+            company_unresolved.append(po_ref)
+            continue
+        present_refs_by_company.setdefault(company, []).append(po_ref)
+
+    if not present_refs_by_company:
+        return jsonify({
+            "status": "error",
+            "detail": "No POs under this file could be sent to BC.",
+            "present": [], "missing": missing, "company_unresolved": company_unresolved,
+            "runs": [],
+        })
+
+    run_ids = []
+    for company, refs in present_refs_by_company.items():
+        refs_param = ",".join(refs)
+        for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
+            try:
+                resp = _gcp_api("POST", path, params={
+                    "companies": company, "create_by": "trigger-bc-only", "po_ref_numbers": refs_param,
+                }, timeout=15)
+                body, status_code = _proxy_json(resp)
+                if status_code == 200 and body.get("run_id"):
+                    run_ids.append(body["run_id"])
+            except requests.RequestException as exc:
+                return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+    if not run_ids:
+        return jsonify({"error": "Could not start the BC retrigger — no run_id returned."}), 502
+
+    with ThreadPoolExecutor(max_workers=len(run_ids)) as ex:
+        results = list(ex.map(_poll_reprocess_run, run_ids))
+
+    present = [ref for refs in present_refs_by_company.values() for ref in refs]
+    if any(r.get("status") == "error" for r in results):
+        detail = "; ".join(r.get("error") or str(r.get("summary") or "") for r in results if r.get("status") == "error")
+        status, detail = "error", (detail or "BC retrigger failed.")
+    elif all(r.get("status") == "done" for r in results):
+        status, detail = "done", "Business Central checked/updated for these POs."
+    elif any(r.get("status") in (None, "unknown") for r in results):
+        status, detail = "error", "Could not confirm the BC retrigger's outcome — check Handoff History or try again."
+    else:
+        status, detail = "pending", "Still processing in the background — check Handoff History shortly."
+
+    return jsonify({
+        "status": status, "detail": detail,
+        "present": present, "missing": missing, "company_unresolved": company_unresolved,
         "runs": results,
     })
 
