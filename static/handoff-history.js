@@ -123,6 +123,44 @@
     });
   }
 
+  // Offered whenever BC isn't confirmed created yet (buffered/error/unknown) — unlike
+  // renderRetriggerAction above, this never touches BigQuery or MSSQL: it re-checks/
+  // backfills Business Central using whatever CustomerPOUL/CustomerPOULDetail already
+  // has, so it's useful even when MSSQL itself is already fine and only BC is missing
+  // the order or short some lines.
+  function renderBcOnlyRetriggerAction(container, poRef) {
+    container.classList.remove("hidden");
+    container.classList.add("handoff-history-retrigger-action"); // reuse existing layout/spacing
+    container.innerHTML = `
+      <button class="btn-reset handoff-history-retrigger-bc-btn" type="button">Retrigger BC only</button>
+      <span class="handoff-history-retrigger-result handoff-history-retrigger-bc-result"></span>
+    `;
+    const btn = container.querySelector(".handoff-history-retrigger-bc-btn");
+    const resultEl = container.querySelector(".handoff-history-retrigger-bc-result");
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      resultEl.textContent = "Checking Business Central…";
+      resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result";
+      try {
+        const res = await fetch("/api/handoff-history/retrigger-bc-only", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ po_ref_number: poRef }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || "BC retrigger failed");
+        resultEl.textContent = "✓ " + (data.detail || "Business Central checked/updated.") + " — refreshing…";
+        resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result " +
+          (data.status === "pending" ? "warn" : "ok");
+        load();
+      } catch (e) {
+        resultEl.textContent = "Error: " + e.message;
+        resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result warn";
+        btn.disabled = false;
+      }
+    });
+  }
+
   function renderRecord(rec) {
     const row = document.createElement("div");
     row.className = "order-row history-row";
@@ -141,6 +179,7 @@
       ${rec.mssql_error ? `<div class="order-error">MSSQL: ${escapeHtml(rec.mssql_error)}</div>` : ""}
       ${rec.bc_error ? `<div class="order-error">BC: ${escapeHtml(rec.bc_error)}</div>` : ""}
       <div class="handoff-history-retrigger-action hidden"></div>
+      <div class="handoff-history-retrigger-bc-action hidden"></div>
     `;
     // customerpoul only — the retrigger endpoint re-fetches from BigQuery's
     // int_document_ai/int_document_ai_detail, which is customerpoul's own source
@@ -148,6 +187,11 @@
     const needsRetrigger = rec.mssql_status === "error" || rec.trigger_status === "not_promoted";
     if (rec.group_code === "customerpoul" && needsRetrigger && rec.po_ref_number) {
       renderRetriggerAction(row.querySelector(".handoff-history-retrigger-action"), rec.po_ref_number);
+    }
+    // BC-only is independent of MSSQL status — offered whenever BC isn't confirmed
+    // created yet, including the common case where MSSQL is already fine.
+    if (rec.group_code === "customerpoul" && rec.bc_status !== "created" && rec.po_ref_number) {
+      renderBcOnlyRetriggerAction(row.querySelector(".handoff-history-retrigger-bc-action"), rec.po_ref_number);
     }
     return row;
   }

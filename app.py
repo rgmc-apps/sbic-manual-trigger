@@ -1,6 +1,7 @@
 import os
 import re
 import smtplib
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
@@ -95,16 +96,27 @@ def _merge_duplicate_headers(headers: list, details: list) -> list:
     both the BigQuery Lookup tab's Insert action and the batch retrigger route would
     act on every duplicate independently instead of once.
 
-    Tie-break, most-preferred first: has >=1 matching row in details, has a non-blank
-    company_name, latest created_at. Returns one header per po_ref_number, in
-    first-seen order.
+    Tie-break, most-preferred first: company_name resolves to a BC-postable company
+    (via _resolve_bc_company — contains SUNCOAST/SBIC), has >=1 matching row in
+    details, latest created_at. Returns one header per po_ref_number, in first-seen
+    order.
+
+    BC-routability deliberately outranks "has items": confirmed live 2026-11-06 that a
+    po_ref's duplicates can split exactly this way — a BC-routable "SUNCOAST BRANDS"
+    header with zero of its own matching detail rows, alongside a "MANILA TASTE
+    CURATORS VENTURES" header (MTC has no BC company configured, so it can never reach
+    BC at all) that DOES have the real detail rows. Picking the BC-routable header here
+    is safe even though it looks item-less: every caller matches a po_ref's detail rows
+    from the full `details` list independently of which header this function returns,
+    so the real lines still attach regardless — this only decides which company_name
+    attribution the resulting order gets.
     """
     detail_refs = {d.get("po_ref_number") for d in details if d.get("po_ref_number")}
 
     def _score(h: dict):
+        is_bc_routable = _resolve_bc_company(h.get("company_name")) is not None
         has_items = h.get("po_ref_number") in detail_refs
-        has_company = bool((h.get("company_name") or "").strip())
-        return (has_items, has_company, h.get("created_at") or "")
+        return (is_bc_routable, has_items, h.get("created_at") or "")
 
     best_by_ref: dict = {}
     order: list = []
@@ -3856,6 +3868,92 @@ def _trigger_bc_followup(company_name: str | None, po_refs: list, company_id: in
             }, timeout=15)
         except requests.RequestException as exc:
             app.logger.warning(f"_trigger_bc_followup: {path} failed for po_refs={refs_param}: {exc}")
+
+
+def _poll_reprocess_run(run_id: str, timeout_s: float = 20, interval_s: float = 1) -> dict:
+    """Polls GET /bc/custom/v2/so-buffer/reprocess-status/{run_id} (same call
+    /api/reprocess-status/<run_id> makes) until status is "done"/"error" or timeout_s
+    runs out — returns the last known status dict either way (never raises).
+
+    Used only by the "Retrigger BC only" action below: unlike a file-scoped retrigger,
+    this path never touches BigQuery (sync-inserted-orders/backfill-from-cloudsql are
+    Cloud-SQL/MSSQL + BC only), so it's expected to finish in low single-digit seconds —
+    fast enough to poll server-side and hand the UI one synchronous result instead of
+    adding a second frontend polling loop alongside the existing file-retrigger one.
+    """
+    deadline = time.monotonic() + timeout_s
+    last_body: dict = {"status": "unknown"}
+    while True:
+        try:
+            resp = _bc_api("GET", f"/bc/custom/v2/so-buffer/reprocess-status/{run_id}")
+            body, status_code = _proxy_json(resp)
+            if status_code == 200 and isinstance(body, dict):
+                last_body = body
+                if body.get("status") in ("done", "error"):
+                    return last_body
+        except requests.RequestException as exc:
+            last_body = {"status": "unknown", "error": f"Could not reach rgmc-bc-api: {exc}"}
+        if time.monotonic() >= deadline:
+            return last_body
+        time.sleep(interval_s)
+
+
+@app.route("/api/handoff-history/retrigger-bc-only", methods=["POST"])
+def api_handoff_history_retrigger_bc_only():
+    """Business-Central-only retrigger for one PO — unlike every other retrigger action
+    here, this never touches BigQuery or re-inserts into MSSQL. It reads the PO exactly
+    as it already sits in CustomerPOUL/CustomerPOULDetail (_fetch_from_customerpoul)
+    and runs the same check-exists/backfill-missing-lines-or-create-fresh logic
+    _trigger_bc_followup fires elsewhere, but blocking on the result (via
+    _poll_reprocess_run) instead of fire-and-forget, so the UI gets one real outcome
+    instead of pretending it's instant.
+
+    Useful when MSSQL already has good data for a PO but BC doesn't yet (a missing
+    order, or one still short some lines) — sidesteps the slow BigQuery dbt-view read
+    entirely for that common case.
+    """
+    data = request.get_json(silent=True) or {}
+    po_ref = (data.get("po_ref_number") or "").strip()
+    if not po_ref:
+        return jsonify({"error": "po_ref_number is required"}), 400
+
+    header, _lines = _fetch_from_customerpoul(po_ref)
+    if not header:
+        return jsonify({"error": f"PO {po_ref!r} not found in MSSQL (CustomerPOUL) — nothing to hand off to BC."}), 404
+
+    company = _resolve_bc_company(header.get("company_name"), header.get("company_id"))
+    if not company:
+        return jsonify({
+            "error": f"Could not resolve a BC company from companyName={header.get('company_name')!r} "
+                     f"companyId={header.get('company_id')!r} — not sent to BC.",
+        }), 400
+
+    run_ids = []
+    for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
+        try:
+            resp = _gcp_api("POST", path, params={
+                "companies": company, "create_by": "trigger", "po_ref_numbers": po_ref,
+            }, timeout=15)
+            body, status_code = _proxy_json(resp)
+            if status_code == 200 and body.get("run_id"):
+                run_ids.append(body["run_id"])
+        except requests.RequestException as exc:
+            return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+
+    if not run_ids:
+        return jsonify({"error": "Could not start the BC retrigger — no run_id returned."}), 502
+
+    results = [_poll_reprocess_run(run_id) for run_id in run_ids]
+    if any(r.get("status") == "error" for r in results):
+        detail = "; ".join(r.get("error") or str(r.get("summary") or "") for r in results if r.get("status") == "error")
+        return jsonify({"status": "error", "detail": detail or "BC retrigger failed.", "runs": results})
+    if all(r.get("status") == "done" for r in results):
+        return jsonify({"status": "done", "detail": "Business Central checked/updated for this PO.", "runs": results})
+    return jsonify({
+        "status": "pending",
+        "detail": "Still processing in the background — check Handoff History shortly.",
+        "runs": results,
+    })
 
 
 def _cleanup_and_reinsert_po(po_ref: str, header: dict, details: list, file_name: str | None):

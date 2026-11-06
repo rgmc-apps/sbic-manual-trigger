@@ -665,6 +665,8 @@
     container.innerHTML = `
       <button class="btn-reprocess dash-retrigger-mssql-btn" type="button">Retrigger Handoff (MSSQL)</button>
       <span class="dash-buffer-result"></span>
+      <button class="btn-reset dash-retrigger-bc-btn" type="button">Retrigger BC only</button>
+      <span class="dash-buffer-result dash-retrigger-bc-result"></span>
     `;
     const btn = container.querySelector(".dash-retrigger-mssql-btn");
     const resultEl = container.querySelector(".dash-buffer-result");
@@ -687,6 +689,33 @@
         resultEl.textContent = "Error: " + e.message;
         resultEl.className = "dash-buffer-result warn";
         btn.disabled = false;
+      }
+    });
+
+    // "BC only" — skips MSSQL/BigQuery entirely, just re-checks/backfills Business
+    // Central from whatever MSSQL already has. Useful when MSSQL is already correct
+    // but BC is missing the order or short some lines.
+    const bcBtn = container.querySelector(".dash-retrigger-bc-btn");
+    const bcResultEl = container.querySelector(".dash-retrigger-bc-result");
+    bcBtn.addEventListener("click", async () => {
+      bcBtn.disabled = true;
+      bcResultEl.textContent = "Checking Business Central…";
+      bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result";
+      try {
+        const res = await fetch("/api/handoff-history/retrigger-bc-only", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ po_ref_number: poRef }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || "BC retrigger failed");
+        bcResultEl.textContent = "✓ " + (data.detail || "Business Central checked/updated.");
+        bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result " + (data.status === "pending" ? "warn" : "ok");
+      } catch (e) {
+        bcResultEl.textContent = "Error: " + e.message;
+        bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result warn";
+      } finally {
+        bcBtn.disabled = false;
       }
     });
   }
