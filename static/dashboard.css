@@ -163,6 +163,9 @@
 .dash-queue-missing-result.ok { color: var(--success-text); }
 .dash-queue-missing-result.warn { color: var(--error-text); }
 
+/* Trigger Status modal — divides "current state" from "previous triggers". */
+.dash-trigger-history-heading { margin: 16px 0 8px; font-size: .8125rem; font-weight: 600; }
+
 @media (max-width: 720px) {
   .dash-file-name { max-width: 100%; }
 }

@@ -838,12 +838,61 @@
     }).join("");
   }
 
+  // run.summary is {message, details} as written by rgmc-worker-pool's
+  // bridge_run_history.record_run — details is {header_records, detail_records} on a
+  // successful data-transfer run, absent otherwise (e.g. "No new data to process.").
+  function renderRunHistory(runs, labelByCode) {
+    if (!runs.length) {
+      return `<div class="search-hint">No runs recorded yet — this list only starts from when this feature shipped, it can't show anything from before.</div>`;
+    }
+    return runs.map((run) => {
+      const badgeClass = run.status === "error" ? "failed" : run.status === "success" ? "ready" : "pending";
+      const label = labelByCode[run.group_code] || run.group_code;
+      const methodTag = run.method === "manual" ? "manual" : "automated";
+      let summary;
+      if (run.status === "error") {
+        const errText = run.error || "";
+        summary = errText.length > 160 ? errText.slice(0, 160) + "…" : errText;
+      } else {
+        const msg = (run.summary && run.summary.message) || "";
+        const details = run.summary && run.summary.details;
+        const counts = details && details.header_records != null
+          ? ` (${details.header_records} header, ${details.detail_records} detail record(s))`
+          : "";
+        summary = msg + counts;
+      }
+      return `
+        <div class="order-row history-row">
+          <div class="order-row-head">
+            <span class="order-ref">${escapeHtml(label)} — ${escapeHtml(methodTag)}</span>
+            <span class="order-badge ${badgeClass}">${escapeHtml(run.status || "unknown")}</span>
+          </div>
+          <div class="order-detail">${escapeHtml(fmtDate(run.finished_at || run.started_at))} — ${escapeHtml(summary)}</div>
+        </div>
+      `;
+    }).join("");
+  }
+
   async function loadTriggerStatus() {
     try {
-      const res = await fetch("/api/bridge-run-locks");
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || data.detail || "Lookup failed");
-      detailsModalBody.innerHTML = renderTriggerStatus(data.locks || []);
+      const [locksRes, historyRes] = await Promise.all([
+        fetch("/api/bridge-run-locks"),
+        fetch("/api/bridge-run-history?limit=20"),
+      ]);
+      const locksData = await locksRes.json();
+      if (!locksRes.ok) throw new Error(locksData.error || locksData.detail || "Lookup failed");
+      const locks = locksData.locks || [];
+      const labelByCode = {};
+      locks.forEach((l) => { labelByCode[l.group_code] = l.label; });
+
+      const historyData = await historyRes.json();
+      const historyHtml = historyRes.ok
+        ? renderRunHistory(historyData.runs || [], labelByCode)
+        : `<div class="search-hint">Could not load run history: ${escapeHtml(historyData.error || historyData.detail || "")}</div>`;
+
+      detailsModalBody.innerHTML = renderTriggerStatus(locks)
+        + `<div class="dash-trigger-history-heading">Previous Triggers</div>`
+        + historyHtml;
     } catch (e) {
       detailsModalBody.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
     }

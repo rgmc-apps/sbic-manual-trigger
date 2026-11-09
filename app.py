@@ -3410,6 +3410,23 @@ def api_bridge_run_locks():
         return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
 
 
+@app.route("/api/bridge-run-history")
+def api_bridge_run_history():
+    """Past BigQuery-bridge runs (automated or manual), most recent first — one entry
+    per run with its group_code/method/status/summary. Proxies rgmc-bc-api, which
+    reads the append-only Firestore log rgmc-worker-pool's bridge_run_history.py
+    writes. For the Monitoring page's trigger-status modal's "previous triggers" list.
+    """
+    group_code = (request.args.get("group_code") or "").strip()
+    params = {"group_code": group_code} if group_code else {}
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/so-buffer/bridge-run-history", params=params)
+        body, status_code = _proxy_json(resp)
+        return jsonify(body), status_code
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Could not reach rgmc-bc-api: {exc}"}), 502
+
+
 @app.route("/trigger", methods=["POST"])
 def trigger():
     data = request.get_json(silent=True) or {}
