@@ -296,8 +296,13 @@ body {
 /* ── Handoff History card ── */
 .handoff-history-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 .handoff-history-hint { margin-top: 6px; font-size: .8125rem; color: var(--text-muted); }
-.handoff-history-filters { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+.handoff-history-filters { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
 .handoff-history-filters .select-wrapper { min-width: 180px; }
+/* Bare date inputs here (no select-wrapper) inherit .form-input's width:100%, which
+   on a flex item resolves against the whole row -- each one then tries to claim the
+   full row width, forcing a wrap. Same fix as .handoff-history-batch-retrigger's own
+   input[type="date"] override below. */
+.handoff-history-filters input[type="date"] { width: auto; min-width: 0; flex: 0 1 150px; }
 .handoff-history-batch-retrigger {
   display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
   margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
