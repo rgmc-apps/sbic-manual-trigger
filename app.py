@@ -3417,8 +3417,14 @@ def api_bridge_run_history():
     reads the append-only Firestore log rgmc-worker-pool's bridge_run_history.py
     writes. For the Monitoring page's trigger-status modal's "previous triggers" list.
     """
-    group_code = (request.args.get("group_code") or "").strip()
-    params = {"group_code": group_code} if group_code else {}
+    params = {}
+    for key in ("group_code", "date_from", "date_to"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            params[key] = value
+    limit = (request.args.get("limit") or "").strip()
+    if limit:
+        params["limit"] = limit
     try:
         resp = _bc_api("GET", "/bc/custom/v2/so-buffer/bridge-run-history", params=params)
         body, status_code = _proxy_json(resp)

@@ -873,35 +873,67 @@
     }).join("");
   }
 
+  // Filter controls are rendered ONCE as a static shell (openTriggerStatusModal) and
+  // never touched again by the 15s auto-refresh — only the two result containers
+  // underneath get their innerHTML replaced, so a user's in-progress filter
+  // selection survives every refresh tick instead of resetting under them.
   async function loadTriggerStatus() {
+    const locksEl = detailsModalBody.querySelector("#dash-trigger-locks");
+    const historyEl = detailsModalBody.querySelector("#dash-trigger-history");
+    if (!locksEl || !historyEl) return; // modal was closed/replaced mid-flight
+
+    const groupCode = detailsModalBody.querySelector("#dash-trigger-group-filter").value;
+    const dateFrom = detailsModalBody.querySelector("#dash-trigger-date-from").value;
+    const dateTo = detailsModalBody.querySelector("#dash-trigger-date-to").value;
+    const historyParams = new URLSearchParams({ limit: "20" });
+    if (groupCode) historyParams.set("group_code", groupCode);
+    if (dateFrom) historyParams.set("date_from", dateFrom);
+    if (dateTo) historyParams.set("date_to", dateTo);
+
     try {
       const [locksRes, historyRes] = await Promise.all([
         fetch("/api/bridge-run-locks"),
-        fetch("/api/bridge-run-history?limit=20"),
+        fetch(`/api/bridge-run-history?${historyParams.toString()}`),
       ]);
       const locksData = await locksRes.json();
       if (!locksRes.ok) throw new Error(locksData.error || locksData.detail || "Lookup failed");
       const locks = locksData.locks || [];
       const labelByCode = {};
       locks.forEach((l) => { labelByCode[l.group_code] = l.label; });
+      locksEl.innerHTML = renderTriggerStatus(locks);
 
       const historyData = await historyRes.json();
-      const historyHtml = historyRes.ok
+      historyEl.innerHTML = historyRes.ok
         ? renderRunHistory(historyData.runs || [], labelByCode)
         : `<div class="search-hint">Could not load run history: ${escapeHtml(historyData.error || historyData.detail || "")}</div>`;
-
-      detailsModalBody.innerHTML = renderTriggerStatus(locks)
-        + `<div class="dash-trigger-history-heading">Previous Triggers</div>`
-        + historyHtml;
     } catch (e) {
-      detailsModalBody.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
+      locksEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
+      historyEl.innerHTML = "";
     }
   }
 
   function openTriggerStatusModal() {
     detailsModalTitle.textContent = "Automated Trigger Status";
-    detailsModalBody.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Loading…</div>`;
+    detailsModalBody.innerHTML = `
+      <div id="dash-trigger-locks"><div class="search-hint search-loading"><span class="btn-spinner"></span> Loading…</div></div>
+      <div class="dash-trigger-history-heading">Previous Triggers</div>
+      <div class="handoff-history-filters">
+        <div class="select-wrapper">
+          <select class="form-select" id="dash-trigger-group-filter">
+            <option value="">All processes</option>
+            <option value="customerpoul">CustomerPOUL</option>
+            <option value="customerra">CustomerRA</option>
+            <option value="onlinesalespo">Online Sales PO</option>
+          </select>
+        </div>
+        <input class="form-input" type="date" id="dash-trigger-date-from" title="From date" />
+        <input class="form-input" type="date" id="dash-trigger-date-to" title="To date" />
+      </div>
+      <div id="dash-trigger-history"></div>
+    `;
     detailsModalOverlay.classList.remove("hidden");
+    detailsModalBody.querySelectorAll("#dash-trigger-group-filter, #dash-trigger-date-from, #dash-trigger-date-to")
+      .forEach((el) => el.addEventListener("change", loadTriggerStatus));
     loadTriggerStatus();
     activeModalRefreshTimer = setInterval(loadTriggerStatus, 15000);
   }
