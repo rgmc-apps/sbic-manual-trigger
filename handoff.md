@@ -2,244 +2,235 @@
 
 ## Goal
 
-Harden and improve observability of the RGMC/SBIC SO-import pipeline (5 repos:
-`sbic-manual-trigger-page` the Flask monitoring dashboard, `rgmc-gcp-api` the FastAPI
-BigQuery/MSSQL/BC bridge API, `rgmc-worker-pool` the Cloud Run Worker Pool doing the
-real BigQuery→MSSQL→BC work, `rgmc-bc-api` the BC/Firestore buffer API, `rgmc-it-bot`
-the Teams notification bot). This session's concrete asks, in order:
+Harden and speed up the RGMC/SBIC SO-import pipeline (BigQuery → MSSQL → Business
+Central) across the `sbic-manual-trigger-page` / `rgmc-gcp-api` / `rgmc-worker-pool`
+/ `rgmc-bc-api` / `rgmc-it-bot` ecosystem, and separately resolve a backlog of
+PRINCE RETAIL (BC customer `PR006`) POs stuck out of BC. This session had two
+threads:
 
-1. Investigate why "handoff to MSSQL and BC takes some time to be triggered after
-   uploading" and whether the Cloud Tasks debounce is the cause.
-2. Implement the recommended fix from that investigation.
-3. Add a file-scoped "Retrigger BC only" button + presence check on the Search tab, a
-   new IT-bot Teams notification for BC-only retriggers, and distinguishable buffer
-   reasons ("no item reference" / "customer has no code" / "branch has no lookup
-   code") instead of one generic buffered-order message.
-4. Add a pop-up on the Monitoring page showing live status of all automated BigQuery-
-   bridge triggers (per group_code: running/idle/stale).
-5. Diagnose and fix a live, recurring failure where retriggering a specific uploaded
-   file ("Retrigger Handoff (cleanup & re-insert all)") inserted nothing into MSSQL or
-   BC, across three different root causes discovered one after another.
-6. Diagnose why one specific PO in that file still ends up buffered even though its
-   branch has a matching BC legacy code — **in progress, not yet fixed**, awaiting the
-   user's choice of fix approach (see Next Step).
+1. **(Carried over, still paused)** PRINCE RETAIL investigation from the prior
+   session: 3 POs (`4561798`, `4561836`, `4561912`) blocked by 10 groups of
+   duplicate/ambiguous `CustomerBranch.lookUpCode` values (33 rows, all under
+   `PRINCE RETAIL MDSG INC` / customerId 553), and 2 POs (`4563702`, `4563680`)
+   blocked by a branch that doesn't exist in `CustomerBranch` at all. **Explicitly
+   asked the user to confirm the `lookUpCode` fix convention this session — they
+   answered "Not sure yet / need to check with someone."** Do not write or propose
+   running any UPDATE script for this until they come back with an answer.
+
+2. **(This session's actual work)** A user asked to check a specific Excel batch
+   (`C:\Users\erarellano\Downloads\Suncoast AI PO.xlsx`, "Extract 3" sheet — 53 POs,
+   all `SUNCOAST BRANDS`/SBIC) against BC and reprocess whichever were missing. That
+   led into a deep, log-evidence-backed investigation of **why SBIC handoffs
+   sometimes take 6+ minutes (one traced case: 32+ minutes) to reach BC**, and five
+   concrete code fixes in `rgmc-worker-pool`, described below.
 
 ## Current State
 
-**Fully done and deployed/verified:**
-- MSSQL `numeric(8,2)` overflow bug on `CustomerPOULDetailBQ` (unitAmount/netAmount/
-  netPrice/netPricePcs too small for large bulk-order totals) — root-caused via a live
-  `INFORMATION_SCHEMA.COLUMNS` query through the existing `GET /sbic/by_table/value`
-  route (table_name accepts ANY string, including system views — see Gotchas). Fix
-  script written to `fix_customerpouldetailbq_overflow.sql` (repo root, committed) —
-  **UNKNOWN whether the user has actually run this ALTER TABLE script against
-  sbic_prod yet.** Until it's run, any PO batch containing a line total over
-  999,999.99 will still fail the same way.
-- `bridge_run_lock.py`'s stuck-forever "running" lock (confirmed live: customerpoul's
-  lock was stuck ~23 hours on 2026-11-05/06, silently dropping every automated
-  trigger) — fixed with a 20-minute `STALE_AFTER` staleness fallback. Committed,
-  deployed, live.
-- 4-part feature (file-scoped BC-only retrigger + presence check, new IT-bot "bc.
-  retrigger" Teams notification, buffer-reason categorization) — implemented across
-  `app.py`, `dashboard.js`, `rgmc-worker-pool/src/workers/so_import_worker.py`,
-  `rgmc-worker-pool/src/services/bot_notify.py`, `rgmc-it-bot`'s types/cards/routes/
-  notificationService. Compiles/type-checks clean. **Not yet manually end-to-end
-  tested in a live browser** (unlike item below, which was).
-- New "Trigger Status" pop-up modal on the Monitoring page header (visible on both
-  Search and Handoff History tabs) — backed by a new `rgmc-bc-api` route reading the
-  `bridge_run_lock_{env}` Firestore collection. **Live-tested via Claude-in-Chrome
-  browser automation against the deployed site** — button renders, modal opens,
-  shows all 3 group_codes (customerpoul/customerra/onlinesalespo) with correct
-  status/timestamps.
-- The 3-layer JSON-serialization bug in `rgmc-worker-pool/src/services/
-  retrigger_client.py` (introduced by this session's earlier BigQuery-direct-read
-  migration) — fully fixed across `pandas.Timestamp` → `datetime.date` →
-  `decimal.Decimal`, plus a generic `json.dumps(default=str)` fallback as a safety
-  net for any future type BigQuery hands back. **Verified end-to-end**: retriggered
-  file `portal/batch/20261106-081715-9e7b/6021583648998283090/0/20261106-081714-
-  e648a3-PO_DETAIL_0 (66)-0.json` — 19/20 POs now insert into MSSQL, promote, AND
-  create as real BC Sales Orders (spot-checked several directly against BC's API,
-  e.g. `SBSO268450`, `SBSO268439`).
+**All 5 `rgmc-worker-pool` code changes are written, compiled, self-checked, AND —
+discovered only when writing this handoff — already committed and pushed to
+`origin/master` by the user**, outside this conversation's visible actions:
 
-**In progress, NOT fixed yet:**
-- The 1 remaining PO from that same file, `PO407026110400667`, still lands in
-  `so_buffer_production` instead of reaching BC. Root-caused (not yet fixed) to the
-  MSSQL trigger `tr_CustomerPOBQ` (on `CustomerPOULBQ`, promotes into `CustomerPOUL`):
-  its branch-matching heuristic only resolves `customerBranchId` when the raw OCR'd
-  branch name text contains the numeric store code as a literal substring (e.g.
-  `"0229 SM SAN LAZARO"` → extracts `"0229"`). For this PO, Document AI extracted the
-  branch name as plain `"SVI SAN LAZARO"` with no embedded numeric code, so
-  `customerBranchId` stays at its `-1` sentinel and `customerBranchLookUpCode` ends up
-  holding the raw branch-name text instead of a real code — even though `CustomerBranch`
-  genuinely has this exact branch registered (`customerBranchId=109`,
-  `lookUpCode="0229"`, `customerBranchCode`/legacy code `"SU001-S003-SU"`). The
-  worker-pool's own resolution cascade in `so_import_worker.py`'s `_create_order`
-  behaved correctly given this bad input — it has no reliable signal to find the
-  right ship-to automatically, so it buffers rather than guessing. User was offered two
-  fix options and has not yet chosen (see Next Step).
+```
+664a968 DI-0239 added optimization of the handoff process   (parallelized per-order BC loop)
+405e8c0 DI-0239 add changes for the handoff                 (the other 4 fixes, bundled)
+```
+
+`git status` in `rgmc-worker-pool` is clean (`nothing to commit, working tree
+clean`, `up to date with origin/master`). Per the established deployment model
+(Cloud Build auto-deploys on push, ~3 min), **these fixes should already be live in
+production** — this has NOT been verified post-deploy (no log check done after the
+push landed). That verification is the main thing still open.
+
+The 5 changes, all in `rgmc-worker-pool`:
+
+1. **Retry-with-backoff on `not_promoted`** (`src/workers/so_import_worker.py`,
+   `_run_retrigger_file`) — up to 2 extra attempts (5s/15s backoff) when
+   `tr_CustomerPOBQ` fails to promote a retriggered PO, since the trigger scans
+   every `poStatus='NEW'` row table-wide (not scoped to the new insert) and the
+   automated bridge is NOT locked against a concurrent manual retrigger for the same
+   po_ref (`bridge_run_lock.py`'s own docstring: "A manual trigger always bypasses
+   this; only the automated path is gated").
+2. **Elapsed-time rundown** — `bigquery_bridge.py` captures `bq_fetch_start` (before
+   the BigQuery fetch) and `mssql_handoff_end` (right after trigger-promotion
+   verification), attaches both (ISO strings) to the `poul-so-import-batch` Pub/Sub
+   payload in `__trigger_so_import`. `so_import_worker.py` extracts them, threads
+   through `_run_batch` → `_send_batch_notification`, and a new
+   `_elapsed_time_rundown()` helper appends a "BigQuery Fetch Started / MSSQL
+   Handoff Elapsed / BC Handoff Elapsed" block to the bottom of the existing "POUL
+   SO Import" email (the only email sent after BC creation actually finishes).
+   Aggregate-only (not per-PO), per explicit user choice via AskUserQuestion.
+3. **Orphaned-detail-row cleanup** (`bigquery_bridge.py`, new
+   `__header_key_columns`/`__orphaned_detail_keys`/`__cleanup_orphaned_detail_rows`,
+   called from `__insert_dataframes` before the existing `__drop_already_inserted`
+   pre-check) — detects `CustomerPOULDetailBQ` rows with no matching
+   `CustomerPOULBQ` header and deletes them so this run's genuinely-new insert for
+   that po_ref isn't silently excluded forever. **Had a real bug the user caught**:
+   first version keyed on `poRefNumber` alone; fixed to key on the full composite
+   `(poRefNumber, customerName)` resolved via `mappings_bridge.required_columns`/
+   `table_mappings` (same two columns `tr_CustomerPOBQ`'s own join uses) — a bare
+   `poRefNumber` match could have deleted a different customer's valid, already-
+   matched detail rows sharing the same po_ref text (the documented "ghost-tag"
+   duplicate-header scenario). Self-checked with a standalone query-builder test
+   confirming two customers sharing one po_ref now produce two separately-scoped
+   DELETE clauses, never a bare po_ref match.
+4. **Self-healing `sbic_db` engine** (`src/services/sbic_db.py`, `_get_engine()`) —
+   removed the module-level `_engine` singleton; now returns a fresh
+   `DbConn(logger).main()` every call (mirrors `bigquery_bridge.py`'s own
+   already-proven-resilient per-run pattern). Root cause this fixes: a Cloud SQL
+   Connector background cert-refresh asyncio task crashed
+   (`aiohttp.ServerDisconnectedError`, "Task exception was never retrieved",
+   confirmed in logs at `07:51:56` and again at `10:54:37`), and the cached engine
+   had no way to recover — every `so_import_worker` batch depending on `sbic_db`
+   silently stalled for ~1 hour (the ephemeral cert's TTL) until the process
+   otherwise restarted.
+5. **Parallelized per-order BC creation** (`so_import_worker.py`) — extracted the
+   per-order loop body into a new `_process_one_order()` function, now run via
+   `ThreadPoolExecutor(max_workers=_ORDER_CONCURRENCY)` with `_ORDER_CONCURRENCY = 5`
+   (matches `order_worker.py`'s own existing BC-concurrency bound). Preserves the
+   original control flow exactly (including a BC-locked order still landing in
+   `successes` before its buffer/status steps are skipped). Self-checked that
+   `executor.map` preserves input order for the `successes`/`errors` split despite
+   concurrent completion timing.
+
+**Separately, the actual Excel-batch task that kicked this off is fully resolved**:
+of 53 POs in Extract 3, 20 were missing from BC; reprocessed via
+`/customerpoul/retrigger-file?po_ref_numbers=...`; 19/20 now confirmed in BC
+(`SBSO269656`–`SBSO269674`). The 20th, `PO407026110401891`, was the one that led to
+fix #1 above — last directly observed in the logs, it **did** eventually promote on
+its own at `08:54:39` UTC the same day (`POUL SO created ? PO 'PO407026110401891' ?
+BC 'SBSO269821'`), via a manual reprocess-buffer trigger from another user
+(Mary Ann Dumarquez), not via my retry fix (which wasn't committed/deployed yet at
+that point). Not re-verified since.
+
+**Unrelated, pre-existing, not part of this session's work** (noticed only while
+checking git status for this handoff): in `sbic-manual-trigger-page`, the user has
+separately added `sql/` to `.gitignore` and moved loose diagnostic/fix SQL scripts
+there, including a new `sql/fix_customerpouldetailbq_overflow.sql` (dated
+2026-11-06, a `numeric(8,2)` → `numeric(14,2)` overflow fix for
+`CustomerPOULDetailBQ`'s amount columns — unrelated to anything in this session).
+`prince_retail_po_investigation.md` (repo root) is still untracked, unchanged from
+the prior session.
 
 ## Files Actively Being Edited
 
-All of the below are **already committed and deployed** (confirmed via `git status`
-clean across all 5 repo working trees, and via Cloud Build build history / live
-`curl` checks against the deployed services). Nothing is mid-edit or uncommitted.
+All committed/pushed already (see Current State) — nothing is mid-edit:
+- `rgmc-worker-pool/src/workers/so_import_worker.py` — retry-with-backoff
+  (`_run_retrigger_file`), elapsed-time-rundown consumption (`_send_batch_notification`,
+  `_elapsed_time_rundown`, `_format_elapsed`), `_process_one_order` extraction +
+  `ThreadPoolExecutor` parallelization, `_ORDER_CONCURRENCY = 5` constant, new
+  `from concurrent.futures import ThreadPoolExecutor` / `from datetime import datetime`
+  imports.
+- `rgmc-worker-pool/src/services/bigquery_bridge.py` — `bq_fetch_start`/
+  `mssql_handoff_end` capture + Pub/Sub payload fields, `__header_key_columns`/
+  `__orphaned_detail_keys`/`__cleanup_orphaned_detail_rows` (composite-key orphan
+  cleanup), call site wired into `__insert_dataframes` before
+  `__drop_already_inserted`.
+- `rgmc-worker-pool/src/services/sbic_db.py` — removed `_engine` module singleton;
+  `_get_engine()` now always builds fresh.
 
-- `C:\claude\sbic-manual-trigger-page\fix_customerpouldetailbq_overflow.sql` — NEW.
-  4 `ALTER TABLE` statements widening `CustomerPOULDetailBQ`'s money columns to
-  `numeric(14,2)`. Committed; **not confirmed run against the live DB**.
-- `C:\claude\sbic-manual-trigger-page\app.py` — several additions this session:
-  `_resolve_po_refs_for_file`, `POST /api/handoff-history/retrigger-bc-only-file`
-  (file-scoped BC-only retrigger with presence check), `create_by="trigger-bc-only"`
-  threaded through the existing single-PO BC-only route, new
-  `GET /api/bridge-run-locks` (proxies rgmc-bc-api for the trigger-status modal).
-- `C:\claude\sbic-manual-trigger-page\static\dashboard.js` — new
-  `.dash-retrigger-bc-file-btn` button + handler in `buildFileRow` (file-scoped BC-only
-  retrigger UI); new Trigger Status modal logic (`renderTriggerStatus`,
-  `loadTriggerStatus`, `openTriggerStatusModal`, `humanizeSeconds`), reusing the
-  existing shared `#dash-details-modal-overlay` with a new `activeModalRefreshTimer`
-  (15s auto-refresh, cleared in `closeDetailsModal`).
-- `C:\claude\sbic-manual-trigger-page\templates\dashboard.html` — new "Trigger Status"
-  button in the header `site-nav`.
-- `C:\claude\sbic-manual-trigger-page\static\style.css` — `.nav-link` got
-  `background: transparent; cursor: pointer; font-family: inherit;` so it also looks
-  right as a `<button>`, not just an `<a>`.
-- `C:\claude\rgmc-worker-pool\src\services\bridge_run_lock.py` — added `STALE_AFTER =
-  timedelta(minutes=20)`; `try_start` now reclaims a "running" lock older than that
-  instead of blocking forever.
-- `C:\claude\rgmc-worker-pool\src\services\retrigger_client.py` — the 3-layer JSON fix:
-  `_json_safe_scalar`/`_json_safe` (element-wise `pandas.Timestamp`/`datetime.date`/
-  `decimal.Decimal` → JSON-safe conversion, applied to both header/detail DataFrames in
-  `fetch_headers_and_details`) + `_json_default` (generic `json.dumps(default=...)`
-  fallback used in `insert_from_bigquery`'s POST body instead of `requests`' own
-  `json=` kwarg).
-- `C:\claude\rgmc-worker-pool\src\workers\so_import_worker.py` — several additions:
-  dispatcher now fires `bot_notify.notify_bc_retrigger(...)` when `create_by ==
-  "trigger-bc-only"` for both `poul-so-sync-from-cloudsql`/`poul-so-backfill-from-
-  cloudsql`; `_resolve_valid_lines` now splits `"no_bc_match"` into
-  `"no_item_reference"` (blank SKU) vs `"item_not_matched"` (SKU given, unmatched);
-  `unmatched_items` entries now carry a `reason` field; the order-level ValueError
-  cascade (ship-to/branch resolution failure, ~line 777-801) now prefixes "Customer
-  has no code on file..." or "Branch has no lookup code on file..." when those
-  specific conditions hold, else keeps the original "No ship-to address..." wording.
-- `C:\claude\rgmc-worker-pool\src\services\bot_notify.py` — new
-  `notify_bc_retrigger(companies, po_ref_numbers, summary, notify, label)`.
-- `C:\claude\rgmc-bc-api\src\services\so_buffer_service.py` — new
-  `GROUP_CODE_LABELS`, `_bridge_run_lock_collection()`, `list_bridge_run_locks()`
-  (mirrors `bridge_run_lock.py`'s own `STALE_AFTER` by hand to compute `is_stale`).
-- `C:\claude\rgmc-bc-api\src\routers\bc_routes\so_buffer_routes.py` — new
-  `GET /bc/custom/v2/so-buffer/bridge-run-locks` route.
-- `C:\claude\rgmc-it-bot\src\types\index.ts` — new `BcRetriggerPayload` interface;
-  `PoUploadOrderResult.unmatched_items` entries now carry optional `reason?: string`.
-- `C:\claude\rgmc-it-bot\src\cards\poUploadCard.ts` — new `buildBcRetriggerCard`;
-  unmatched-items rendering now shows "(no item reference)" when `reason ===
-  "no_item_reference"`.
-- `C:\claude\rgmc-it-bot\src\services\notificationService.ts` — new
-  `notifyBcRetrigger`.
-- `C:\claude\rgmc-it-bot\src\routes\webhook.ts` — new
-  `POST /api/notify/bc-retrigger` route.
+Left over from the *previous* session, still present, still not acted on:
+- `sbic-manual-trigger-page/prince_retail_po_investigation.md` — untracked.
+- `sbic-manual-trigger-page/sql/find_ambiguous_branch_lookup_codes.sql` — untracked
+  (now inside the user's own new `sql/` gitignored folder).
 
 ## Failed Attempts
 
-- **Assumed `gcloud` works the same in Bash as PowerShell** — **Why it failed**:
-  `gcloud`/`python` resolve to broken Windows Store stub aliases under the Bash tool
-  in this environment (exit code 49, "Python was not found"). `gcloud` only works
-  reliably via the PowerShell tool here. One Bash-based revision-check loop silently
-  gave a false "new revision detected" because the error text happened to
-  lexicographically sort after the comparison timestamp.
-- **`gcloud logging read` with `--freshness` + `--order=asc`** — **Why it failed**:
-  known gotcha (already documented from a prior session) — returns stale/wrong-ordered
-  entries. Always use explicit `timestamp>=`/`timestamp<=` bounds instead; `--freshness`
-  alone with `--order=desc` is fine.
-- **Assumed code changes auto-deploy on file save** — **Why it failed**: this
-  environment deploys via Cloud Build triggers (e.g. `rgmc-worker-pool-deploy`) that
-  fire on `git push` to each repo's GitHub remote, not on local file edits. Retriggered
-  the same file twice in a row expecting a fix to be live, got the exact same error
-  both times, before realizing the fix was sitting uncommitted locally. Build+deploy
-  takes ~3 minutes after a push (confirmed via Cloud Build history timestamps).
-- **First JSON-serialization fix (dtype-based `is_datetime64_any_dtype` check in
-  `_json_safe`)** — **Why it failed**: only caught `TIMESTAMP`/`DATETIME` BigQuery
-  columns (proper `datetime64` dtype). BigQuery `DATE` columns (`po_date`,
-  `delivery_date`, `cancellation_date`) come back as **object-dtype columns holding
-  plain `datetime.date` scalars**, which a dtype-based check misses entirely — next
-  retrigger attempt failed with `Object of type date is not JSON serializable`.
-- **Second fix (broadened `_json_safe` to element-wise date+Timestamp handling)** —
-  **Why it failed (partially)**: still didn't cover `decimal.Decimal` (from BigQuery
-  `NUMERIC`/`BIGNUMERIC` columns, e.g. `unitAmount`/`netAmount`) — next retrigger
-  failed with `Object of type Decimal is not JSON serializable`. Fixed by adding
-  Decimal handling to `_json_safe_scalar` AND a generic `_json_default` fallback in
-  `json.dumps` (belt-and-suspenders, so a 4th unknown type doesn't repeat this cycle).
+- **First version of the orphaned-detail cleanup keyed on `poRefNumber` alone** (both
+  the `NOT EXISTS` orphan-detection query and the `DELETE`) — **why it was wrong**:
+  the user caught it immediately ("make sure the deletion only targets the correct
+  columns and not delete excess records"). `CustomerPOULBQ`'s real identity is the
+  composite `(poRefNumber, customerName)` — confirmed via
+  `mappings_bridge.required_columns['v1']['customerpoulbq']` — and this codebase
+  already documents that the same po_ref can have two unrelated header rows under
+  different `customerName` values ("ghost-tag" duplicates, see
+  `retrigger_client.merge_duplicate_headers`'s own docstring). A po_ref-only DELETE
+  could have wiped out a different customer's valid, already-matched detail rows.
+  Fixed by resolving the header's full key via `mappings_bridge` (not hardcoded) and
+  building one `(poRefNumber = x AND customerName = y)` OR-clause per orphan instead
+  of a single `poRefNumber IN (...)` clause.
+- **Assumed a single traced example (the 08:27:39→09:00:14 batch) was itself the
+  "6+ minute" complaint** — turned out to be worse (32+ min), and tracing it
+  further revealed the REAL mechanism was a ~1h53m total consumer silence
+  (07:00:33→08:53:57), not just one slow batch — don't anchor on the first data
+  point found; the gap was the thing worth explaining, not the single batch.
+  (Not a dead end exactly, but worth flagging: the investigation's first hypothesis
+  — CPU/thread contention from the single `cpu: '1'` limit on the worker pool
+  container — was considered and NOT pursued/confirmed; the actual confirmed cause
+  (dead Cloud SQL Connector background task) was found by comparing why
+  `bigquery_bridge.py` kept working through the same window while `so_import_worker`
+  didn't. The CPU-limit theory is still an open, unverified possibility worth
+  revisiting if stalls recur after this fix.)
+- **`gcloud logging read` with `resource.labels.service_name="rgmc-worker-pool"`
+  returns nothing** — this resource type (Cloud Run *Worker Pool*, not a regular
+  Cloud Run *service*) doesn't expose logs under that label the way an HTTP service
+  does. Use `textPayload:"..."` substring filters instead (e.g. `"worker.so_import"`,
+  `"worker.bigquery_bridge"`) — this is how every successful log query in this
+  session worked.
+- **Querying `/bigquery_routes/document-ai/search` for a single PO ref still timed
+  out at 140s client-side** — the `int_document_ai_detail` view is slow even for
+  narrow queries sometimes; fell back to direct `bq query` (BigQuery CLI) against
+  `durable-woods-465907-n1.sbic_int.int_document_ai_detail`, which also took ~140-170s
+  but at least completed (ran these as Bash background tasks given the predictable
+  2-3 min latency).
 
 ## Next Step
 
-Resolve the `PO407026110400667` / "SVI SAN LAZARO" branch-resolution gap. The user
-was given two options and has not yet responded:
-1. **Quick, PO-specific**: add a branch-scoped override on `/reconcile`'s Overrides tab
-   linking raw branch text `"SVI SAN LAZARO"` → customer `SU001` / ship-to
-   `SU001-S003-SU`. No code/SQL change; unblocks this PO and any future PO whose
-   extracted branch text matches exactly.
-2. **Systemic SQL fix**: add an exact-name fallback match to the `tr_CustomerPOBQ`
-   trigger on `CustomerPOULBQ` (MSSQL, `sbic_prod`) — when the lookup-code-substring
-   match fails, also try `CustomerBranch.name = #tmpPO.customerBranchLookUpCode` (or
-   match against the raw branch name column before it gets mangled into
-   `customerBranchLookUpCode`). This is a shared production trigger — get explicit
-   user sign-off before touching it, and consider also checking whether OTHER
-   currently-buffered POs share this same "non-numeric branch name, no embedded code"
-   pattern (would make the systemic fix clearly worth it vs. one-off overrides).
-
-Also confirm with the user whether `fix_customerpouldetailbq_overflow.sql` has
-actually been run against `sbic_prod` yet — if not, that's still an active landmine
-for any batch with a PO line total over 999,999.99.
+**Verify the 5 committed/pushed fixes are actually live and working in production.**
+Specifically:
+1. Confirm the Cloud Build deploy for commits `405e8c0`/`664a968` actually succeeded
+   (check Cloud Build history / the `rgmc-worker-pool` Cloud Run Worker Pool's
+   `latestReadyRevisionName` — it was `rgmc-worker-pool-00128-w8t` as of this
+   session, built from image `...rgmc-worker-pool:405e8c0`; a newer revision should
+   exist now reflecting `664a968` too).
+2. Watch the next several automated SBIC bridge runs' "POUL SO Import" emails for
+   the new "Elapsed Time Rundown" section at the bottom, and confirm MSSQL/BC
+   elapsed times look reasonable (BC handoff should now be seconds to low minutes,
+   not 30+ minutes).
+3. Specifically check whether the `07:51:56`-style Cloud SQL Connector crash
+   recurs post-deploy — if `sbic_db`'s fresh-engine-per-call fix is working, a
+   recurrence of that traceback should no longer cause an extended stall (next
+   batch's fresh engine should just work).
+4. Separately, circle back to the user on the **still-unanswered PRINCE RETAIL
+   `lookUpCode` fix convention** (they said they'd check with someone) — don't
+   write the UPDATE script until they confirm.
 
 ## Context & Gotchas
 
-- **Deployment model**: every repo here auto-deploys via a Cloud Build trigger on
-  push to its GitHub remote (`gcloud builds list` shows trigger names like
-  `rgmc-worker-pool-deploy`, `rmgpgab-rgmc-bc-api-prod-...`, etc. — some are
-  "cloudbuild.yaml"-driven, some are GitHub-connected auto-triggers). The **user**
-  (git identity `erar404 <it.arellanoerwin@gmail.com>`) has been the one actually
-  committing and pushing my edits each time, following the pattern established
-  earlier this session — I should keep asking before committing unless told
-  otherwise, but the user has consistently done it themselves within the same turn
-  when asked.
-- **rgmc-worker-pool's GitHub remote moved**: `git remote -v` still shows
-  `github.com/rgmc-apps/rgmc-worker-pool.git`, but a push now prints "This repository
-  moved. Please use the new location: github.com/erar404/rgmc-worker-pool.git" — this
-  is expected/harmless (an org→personal-account transfer), not an error to chase.
-- **Useful live-diagnostic trick discovered this session**: rgmc-gcp-api's
-  `GET /sbic/by_table/value?table_name=...&where_column=...&where_value=...` route
-  (mssql_routes.py) builds its query as a raw string-formatted `SELECT * FROM
-  {table_name} WHERE {where_column} = :where_value` — `table_name` accepts literally
-  anything, including system catalogs: `INFORMATION_SCHEMA.COLUMNS` (column
-  precision/scale — this is how the overflow bug's exact columns were found),
-  `sys.triggers` (list triggers), `sys.sql_modules` (get a trigger/proc's full
-  definition by `object_id`). Extremely useful for live MSSQL diagnosis without a
-  direct DB connection tool — also worth flagging to the user as a latent
-  SQL-injection-shaped surface on `table_name`/`where_column` (not fixed this
-  session, pre-existing).
-- **Browser automation (Claude-in-Chrome)** was used to directly verify the Trigger
-  Status modal live against the deployed site (navigate → screenshot → click →
-  screenshot) — confirmed a feature truly renders/works, not just that the HTML
-  text is present. Good pattern to reuse for future UI verification in this project.
-- **The `_json_safe`/`_json_default` fix only applies to `retrigger_client.py`'s own
-  direct-BigQuery-read path** (used by the `poul-so-retrigger-file` message handler).
-  The OLDER HTTP-proxy path through rgmc-gcp-api's FastAPI layer (used by
-  `cleanup_staging`/`insert_from_bigquery`/`check_promoted` — still HTTP calls per
-  that module's own docstring — and by sbic-manual-trigger-page's own single-PO/batch
-  retrigger routes in `app.py`) was never affected by this bug class, since FastAPI's
-  `jsonable_encoder` already serializes datetime/Decimal natively. No parallel fix
-  needed there.
-- **Known, still-unfixed issues from earlier sessions** (not touched this session,
-  just carried forward): the dbt-view performance issue (`int_document_ai`/
-  `int_document_ai_detail` are non-materialized views re-scanning full history on
-  every read — owned by a separate dbt project, out of scope for any of these 5
-  repos); the dead-letter Pub/Sub topic (`rgmc-poul-so-import-dead`) has no
-  subscription, so dead-lettered messages are silently discarded with zero
-  visibility; MTC (Manila Taste Curators) still has no BC company configured by
-  design (the "30 POs" SBIC-attribution merge-priority logic from earlier this
-  session exists specifically to route around this).
-- **`bridge_run_lock_{env}` / `reprocess_runs_{env}` Firestore collections**: `{env}`
-  resolves to `"staging"` or `"production"` depending on `config.GCP_ENV` — confirmed
-  via `rgmc-bc-api`'s own `_env_slug()` helper (`(config.GCP_ENV or
-  "staging").lower().replace(" ", "_")`) and `bridge_run_lock.py`'s simpler
-  `config.GCP_ENV.lower()` — both agree in practice since there are no spaces in
-  either value.
+- **The user commits/pushes without always announcing it in-conversation** — this
+  session's biggest process surprise: all 5 `rgmc-worker-pool` changes were found
+  already committed+pushed only when checking `git status` to write this handoff,
+  with no explicit "yes commit" message visible in this transcript. Always
+  `git status`/`git log` both repos before assuming uncommitted work is still
+  uncommitted.
+- **Deployment model**: every repo auto-deploys via Cloud Build on push to GitHub
+  (~3 min build+deploy), per established pattern from prior sessions.
+- **`gcloud` only works reliably via the PowerShell tool**, not Bash (Bash's
+  `python`/`gcloud` resolve to broken Windows Store stub aliases). `py` (real
+  Python) and `bq` (BigQuery CLI) both work fine in Bash.
+- **BigQuery's `int_document_ai_detail` view is confirmed slow** — directly measured
+  at `168.08s` via `pandas_gbq.gbq_connector`'s own "Total time taken" log line. Not
+  a worker-pool code issue; flagged as out of scope for these fixes, worth escalating
+  to whoever owns the dbt view separately.
+- **Cloud Run Worker Pool, not Service** — `rgmc-worker-pool` runs 4 independent
+  Pub/Sub subscriber loops (order, sync, so_import, bigquery_bridge) in one process
+  (`src/main.py`), each via its own `subscriber.subscribe(...)` call (own default
+  executor/thread pool), sharing a single `cpu: '1'` container resource limit. Not
+  concluded whether this per-container CPU limit contributes to stalls — flagged as
+  an open question, not fixed this session.
+- **`mappings_bridge.py`** (`rgmc-worker-pool/src/mappings_bridge.py`) is the
+  canonical source for MSSQL table composite keys (`required_columns`) and
+  snake_case→camelCase column name translation (`table_mappings`) — always resolve
+  key columns through this, never hardcode (`poRefNumber`/`customerName` etc.),
+  since that's exactly the bug the user caught this session.
+- **The Fact-Forcing Gate hook** fires on the *first* Edit/Write to each file in a
+  session (and apparently again if the grep search path used to satisfy it doesn't
+  literally contain the target file's full path) — when it fires, answer with (1)
+  grep-confirmed call sites, (2) data-file format or "not applicable", (3) the
+  user's verbatim current instruction, then retry the same edit. For a *new* file,
+  it instead asks what it supersedes / where it's linked from / the verbatim
+  instruction.
+- **PO407026110401891** (SUPERVALUE INC., branch `[0286] SVI MEGAMALL A`) was the
+  specific PO that triggered fix #1's investigation — its branch/customer lookup
+  were confirmed UNambiguous (unlike the PRINCE RETAIL case), so its repeated
+  `not_promoted` failures were from the broader table-wide-trigger-scan +
+  bridge-vs-manual-retrigger race, not a master-data issue.

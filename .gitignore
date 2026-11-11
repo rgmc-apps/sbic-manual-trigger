@@ -7,3 +7,5 @@ venv/
 .venv/
 .devserver.*.log
 plans/
+sql/
+handoff.md
