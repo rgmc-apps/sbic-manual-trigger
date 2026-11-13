@@ -8,4 +8,6 @@ venv/
 .devserver.*.log
 plans/
 sql/
+reports/
+temp/
 handoff.md
