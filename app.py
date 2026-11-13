@@ -825,6 +825,31 @@ def _fetch_overrides_by_type(override_type: str) -> list:
     return (body.get("data") or []) if status_code == 200 else []
 
 
+def _fetch_item_ref_map(company: str) -> dict:
+    """Upper-cased customerSKUCode (referenceNo) -> {"itemNo", "description"}, from BC's
+    own Item Reference table (Pag50349, referenceType="Customer" only) — same convention
+    rgmc-worker-pool's so_import_worker.py._build_ref_map uses for the automated import/
+    reprocess-buffer/retrigger paths. Filtered to "Customer" type there for the same
+    reason: Item/Variant/Bar Code/Vendor reference rows can share a referenceNo value
+    with an unrelated item's customer SKU code."""
+    try:
+        resp = _bc_api("GET", "/bc/custom/v2/item-references", params={
+            "reference_type": "Customer", "company": company,
+        })
+        body, status_code = _proxy_json(resp)
+    except requests.RequestException:
+        return {}
+    if status_code != 200:
+        return {}
+    return {
+        (r.get("referenceNo") or "").strip().upper(): {
+            "itemNo": r.get("itemNo"), "description": r.get("description") or "",
+        }
+        for r in (body.get("data") or [])
+        if r.get("itemNo") and r.get("referenceNo")
+    }
+
+
 def _match_branch_override(branch_overrides: list, branch_name: str) -> dict | None:
     """The already-saved "branch" override's ship-to for this exact customerBranchName,
     if one exists in `branch_overrides` (see _fetch_overrides_by_type) — a human already
@@ -1757,6 +1782,14 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
     uom_overrides_by_key = {
         (ov.get("key") or "").strip().upper(): ov for ov in _fetch_overrides_by_type("uom")
     }
+    # Same BC Item Reference ("Customer" type, Pag50349) matching rgmc-worker-pool's own
+    # automated import already does via _build_ref_map — a raw customerSKUCode BC itself
+    # already resolves to an item, with no saved override needed. Previously this
+    # function only recognized a saved SKU override or a raw-SKU-equals-item-number
+    # coincidence, so an item BC could already auto-resolve showed here as "needs
+    # linking" even though Transfer to BC (via the automated path) would have resolved
+    # it fine — a harmless-but-noisy false positive now eliminated.
+    item_ref_map_by_key = _fetch_item_ref_map(company)
 
     po_refs = [order.get("externalDocumentNo") for order in orders if order.get("externalDocumentNo")]
     expected_by_ref = _fetch_expected_lines_batch(po_refs)
@@ -1776,10 +1809,12 @@ def _find_missing_items(company: str, po_ref_number: str, date_from: str, date_t
         candidates = []
         for line in expected_lines:
             sku_key = _sku_key_for_line(line)
+            raw_sku = (line.get("customerSKUCode") or "").strip()
             sku_override = sku_overrides_by_key.get(sku_key.upper())
             resolved_item = sku_override.get("resolved") if sku_override else None
+            if not resolved_item and raw_sku:
+                resolved_item = item_ref_map_by_key.get(raw_sku.upper())
             resolved_item_no = ((resolved_item or {}).get("itemNo") or "").strip()
-            raw_sku = (line.get("customerSKUCode") or "").strip()
 
             already_present = bool(
                 (resolved_item_no and resolved_item_no.upper() in current_numbers)
