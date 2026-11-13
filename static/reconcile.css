@@ -356,6 +356,8 @@
 .tab-btn:hover, .action-tab-btn:hover { color: var(--text); }
 .tab-btn.active, .action-tab-btn.active { color: var(--brand-dark); border-bottom-color: var(--brand); }
 .tab-btn:active, .action-tab-btn:active { transform: scale(.97); }
+.tab-btn:disabled, .action-tab-btn:disabled { opacity: .4; cursor: not-allowed; }
+.tab-btn:disabled:hover, .action-tab-btn:disabled:hover { color: var(--text-muted); }
 
 .tab-panel, .action-tab-panel {
   display: flex;

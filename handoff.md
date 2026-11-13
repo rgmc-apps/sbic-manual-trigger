@@ -234,3 +234,31 @@ Specifically:
   were confirmed UNambiguous (unlike the PRINCE RETAIL case), so its repeated
   `not_promoted` failures were from the broader table-wide-trigger-scan +
   bridge-vs-manual-retrigger race, not a master-data issue.
+- **HARD RULE (2026-11-13): company can NEVER be inferred from `customerName`.**
+  The same customer (e.g. SUPER SHOPPING MARKET, PASIG SUPERMARKET) legitimately
+  places POs for both SUNCOAST BRANDS (companyId 6) and MANILA TASTE CURATORS
+  VENTURES (companyId 12) depending on which specific PO/brand it is — confirmed
+  against historical `createBy='trigger'` records. A manual bypass-insert rescue
+  that guessed company from customer name sent **99 MTC-brand POs (Lipton/Nestle/
+  Gerber) to BC as SBIC orders** (cleanup list: `mistaken_bc_pos_cleanup.txt` /
+  `mistaken_bc_pos_refs_only.txt` in this repo's root — BC-side cleanup still
+  pending as of this writing).
+  - The production path (`bc_direct_handoff.py`, `bigquery_bridge.py`,
+    `tr_CustomerPOBQ`) was NEVER affected — all three always resolve company from
+    the real `companyName` field BigQuery's Document AI extraction attaches per PO
+    header, never from customerName. Nothing to fix there.
+  - **Tried and rejected**: cross-validating company via `Product.brandId ->
+    WarehouseBrand -> Warehouse.companyId`. Looked clean (no brand spans multiple
+    companies) but flagged **1057 existing, correctly-processed historical orders**
+    as false positives — SBIC legitimately sells some Lipton-brand SKUs too, so
+    brand does not strictly determine company. Do not resurrect this approach.
+  - **No fast, reliable fallback exists** when BigQuery times out (confirmed: even
+    a single-PO `int_document_ai` header-only lookup via
+    `/bigquery_routes/document-ai/search?po_ref_number=...` timed out at 60s+ on
+    this date — the known view-performance issue applies broadly, not just to the
+    detail view).
+  - **The actual rule for any future manual rescue**: if the real `companyName`
+    can't be obtained from BigQuery in time, insert the header with `companyId=-1`
+    (the same "unresolved" sentinel `tr_CustomerPOBQ` itself defaults to) and flag
+    it for manual follow-up — never substitute a guess, and never send an
+    unresolved-company row to BC.
