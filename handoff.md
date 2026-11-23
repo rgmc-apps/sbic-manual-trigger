@@ -2,261 +2,323 @@
 
 ## Goal
 
-Harden the RGMC/SBIC SO-import pipeline (BigQuery → MSSQL → Business Central) across
-the `sbic-manual-trigger-page` / `rgmc-worker-pool` / `rgmc-bc-api` / `rgmc-gcp-api`
-ecosystem, and repair a batch of BC Sales Orders that were created with zero line
-items. The session started from a narrow question — "why do POs `0026087977`,
-`0026087981`, `0026095047`, `0026097312` have no sales order items inserted?" — and
-widened into finding and fixing several real bugs, plus a live, ongoing data-repair
-effort that is NOT finished.
+Two threads, both still open:
 
-Constraints established along the way:
-- Never guess Business Central company (SBIC vs MTC) from customer name — the same
-  customer places POs for both companies depending on the specific brand. Company
-  must come from the real source field, never be inferred.
-- Queue-then-apply only — never write to BC directly from a "pick/suggest" step, only
-  from an explicit Apply action (see memory `feedback_queue_vs_apply_pattern`).
-- PRINCE RETAIL (`4561798`, `4561836`, `4561912`, several `4524xxx`/`4525xxx` refs) is
-  explicitly paused pending the user confirming a `lookUpCode` fix convention with a
-  colleague — do not touch, do not write any UPDATE for it.
+1. **Harden the RGMC/SBIC SO-import pipeline** (BigQuery → MSSQL → Business Central)
+   across `sbic-manual-trigger-page` / `rgmc-worker-pool` / `rgmc-bc-api` /
+   `rgmc-gcp-api`, and keep clearing the backlog of POs that got stuck in MSSQL
+   without ever reaching BC. This is a continuation of a prior session (see the old
+   handoff content folded into git history — commit `5e289b1`).
+2. **UI simplification**: replace the "Retrigger (MSSQL)" / "Retrigger BC only" button
+   pairs on every screen of `sbic-manual-trigger-page` with a single "Retrigger"
+   button, letting the backend decide which path a PO needs (already in MSSQL →
+   BC-only check/create; not yet in MSSQL → full BigQuery refetch + re-insert) instead
+   of making the user pick. Explicitly requested: "have the worker pool d[e]cide on
+   where to insert the handoff (based on the company mapping)".
+
+Constraints carried over from the prior session (still in force):
+- Never guess BC company from customer name — always resolve via `_resolve_bc_company`
+  / `BC_HANDOFF_COMPANY_MAP`, never inferred from free text alone.
+- Queue-then-apply only — never write to BC from a pick/suggest step, only an
+  explicit Apply/retrigger action (user confirms before any BC write).
+- PRINCE RETAIL is still paused — do not touch.
+- MTC (Manila Taste Curators) has no BC company configured (`RECONCILE_COMPANIES =
+  ["SBIC"]` in `app.py`) — any MTC retrigger attempt is expected to report
+  "company not BC-routable", not an error to chase.
 
 ## Current State
 
-**Root cause of the original question, fully diagnosed and fixed, and separately
-already committed+pushed by the user (not by me explicitly, but confirmed present in
-each repo's git log — see Context & Gotchas):**
+**Root cause of the "stuck in MSSQL, never reaches BC" bug — found and fixed,
+committed by the user:**
 
-1. `rgmc-worker-pool/src/services/bc_direct_handoff.py` — the direct BigQuery→BC
-   handoff path (built earlier this session to bypass the buggy `tr_CustomerPOBQ`
-   trigger) inserted resolved rows into `CustomerPOUL`/`CustomerPOULDetail` but NEVER
-   into `CustomerPOULDetailBQ` — the table `so_import_worker.py`'s
-   `_run_backfill_from_cloudsql` / `_sync_order_from_cloudsql` actually read line items
-   from (via `gcp_api_client.fetch_customerpouldetailbq`). Result: BC sales orders got
-   created with a header but **zero lines**, for every single PO this path had ever
-   sent to BC (31 total, confirmed live). Fixed: `_insert` now also writes a matching
-   `CustomerPOULDetailBQ` row per detail line (safe — `tr_CustomerPOBQ` only fires on
-   `CustomerPOULBQ`/header inserts, never on the detail table). Committed as
-   `0f3c9d7`/later in that repo's log.
-2. `rgmc-bc-api/src/services/so_buffer_service.py` (`apply_missing_item_fixes`,
-   ~line 1304) — never set `lineNo` explicitly when adding a line to an existing BC
-   sales order, relying on BC's own auto-numbering. For an order that starts with zero
-   lines and gets several lines added back-to-back in the same apply loop, BC's
-   auto-numbering doesn't settle fast enough and every line after the first fails with
-   `Internal_EntityWithSameKeyExists ... Line No.='0'`. Fixed: compute
-   `next_line_no = max(existing lineNo) + 10000` explicitly, same convention
-   `rgmc-worker-pool`'s `_create_order` already uses. Committed as `2c004f7`
-   ("DI-0243 added modifications for bc handoff") and user confirmed this was deployed.
-3. `rgmc-gcp-api/src/routers/bigquery_routes/bigquery_routes.py`
-   (`get_document_ai_source_file`, ~line 293) — the "View File" action's bucket lookup
-   never knew about Manila Taste Curators (MTC) uploads living one folder deeper
-   (`portal/manila_taste/{basename}` instead of `portal/{basename}`, same bucket
-   `sbic-po-parser-in-v2`) — every MTC "View file" request returned `not_found`. Fixed
-   by detecting the `manila_taste` marker already present one level up in the
-   batch-output `file_name` path. Verified live against the real GCS bucket. Committed
-   as `f7a6583`.
-4. `rgmc-worker-pool/src/services/send_mail.py` + `bigquery_bridge.py` — the
-   "BigQuery Bridge Complete" developer email dumped its whole log as one unreadable
-   `<pre>` blob with no elapsed-time field. Added: dash-bracketed sections
-   (`__log_section` blocks like "INSERT SUMMARY"/"DUPLICATES SKIPPED") now render as
-   separate labeled cards; added an optional `elapsed_seconds` param threaded through
-   `notify_success`/`notify_error`/`notify_warning` → an "Elapsed" row; added a new
-   "DIRECT BC HANDOFF" section (`__build_direct_handoff_summary`) so the
-   inserted-into-MSSQL vs sent-to-BC counts are no longer a raw Python dict dump.
-   Already committed/pushed (confirmed present in the repo).
-5. `rgmc-worker-pool/src/services/bot_notify.py` — `notify_bridge_run` renamed its
-   endpoint/event tag from `bridge-run`/`bridge.run` to `po-upload-trigger`/`po.trigger`
-   to match the existing `po-upload-batch`/`po-upload-unmatched` naming convention.
-   Teams command to subscribe: `subscribe po-upload-trigger`. `rgmc-it-bot`'s own
-   `/api/notify/po-upload-trigger` handler still needs to be built in that repo (no
-   local access) for this to actually render anywhere.
+`rgmc-worker-pool/src/workers/so_import_worker.py`'s `_run_backfill_from_cloudsql`
+(the function behind `POST /customerpoul/backfill-from-cloudsql`, called both by the
+`customerpoul-backfill-held-back` Cloud Scheduler cron and synchronously from
+`bc_direct_handoff.run_direct_bc_handoff` right after a fresh MSSQL insert) had one
+failure path explicitly documented as "never buffered — the check itself failed": if
+`bc_client.v2_find_sales_order_by_external_doc_no` (the pre-create existence check)
+raised for any reason — a transient BC blip, a timeout, anything — that PO was logged
+to an in-memory `errors` list and then **completely dropped**: no BC order, no
+Firestore buffer entry, nothing visible on `/reconcile`. Since `bc_direct_handoff`'s own
+dedup guard (`_existing_customer_po_refs`) treats "already in CustomerPOUL" as "already
+handled" on every future run, a PO that hit this exact failure mode was stuck forever —
+no automated path would ever retry it again.
 
-**Rejected approach (do not resurrect):** tried validating BC-handoff company
-assignment via `Product.brandId -> WarehouseBrand -> Warehouse.companyId`, thinking
-brand reliably determines company. It flagged **1057 existing, correctly-processed
-historical orders** as false positives — SBIC legitimately sells some Lipton-brand
-SKUs too. Reverted entirely from `bc_direct_handoff.py`/`bigquery_bridge.py`.
+**Fix applied and VERIFIED COMMITTED** (user committed it themselves, under an
+unrelated-looking message — confirmed live):
+- `C:\claude\rgmc-worker-pool\src\workers\so_import_worker.py` lines ~1774-1788 — moved
+  the `lines = gcp_api_client.fetch_customerpouldetailbq(po_ref)` fetch to BEFORE the
+  existence check (was after), and the existence-check `except` block now calls
+  `so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}",
+  str(e))` instead of just appending to `errors` and moving on.
+- **Committed** as `1fcc309` ("DI-0246 fix for missing items on garments webapp" — the
+  message doesn't match the actual change; this is a known recurring pattern with this
+  user, see Context & Gotchas). Confirmed via `git show --stat 1fcc309 -- 
+  src/workers/so_import_worker.py` (8 insertions, 2 deletions) and
+  `grep -n "Fetched before the existence check" src/workers/so_import_worker.py`
+  both match. **This still needs an actual Cloud Run deploy of `rgmc-worker-pool` to
+  take effect live** — a git commit alone doesn't redeploy the service. Not confirmed
+  deployed this session.
+- `rgmc-worker-pool` also has an UNRELATED uncommitted change sitting in the working
+  tree: `src/services/price_firestore_service.py` (modified, not staged) — **not
+  touched by this session, not related to any of this work**, presumably the user's
+  own separate in-progress edit (garments webapp, matching the commit message above).
+  Leave it alone unless the user says otherwise.
 
-**The 99-PO company-mis-tagging incident (separate from the above) is still
-unresolved on the BC side.** Earlier in the session, 99 POs were manually
-bypass-inserted with the wrong company (tagged SBIC when they were actually MTC
-Lipton/Nestle/Gerber products) and ended up as real BC sales orders under the wrong
-company. The MSSQL side was corrected (`CustomerPOUL.companyId`/`companyName` fixed
-for the 100 affected rows). **The BC side — voiding/cleaning up those 99 wrongly
-created sales orders — has NOT been confirmed done.** The reference list moved from
-the repo root into the gitignored `reports/` folder at some point this session (not by
-me — found already relocated): `reports/mistaken_bc_pos_cleanup.txt` (PO_REF|BC_ORDER_NO|CUSTOMER_NAME|CUSTOMER_NO,
-99 rows) and `reports/mistaken_bc_pos_refs_only.txt` (same 99 refs, pipe-joined on one
-line). **Check with the user whether this was ever actually cleaned up in BC** — it was
-never re-verified in this session after the initial finding.
+**Two separate batches of stuck POs found and cleared this session (both via the
+EXACT same remediation — `POST /customerpoul/backfill-from-cloudsql` scoped to the
+specific `po_ref_numbers`, `create_by=bc_direct_handoff`, `companies=SBIC`):**
 
-**The zero-line-orders repair (the 31 POs from bug #1 above) is live and in progress,
-NOT complete:**
-- **70 of 265 expected line items are now in BC.**
-- **4 of 31 POs are fully complete**: `0026087977` (4/4), `0026087981` (4/4),
-  `0026095047` (1/1), `0026097312` (1/1) — these are exactly the 4 POs the session
-  started with, so the original question is fully answered/resolved.
-- **27 of 31 POs remain partial**, blocked purely on human `/reconcile` decisions, not
-  on anything further I can fix in code:
-  - ~13 distinct SKUs still have no BC item reference at all and need linking
-    (confirmed as of the last check; count went from 14→13 after the item-reference
-    matching fix below reclassified one).
-  - ~55+ distinct SKUs resolve to a real BC item but need their Unit of Measure
-    confirmed (raw unit like "Cases" doesn't map to a valid BC UOM for that item, no
-    saved override exists yet).
-  - The worst-affected POs by line count: `1876078-00` (6/25), `1876068-00` (9/26),
-    `1876054-00` (5/22), `1876061-00` (7/22), `1876093-00` (6/22), `506189225-00`
-    (5/20), `506189228-00` (4/17).
-  - Exact per-PO/per-SKU breakdown files (gitignored, still on disk):
-    `temp/queue_retry4.json`, `temp/skip_a2.json`, `temp/skip_b.json`.
+1. First batch — the 5 refs the user named directly: `10092880`, `10092882`,
+   `10092883`, `10092885`, `10092886` (all WATSONS PERSONALCARE / SUNCOAST BRANDS).
+   Run `e29152ca418a454eaba6411d74bc826f` — **all 5 succeeded**: `SBSO26A001292`,
+   `SBSO26A001290`, `SBSO26A001293`, `SBSO26A001291`, `SBSO26A001289` respectively (32
+   lines total, 0 failed). Verified live against BC.
+2. Second batch — 6 refs the user supplied from their own query: `26114282` (real
+   MSSQL value is zero-padded: `0026114282` — the user's copy/paste had dropped the
+   leading zeros, a BigQuery/Excel artifact, not a data bug), `MDSG-11355`,
+   `MDSG-11374`, `PO407026111303099`, `PO407026111300487`, `PO407026111301092`. Run
+   `9d2c0486e88446419a536caaaee96753` — **4 of 6 succeeded**:
+   - `0026114282` → `SBSO26A001294`
+   - `PO407026111300487` → `SBSO26A001295`
+   - `PO407026111301092` → `SBSO26A001296`
+   - `PO407026111303099` → `SBSO26A001297`
+   - `MDSG-11355` and `MDSG-11374` (both PYC FOODS CORPORATION) **failed and landed in
+     the SO buffer** (proof the fix works — this is the NEW correct behavior, not a
+     regression): `last_error` is "No ship-to address in BC for branch code='OWD-TMOG
+     RETAIL BOH\n74 TIMOG AVENUE\nSACRED HEART DILIMAN\nQUEZON CITY MNLA 1103'" (and
+     the Alabang equivalent for the other) — `customerBranchName` for these two is a
+     full multi-line address block instead of a short branch code, and BC has no
+     matching ship-to. **This is a genuine, separate `/reconcile` branch-linking job,
+     not a code bug** — needs a human to link that branch name to a BC ship-to address
+     on the Overrides tab. Not fixed, not expected to be fixed by this code.
 
-**Separately, just applied, NOT yet re-verified at scale:** a fix that makes the
-Missing Items comparison (`_find_missing_items` in `app.py`) also check BC's own Item
-Reference table (`referenceType="Customer"`), matching what `rgmc-worker-pool`'s
-automated reprocess-buffer/retrigger path already does via `_build_ref_map`.
-Previously this function only recognized a saved manual override or a raw-SKU-equals-
-item-number coincidence, so anything BC could already auto-resolve on its own showed
-as a false "needs_linking". Verified on one PO (`506189234-00`): 3 of 5 previously
-unresolved items correctly reclassified from `needs_linking` to `needs_uom` with a
-real resolved item (e.g. SKU `4492199` → BC item `PF01PF04`). Ran the full repair loop
-once after this fix and it picked up 1 more item (69→70 lines). **This file
-(`app.py`) is the only uncommitted change in any repo right now.**
+**Broader context still true from before this session (NOT re-verified this
+session, may have changed):** the earlier full-week BigQuery scan found ~183 distinct
+SBIC PO refs (beyond the ones named above) in the exact same stuck state (in MSSQL via
+`bc_direct_handoff`, not in BC, not in buffer) — see `temp/week_scan2.json`. Only the
+11 refs named explicitly by the user across the two batches above have actually been
+retriggered. **The other ~170-some are still sitting there un-retriggered** — the
+worker-pool fix prevents NEW occurrences but does nothing for ones already stuck from
+before the fix was deployed (and again, deploy status is unconfirmed).
+
+**The 97-of-104 orphaned SBIC buffer entries (from the Nov 13 "99-PO company
+mis-tagging" cleanup) are STILL sitting there, unaddressed this session** — confirmed
+their BC sales orders were voided (direct BC lookup on 3 sample order numbers all
+returned empty), but nobody has cleared/re-created the matching buffer entries yet.
+Still needs a decision: re-create fresh orders for these, or just purge the stale
+buffer docs.
+
+**UI consolidation — implemented, uncommitted, smoke-tested live, NOT committed:**
+
+`git status --short` in `sbic-manual-trigger-page` shows exactly these 3 files
+modified (uncommitted as of this handoff):
+```
+ M app.py
+ M static/dashboard.js
+ M static/handoff-history.js
+```
+
+Backend (`app.py`):
+- `_retrigger_bc_only_core(po_ref)` (~line 3978) and `_retrigger_mssql_core(po_ref)`
+  (~line 4193) — extracted from the old route bodies, same logic, unchanged behavior.
+  The old routes (`POST /api/handoff-history/retrigger-bc-only`,
+  `POST /api/handoff-history/retrigger-mssql`) are now thin wrappers around these and
+  still work exactly as before (kept for backward compat / nothing else was found to
+  call them besides the JS that now calls the new consolidated route instead).
+- **New** `POST /api/handoff-history/retrigger` (~line 4217) — single entry point:
+  calls `_fetch_from_customerpoul(po_ref)`; if a header already exists, delegates to
+  `_retrigger_bc_only_core` (path="bc_only"); otherwise delegates to
+  `_retrigger_mssql_core` (path="mssql_full", which already fires the BC follow-up on
+  success). Response always carries `"path"` so the frontend can word its message
+  correctly.
+- `_resolve_file_refs_by_mssql_presence(file_name)` and
+  `_run_bc_only_for_refs_by_company(present_refs_by_company)` (~line 4076-4133) —
+  extracted from the old `retrigger-bc-only-file` route body, same logic.
+- **New** `POST /api/handoff-history/retrigger-file` (~line 4190) — file-scoped
+  equivalent: splits the file's refs into present (→ synchronous BC-only poll, via
+  `_run_bc_only_for_refs_by_company`) vs missing (→ async
+  `POST /customerpoul/retrigger-file` scoped to ONLY the missing refs via
+  `po_ref_numbers=`, so already-good POs in the same file aren't redundantly
+  re-fetched from BigQuery). Returns `{bc_only_result, missing, company_unresolved,
+  full_retrigger_run_id}` — the missing-side result is a run_id the frontend polls
+  separately.
+- Old `POST /api/handoff-history/retrigger-bc-only-file` route kept, now calls the
+  same two extracted helpers.
+- `pylance` flags a couple of pre-existing-style unused-var warnings (`_lines`,
+  `status_code`) — intentional underscore-prefixed/already-existed-before-this-session
+  convention, not real issues, left as-is.
+
+Frontend:
+- `static/dashboard.js`: per-PO `renderRetriggerAction` (~line 711) now renders ONE
+  `.dash-retrigger-btn` ("Retrigger") instead of two, posts to
+  `/api/handoff-history/retrigger`, branches display text on `data.path`. File-row
+  buttons (`.dash-retrigger-file-btn` + `.dash-retrigger-bc-file-btn`, ~line 195-400)
+  merged into one `.dash-retrigger-file-btn` ("Retrigger") posting to
+  `/api/handoff-history/retrigger-file`; handles the synchronous `bc_only_result` via
+  new helper `renderBcOnlyFileResult(data)` (~line 61, added right after
+  `pollRunStatus`), then if `full_retrigger_run_id` is present, polls it with the
+  existing `pollRunStatus` helper the same way the old whole-file button did.
+- `static/handoff-history.js`: `renderRetriggerAction` (~line 82) now renders ONE
+  button posting to `/api/handoff-history/retrigger`; `renderBcOnlyRetriggerAction`
+  deleted entirely; `renderRecord` (~line 127) now has a single
+  `.handoff-history-retrigger-action` container (the second
+  `.handoff-history-retrigger-bc-action` div removed) and ONE condition:
+  `needsRetrigger = mssql_status === "error" || trigger_status === "not_promoted" ||
+  bc_status !== "created"`.
+- **Deliberately NOT touched**: `templates/dashboard.html` / `templates/index.html`'s
+  `#handoff-batch-retrigger-btn` ("Retrigger Batch (MSSQL)") — this is a standalone
+  manual batch tool (paste refs or a date range) with no "BC only" sibling button to
+  consolidate with, so it was left alone as out of scope.
+
+**Verification done this session:**
+- `py -m py_compile app.py` — clean.
+- `node --check static/dashboard.js` / `static/handoff-history.js` — both clean.
+- Live smoke test against the local dev server (`http://127.0.0.1:8099`, started via
+  `PORT=8099 nohup py app.py > temp/app_server2.log 2>&1 &`, PID 33168 — **still
+  running** as of this handoff):
+  - `curl POST /api/handoff-history/retrigger {"po_ref_number":"10092880"}` → correctly
+    took `path: "bc_only"` (already in MSSQL), returned `status: "done"`.
+  - Live in Chrome (Handoff History tab): clicked the single new "Retrigger" button on
+    an MTC record (`PO407026111302621`) → correctly took the bc_only path and rendered
+    "Error: Could not resolve a BC company from companyName='MANILA TASTE CURATORS
+    VENTURES' companyId=12 — not sent to BC." inline, button re-enabled, no JS
+    exceptions.
+- **NOT tested live**: the new file-scoped `/api/handoff-history/retrigger-file`
+  route's actual button click — deliberately skipped because the only real file
+  available to test against had 81 real POs and clicking it would have triggered 81
+  real BC-write attempts just to smoke-test the UI. Confidence here rests on: (a) it
+  reuses the exact same `_run_bc_only_for_refs_by_company` helper already proven live
+  on the per-PO path, and (b) the async-missing-refs branch reuses the pre-existing,
+  already-working `/customerpoul/retrigger-file` endpoint and the pre-existing
+  `pollRunStatus` polling loop, unchanged.
+
+**A Flask dev-server quirk surfaced during testing, not a bug**: the local
+`py app.py` dev server runs single-threaded by default (no `threaded=True` in
+`app.run(...)`), so one slow in-flight request (e.g. the Search tab's known-slow
+BigQuery `document-ai/search` full-table-scan query, which can take up to
+`BQ_PROXY_TIMEOUT`=150s) blocks every other request including unrelated tabs/routes
+until it resolves. Caused a stuck "Searching…" on the Handoff History tab for ~160s
+during testing — resolved on its own once the slow request finished. Not something to
+fix unless the user asks; mentioned here so the next session doesn't mistake it for a
+new regression.
 
 ## Files Actively Being Edited
 
-- `sbic-manual-trigger-page/app.py` — **uncommitted.** Added `_fetch_item_ref_map(company)`
-  (new helper, ~line 828, right after `_fetch_overrides_by_type`) and wired it into
-  `_find_missing_items` (~line 1782 for the fetch, ~line 1809-1816 for the per-line
-  resolution fallback: `if not resolved_item and raw_sku: resolved_item =
-  item_ref_map_by_key.get(raw_sku.upper())`). Compiles clean (`py -m py_compile app.py`
-  passed). Verified live against the running local app. Not committed — do
-  `git diff app.py` to see the exact 36-line diff before deciding whether to commit.
-
-All other repos (`rgmc-worker-pool`, `rgmc-bc-api`, `rgmc-gcp-api` at
-`C:\RGMC\Source\git\rgmc-gcp-api`) show **clean working trees** — every fix described
-above is already committed and pushed (by the user, not announced in-conversation).
-`sbic-manual-trigger-page`'s own `templates/reconcile.html`/`static/reconcile.css`
-(Cloud SQL tab disabled) are also already committed (`79e5d67 disabled sql sync`).
+- `C:\claude\sbic-manual-trigger-page\app.py` — **uncommitted.** See "UI
+  consolidation" above for the exact diff shape. Compiles clean, smoke-tested live for
+  the per-PO path.
+- `C:\claude\sbic-manual-trigger-page\static\dashboard.js` — **uncommitted.** Per-PO
+  and file-row retrigger buttons consolidated. Syntax-checked clean.
+- `C:\claude\sbic-manual-trigger-page\static\handoff-history.js` — **uncommitted.**
+  Per-record retrigger buttons consolidated. Syntax-checked clean, smoke-tested live.
+- `C:\claude\rgmc-worker-pool\src\workers\so_import_worker.py` — **committed** (by the
+  user, as `1fcc309`). Confirmed present on disk and in git log. No further action
+  needed on this file unless a deploy is still pending (unconfirmed — see Next Step).
+- `C:\claude\rgmc-worker-pool\src\services\price_firestore_service.py` — modified,
+  uncommitted, **NOT part of this session's work** — belongs to the user's own
+  separate in-progress change. Do not touch, do not assume it's related.
 
 ## Failed Attempts
 
-- **Guessing BC company from customer name** during an earlier manual bypass-insert
-  rescue (before this handoff's visible window, but its consequences are still being
-  cleaned up) — **why it failed**: the same customer (e.g. SUPER SHOPPING MARKET,
-  PASIG SUPERMARKET) legitimately orders from both SUNCOAST BRANDS (SBIC, companyId 6)
-  and MANILA TASTE CURATORS VENTURES (MTC, companyId 12) depending on the specific
-  PO/brand — confirmed against historical `createBy='trigger'` records. Sent 99
-  MTC-brand POs to BC as SBIC orders. See "99-PO company-mis-tagging incident" above —
-  BC-side cleanup still unconfirmed.
-- **`Product.brandId -> WarehouseBrand -> Warehouse.companyId` as a company-validation
-  rule** — **why it failed**: looked like a clean 1:1 mapping (no brand spans multiple
-  companies) but flagged 1057 existing, correctly-processed historical orders as false
-  positives. SBIC legitimately sells some Lipton-brand SKUs too (likely a
-  pre-MTC-era product line or commercial overlap that doesn't match physical warehouse
-  stocking). Reverted entirely.
-- **Treating `CustomerPOULDetail` as a drop-in substitute for `CustomerPOULDetailBQ`**
-  when trying to backfill missing BC line data fast — **why it failed/was rejected**:
-  `CustomerPOULDetail` is missing `poQtyPcs`, `unitOfMeasurement`, `unitAmount`,
-  `netAmount` — fields line-resolution depends on (specifically `_is_pcs(uom_raw)`
-  branching in `so_import_worker.py._build_line_payload`). Using it would risk silently
-  wrong quantities for any line whose real unit was "pcs"-coded. Went with the slower
-  but complete and accurate path (direct BigQuery re-fetch) instead.
-- **Querying BigQuery (`int_document_ai`/`int_document_ai_detail`) for a single PO ref
-  or a small batch, expecting speed from the narrower scope** — **why it failed**: the
-  views re-scan the full historical backlog regardless of filter size (documented,
-  known, out-of-scope-to-fix-here issue — the real fix is materializing them as dbt
-  tables, owned by a separate team). Confirmed 60s+ timeouts even for single-PO
-  header-only lookups. The working pattern is: always run these as backgrounded
-  commands with 180-280s timeouts and just wait, not try to make them fast.
-- **A specific 17-ref sub-batch to `/api/dashboard/queue-missing-items` consistently
-  returned `orders_with_missing_items: 0` on 2 separate attempts** even though those
-  POs definitely had missing items (confirmed independently) — **why**: never
-  root-caused; looks like an intermittent failure in the underlying BC search or
-  BigQuery call inside `_find_missing_items` that silently returns empty rather than
-  erroring. Splitting into two smaller sub-batches (8 and 9 refs) worked on the very
-  next attempt for both. **Always retry an unexpected "0 orders" result 1-2 times, and
-  split into smaller batches if it persists, before concluding something's actually
-  resolved.**
+- **Querying `rgmc-gcp-api`'s `/bigquery_routes/by_table/value` with
+  `table_name=CustomerPOULBQ`** — **why it failed**: that route is BigQuery-only;
+  `CustomerPOULBQ` is an MSSQL table and doesn't exist in BigQuery, so the backend's
+  BigQuery client 404'd and the route surfaced it as a 500 (`"Not found: Table
+  durable-woods-465907-n1:sbic_int.CustomerPOULBQ was not found in location
+  asia-southeast1"`). **This exact error is what triggered the "RGMC API — API
+  Watchdog" alert the user saw and asked about** — confirmed to be this session's own
+  diagnostic mistake, not a real system fault. The correct route for MSSQL tables is
+  `/sbic/by_table/value` (used successfully right after, same params, same table).
+  No fix needed/applied; explained to the user as a one-off, not a regression. (An
+  optional future hardening — validate `table_name` against an allowlist and return a
+  clean 400 instead of a raw 500 — was floated but **not implemented**, pending user
+  interest.)
+- **Trying to pull `rgmc-worker-pool` Cloud Run logs via `gcloud logging read` to
+  pin down the EXACT moment/reason the existence-check failure first occurred** —
+  **why it failed**: `gcloud logging read 'resource.type="cloud_run_revision" AND
+  resource.labels.service_name="rgmc-worker-pool"'` returned zero rows even
+  unfiltered by time, while the same query for `rgmc-gcp-api` returned recent rows
+  fine — the worker-pool service's logs aren't reachable this way (unknown why;
+  possibly a different resource type since it's Pub/Sub-triggered, or a different
+  logging sink). Abandoned in favor of reasoning from the code's own documented
+  behavior instead (the "never buffered — the check itself failed" comment was
+  sufficient to pin the root cause without logs).
+- **Testing the SO buffer via `company=MTC`** — not a failure exactly, but a dead
+  end worth noting: MTC buffer entries (76 of them) are expected-permanently-parked,
+  not bugs — `RECONCILE_COMPANIES = ["SBIC"]` means MTC has no BC company to route to
+  at all (removed 2026-10-08, confirmed in `app.py` comments). Don't chase these.
+- **Running the full past-week BigQuery scan unscoped (no company filter)** —
+  timed out at the backend's own 120s cap first try (`{"detail":"BigQuery read timed
+  out after 120s"}`); retried scoped to `company=SBIC` and it succeeded in ~15s. Same
+  known-flaky-BigQuery-view pattern documented in the prior session's handoff — retry
+  once, narrow the filter, don't assume "timed out" means something is broken.
 
 ## Next Step
 
-Resume the repair loop for the 27 remaining POs. The single most useful immediate
-action: re-run `python temp/full_repair_loop.py` (already exists, self-contained,
-reads `ALL_31` refs, loops queue→apply until nothing new) to pick up anything a
-human has since resolved on `/reconcile`, or anything the item-reference-matching fix
-(still uncommitted in `app.py`) newly unlocks once re-verified at full scale (it was
-only tested on 1 of 31 POs and one small follow-up run).
-
-Before that, two decisions need the user:
-1. **Commit `app.py`?** The item-reference matching fix is tested and working but
-   still local-only — everything else this session has already been committed/pushed
-   by the user without asking, so check whether they want this one committed too or
-   are waiting to review the diff themselves (`git diff app.py`).
-2. **Confirm the 99-PO BC cleanup status.** Ask the user directly: "Were the 99 sales
-   orders in `reports/mistaken_bc_pos_cleanup.txt` ever voided/corrected in BC?" This
-   was never re-verified after the initial fix session and could still be sitting
-   there uncorrected.
-
-For the 27 remaining POs' actual data gaps, nothing more can be automated — they need
-a human on `/reconcile`'s Overrides tab to either link the ~13 unresolved customer SKU
-codes to a BC item, or confirm the Unit of Measure for the ~55+ SKUs that already
-resolve to an item but have an unconfirmed unit. Once either is saved, re-running
-`full_repair_loop.py` (or the Missing Items tab's own Queue/Apply) picks it up
-automatically — no code changes needed for that part.
+1. **Confirm whether `rgmc-worker-pool` has actually been deployed** since the
+   `1fcc309` commit. A git commit alone does not update the live Cloud Run service —
+   check deploy status (e.g. `gcloud run services describe rgmc-worker-pool --region
+   asia-southeast1 --format="value(status.latestReadyRevisionName,
+   status.traffic)"` or ask the user directly) before assuming the fix is actually
+   live and will prevent new POs from getting stuck the same way.
+2. **Decide what to do with the other ~170-ish still-stuck SBIC POs** from
+   `temp/week_scan2.json` (everything beyond the 11 refs already retriggered this
+   session) — the same `POST /customerpoul/backfill-from-cloudsql` call, scoped to
+   the remaining refs, `create_by=bc_direct_handoff`, `companies=SBIC`, is the proven
+   remediation; just needs the user's go-ahead on scope (all at once vs. in batches)
+   given the queue-then-apply / explicit-permission-for-BC-writes convention.
+3. **Commit the UI consolidation** (`app.py`, `dashboard.js`, `handoff-history.js`) if
+   the user is satisfied with it — not yet asked/confirmed this session. Mention the
+   untested file-scoped retrigger button specifically and offer to test it live on a
+   small real file (not the 81-PO one) before they rely on it in production, or let
+   them test manually first.
+4. Separately, still pending from the PRIOR session and never revisited this one:
+   the 97 orphaned SBIC buffer entries (voided-but-not-cleared) and the ~55+ SKU
+   UOM-confirmation / ~13 SKU-linking backlog on `/reconcile` for the original 27
+   partial POs — both untouched this session, still open.
 
 ## Context & Gotchas
 
-- **The user commits and pushes without announcing it in-conversation — this is a
-  recurring pattern, not a one-off.** Every repo's `git log` this session already
-  contained my fixes under commit messages like "DI-0243 added fix on missing items",
-  "DI-0243 BC/MSSQL handoff modifications", "disabled sql sync" — none of which I
-  committed myself, and none of which were explicitly flagged by the user as "I just
-  pushed this." **Always `git status`/`git log` every touched repo before assuming
-  uncommitted work is still uncommitted**, and before assuming a described fix still
-  needs deployment.
-- **`sbic-manual-trigger-page` runs locally** at `http://127.0.0.1:8099` and proxies
-  to two deployed Cloud Run services: `rgmc-gcp-api` (`GCP_API_BASE`, BigQuery +
-  MSSQL reads) and `rgmc-bc-api` (`BC_API_BASE`, all actual Business Central writes).
-  `app.py`'s own `_bc_api`/`_gcp_api` helpers are the only way to reach BC/BigQuery
-  from this environment — there are no local BC OAuth credentials
-  (`BC_CLIENT_ID`/`BC_CLIENT_SECRET` are Cloud-Run-only env vars).
-- **MSSQL access**: `pytds.connect(server='127.0.0.1', database='sbic_prod',
-  user='sqlserver', password='@MyRunway', port=828, ...)` — explicitly granted by the
-  user this session for diagnostic/rescue work. Use `py -c "..."` (Bash), not `bq`/
-  `gcloud` (those resolve to broken Windows Store Python stub aliases in Bash — use
-  PowerShell for `gcloud`/`bq` instead).
-- **Local repo locations** (all plain directories, not symlinks, discovered
-  piecemeal this session — write them down so the next session doesn't have to
-  re-discover):
-  - `C:\claude\sbic-manual-trigger-page` (this repo)
-  - `C:\claude\rgmc-worker-pool`
-  - `C:\claude\rgmc-bc-api`
-  - `C:\claude\rgmc-it-bot` (exists locally, not used this session beyond noting its
-    `/api/notify/po-upload-trigger` handler still needs building)
-  - `C:\RGMC\Source\git\rgmc-gcp-api` — **note the different root** (`C:\RGMC\...`, not
-    `C:\claude\...`) — the user told me this mid-session; I had previously assumed no
-    local access and was about to do blind live-testing instead.
-- **Fact-Forcing Gate**: fires on first Edit/Write to each file per session. Answer
-  with (1) grep/search-confirmed callers, (2) data shape or duplicate-purpose check,
-  (3) the user's verbatim current instruction, then retry the same edit. For a new
-  file, it asks what it supersedes / where it's linked from instead. The search that
-  satisfies it must literally include the target file's path in its own search scope —
-  a prior broad grep across multiple files does NOT count for a file it didn't
-  explicitly include.
-- **Queue-then-apply convention, reused for the repair**: `/api/dashboard/
-  queue-missing-items` (reads BigQuery `int_document_ai_detail` + current BC lines,
-  queues only "ready" items into the `so_missing_item_fixes_{env}` Firestore buffer)
-  then `/api/apply-missing-item-fixes` (the one real BC write, batched 50 at a time via
-  `MISSING_ITEM_FIX_APPLY_BATCH_CAP` in `rgmc-bc-api`). Always scope `apply`'s
-  `order_ids` explicitly — calling it with no scope would also process unrelated
-  pre-existing pending fixes from other users (confirmed: 4 stale PRINCE RETAIL fixes
-  queued back on 2026-10-20 by "Mary Ann Dumaruqez" sat in the same company-wide queue
-  the whole session — never touch those).
-- **`temp/` vs `reports/`**: both gitignored. `temp/` is scratch/working files (status
-  JSONs, the repair-loop script, BigQuery query results) — use it for anything
-  throwaway. `reports/` is where the user relocates finished reference
-  lists/deliverables (e.g. the mistaken-BC-POs cleanup list moved there mid-session).
-  Check both before assuming a file from earlier in the session is gone.
-- **PRINCE RETAIL is still paused**, unrelated to everything in this handoff — 3 POs
-  (`4561798`, `4561836`, `4561912`) and several more blocked by duplicate/ambiguous
-  `CustomerBranch.lookUpCode` values, user said they'd check the fix convention with a
-  colleague and hasn't come back. Don't write or run any UPDATE for it.
+- **The user commits and deploys without announcing it in-conversation — confirmed
+  again this session.** The `rgmc-worker-pool` fix was committed under the message
+  "DI-0246 fix for missing items on garments webapp", which doesn't describe the
+  actual change at all. **Always `git status`/`git log`/`git show --stat` before
+  assuming an edit is still pending** — this is the second session in a row this
+  exact pattern has shown up (see prior handoff's own note on this).
+- **Local app runs at `http://127.0.0.1:8099`**, started this session via
+  `PORT=8099 nohup py app.py > temp/app_server2.log 2>&1 &` (PID 33168, listening,
+  confirmed at end of session). No special env vars needed — `BC_API_BASE`/
+  `GCP_API_BASE` default straight to the real deployed Cloud Run URLs
+  (`rgmc-bc-api-prod-935246372408.asia-southeast1.run.app` /
+  `rgmc-gcp-api-935246372408.asia-southeast1.run.app`), both publicly reachable
+  without auth headers — confirmed live this session, no need to hunt for local
+  credentials to test this app.
+- **The dev server is single-threaded** (`debug=False`, no `threaded=True`) — a slow
+  BigQuery request from one browser tab/action will block every other request to the
+  same local server until it resolves. If something looks "stuck" during testing,
+  check `tail temp/app_server2.log` for what's actually in flight before assuming a
+  real bug.
+- **`po_ref_number` zero-padding**: BigQuery/MSSQL stores some PO refs zero-padded
+  (e.g. `0026114282`) that look like plain integers when copied out of a spreadsheet
+  or BigQuery console (losing the leading zeros). A ref search returning "not found"
+  when the user is certain it exists is worth re-checking with/without padding before
+  concluding it's genuinely missing.
+- **`gcloud` only works reliably from PowerShell in this environment**, not Bash (Git
+  Bash resolves `gcloud`/`bq` to broken Windows Store Python stub aliases) — carried
+  over from the prior session's notes, reconfirmed when listing Cloud Scheduler jobs
+  this session.
+- **Direct MSSQL access via `pytds`/the Bash tool got blocked by the auto-mode
+  classifier this session** ("Unauthorized Access") even though the prior session's
+  handoff said the user had granted it — don't assume that grant still holds; use the
+  `rgmc-gcp-api` HTTP endpoints (`/customerpoul`, `/sbic/by_table/value`, etc.)
+  instead, which worked fine throughout this session with no permission friction.
+- **BC-write actions always got an explicit human go-ahead this session** before
+  running (the two `backfill-from-cloudsql` triggers) — the auto-mode classifier
+  itself blocked the first attempt with "Destructive or Unwanted Actions" until the
+  user typed an explicit "go ahead." Keep doing this for any further retrigger batches
+  — don't assume a prior "go ahead" covers a new, differently-scoped batch.
+- **`curl -X POST -G` together silently drops the request body/Content-Length**,
+  causing a `411 Length Required` from the Cloud Run front end — observed directly
+  this session. Use `-d ''` (explicit empty body) with a fully-built query-string URL
+  for a POST-with-query-params-only call instead of combining `-X POST` with `-G`.

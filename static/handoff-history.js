@@ -74,25 +74,25 @@
     return "pending";
   }
 
-  // Only offered for "not_promoted" — the row is confirmed stuck in CustomerPOULBQ/
-  // CustomerPOULDetailBQ with no matching CustomerPOUL row, so a clean-up-then-
-  // re-insert can actually help. Any other trigger_status either doesn't need it
-  // (promoted) or wouldn't be fixed by it (unknown — e.g. the MSSQL insert itself
-  // already failed, so there's nothing stale in the staging tables to clean up).
+  // Single retrigger action (/api/handoff-history/retrigger) — the backend decides
+  // whether this PO only needs a BC-only check/create (already in CustomerPOUL) or
+  // the full BigQuery-refetch + MSSQL re-insert (not yet in CustomerPOUL), instead of
+  // showing two separate "Retrigger (clean up & re-insert)" / "Retrigger BC only"
+  // buttons and making the person pick.
   function renderRetriggerAction(container, poRef) {
     container.classList.remove("hidden");
     container.innerHTML = `
-      <button class="btn-reset handoff-history-retrigger-btn" type="button">Retrigger (clean up &amp; re-insert)</button>
+      <button class="btn-reset handoff-history-retrigger-btn" type="button">Retrigger</button>
       <span class="handoff-history-retrigger-result"></span>
     `;
     const btn = container.querySelector(".handoff-history-retrigger-btn");
     const resultEl = container.querySelector(".handoff-history-retrigger-result");
     btn.addEventListener("click", async () => {
       btn.disabled = true;
-      resultEl.textContent = "Cleaning up and re-inserting…";
+      resultEl.textContent = "Retriggering…";
       resultEl.className = "handoff-history-retrigger-result";
       try {
-        const res = await fetch("/api/handoff-history/retrigger-mssql", {
+        const res = await fetch("/api/handoff-history/retrigger", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ po_ref_number: poRef }),
@@ -103,60 +103,22 @@
         // into a real non-200) — but a successful insert whose trigger never promoted
         // the row still comes back 200, so that case needs its own, non-"ok" message
         // instead of reading as a full success.
-        if (!res.ok) throw new Error(data.error || data.detail || data.message || "Retrigger failed");
-        if (data.trigger_status === "not_promoted") {
+        if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || data.message || "Retrigger failed");
+        if (data.path === "bc_only") {
+          const icon = data.status === "pending" ? "⏳ " : "✓ ";
+          resultEl.textContent = icon + (data.detail || "Business Central checked/updated.") + " — refreshing…";
+          resultEl.className = "handoff-history-retrigger-result " + (data.status === "pending" ? "warn" : "ok");
+        } else if (data.trigger_status === "not_promoted") {
           resultEl.textContent = "⚠ Inserted, but still not promoted by the MSSQL trigger — retry later.";
           resultEl.className = "handoff-history-retrigger-result warn";
-        } else if (data.trigger_status === "promoted") {
-          resultEl.textContent = "✓ Inserted and promoted — refreshing…";
-          resultEl.className = "handoff-history-retrigger-result ok";
         } else {
-          resultEl.textContent = "✓ Re-inserted (promotion status unknown) — refreshing…";
+          resultEl.textContent = "✓ Re-inserted and sent to Business Central — refreshing…";
           resultEl.className = "handoff-history-retrigger-result ok";
         }
         load();
       } catch (e) {
         resultEl.textContent = "Error: " + e.message;
         resultEl.className = "handoff-history-retrigger-result warn";
-        btn.disabled = false;
-      }
-    });
-  }
-
-  // Offered whenever BC isn't confirmed created yet (buffered/error/unknown) — unlike
-  // renderRetriggerAction above, this never touches BigQuery or MSSQL: it re-checks/
-  // backfills Business Central using whatever CustomerPOUL/CustomerPOULDetail already
-  // has, so it's useful even when MSSQL itself is already fine and only BC is missing
-  // the order or short some lines.
-  function renderBcOnlyRetriggerAction(container, poRef) {
-    container.classList.remove("hidden");
-    container.classList.add("handoff-history-retrigger-action"); // reuse existing layout/spacing
-    container.innerHTML = `
-      <button class="btn-reset handoff-history-retrigger-bc-btn" type="button">Retrigger BC only</button>
-      <span class="handoff-history-retrigger-result handoff-history-retrigger-bc-result"></span>
-    `;
-    const btn = container.querySelector(".handoff-history-retrigger-bc-btn");
-    const resultEl = container.querySelector(".handoff-history-retrigger-bc-result");
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      resultEl.textContent = "Checking Business Central…";
-      resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result";
-      try {
-        const res = await fetch("/api/handoff-history/retrigger-bc-only", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ po_ref_number: poRef }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || "BC retrigger failed");
-        const icon = data.status === "pending" ? "⏳ " : "✓ ";
-        resultEl.textContent = icon + (data.detail || "Business Central checked/updated.") + " — refreshing…";
-        resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result " +
-          (data.status === "pending" ? "warn" : "ok");
-        load();
-      } catch (e) {
-        resultEl.textContent = "Error: " + e.message;
-        resultEl.className = "handoff-history-retrigger-result handoff-history-retrigger-bc-result warn";
         btn.disabled = false;
       }
     });
@@ -180,19 +142,15 @@
       ${rec.mssql_error ? `<div class="order-error">MSSQL: ${escapeHtml(rec.mssql_error)}</div>` : ""}
       ${rec.bc_error ? `<div class="order-error">BC: ${escapeHtml(rec.bc_error)}</div>` : ""}
       <div class="handoff-history-retrigger-action hidden"></div>
-      <div class="handoff-history-retrigger-bc-action hidden"></div>
     `;
     // customerpoul only — the retrigger endpoint re-fetches from BigQuery's
     // int_document_ai/int_document_ai_detail, which is customerpoul's own source
-    // table, not onlinesalespo's (int_online_sales_data) or customerra's.
-    const needsRetrigger = rec.mssql_status === "error" || rec.trigger_status === "not_promoted";
+    // table, not onlinesalespo's (int_online_sales_data) or customerra's. Offered
+    // whenever either side isn't confirmed good yet — the backend itself decides
+    // whether that means a BC-only check/create or the full MSSQL re-insert.
+    const needsRetrigger = rec.mssql_status === "error" || rec.trigger_status === "not_promoted" || rec.bc_status !== "created";
     if (rec.group_code === "customerpoul" && needsRetrigger && rec.po_ref_number) {
       renderRetriggerAction(row.querySelector(".handoff-history-retrigger-action"), rec.po_ref_number);
-    }
-    // BC-only is independent of MSSQL status — offered whenever BC isn't confirmed
-    // created yet, including the common case where MSSQL is already fine.
-    if (rec.group_code === "customerpoul" && rec.bc_status !== "created" && rec.po_ref_number) {
-      renderBcOnlyRetriggerAction(row.querySelector(".handoff-history-retrigger-bc-action"), rec.po_ref_number);
     }
     return row;
   }

@@ -2625,6 +2625,7 @@ def _customerpoul_row_to_search_header(row: dict) -> dict:
         "cancellation_date": row.get("cancellationDate"),
         "remark": row.get("remark"),
         "created_at": row.get("createDate"),
+        "create_by": row.get("createBy"),
     }
 
 
@@ -3975,54 +3976,54 @@ def _poll_reprocess_run(run_id: str, timeout_s: float = 20, interval_s: float = 
         time.sleep(interval_s)
 
 
-@app.route("/api/handoff-history/retrigger-bc-only", methods=["POST"])
-def api_handoff_history_retrigger_bc_only():
-    """Business-Central-only retrigger for one PO — unlike every other retrigger action
-    here, this never touches BigQuery or re-inserts into MSSQL. It reads the PO exactly
+def _retrigger_bc_only_core(po_ref: str) -> tuple[dict, int]:
+    """Business-Central-only retrigger for one PO — unlike the MSSQL-side retrigger,
+    this never touches BigQuery or re-inserts into MSSQL. It reads the PO exactly
     as it already sits in CustomerPOUL/CustomerPOULDetail (_fetch_from_customerpoul)
     and runs the same check-exists/backfill-missing-lines-or-create-fresh logic
     _trigger_bc_followup fires elsewhere, but blocking on the result (via
-    _poll_reprocess_run) instead of fire-and-forget, so the UI gets one real outcome
-    instead of pretending it's instant.
+    _poll_reprocess_run) instead of fire-and-forget, so the caller gets one real
+    outcome instead of pretending it's instant.
 
     Useful when MSSQL already has good data for a PO but BC doesn't yet (a missing
     order, or one still short some lines) — sidesteps the slow BigQuery dbt-view read
-    entirely for that common case.
+    entirely for that common case. Returns (response_body, status_code).
     """
-    data = request.get_json(silent=True) or {}
-    po_ref = (data.get("po_ref_number") or "").strip()
-    if not po_ref:
-        return jsonify({"error": "po_ref_number is required"}), 400
-
     header, _lines = _fetch_from_customerpoul(po_ref)
     if not header:
-        return jsonify({"error": f"PO {po_ref!r} not found in MSSQL (CustomerPOUL) — nothing to hand off to BC."}), 404
+        return {"error": f"PO {po_ref!r} not found in MSSQL (CustomerPOUL) — nothing to hand off to BC."}, 404
 
     company = _resolve_bc_company(header.get("company_name"), header.get("company_id"))
     if not company:
-        return jsonify({
+        return {
             "error": f"Could not resolve a BC company from companyName={header.get('company_name')!r} "
                      f"companyId={header.get('company_id')!r} — not sent to BC.",
-        }), 400
+        }, 400
 
+    # rgmc-worker-pool's fetch_customerpoul_by_create_by filters CustomerPOUL by
+    # create_by FIRST, then narrows by po_ref_numbers — so passing the literal
+    # "trigger-bc-only" (which is never actually stamped on any row; it's only ever
+    # used as a Teams-notification gate on the worker-pool side) matched zero rows for
+    # every real PO, silently no-opping while still reporting "done". Using this PO's
+    # own stored createBy makes the row lookup actually match, at the cost of the
+    # "Retrigger BC only" Teams notification (gated on the literal "trigger-bc-only"
+    # value) no longer firing for this path — confirmed live 2026-11-23 on 4 POs stuck
+    # with BC headers but zero lines.
+    effective_create_by = header.get("create_by") or "trigger-bc-only"
     run_ids = []
     for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
         try:
-            # create_by="trigger-bc-only" (distinct from _trigger_bc_followup's plain
-            # "trigger") is what rgmc-worker-pool's dispatcher gates its new BC-only-only
-            # Teams notification on — see so_import_worker.py's poul-so-sync-from-cloudsql
-            # / poul-so-backfill-from-cloudsql handlers.
             resp = _gcp_api("POST", path, params={
-                "companies": company, "create_by": "trigger-bc-only", "po_ref_numbers": po_ref,
+                "companies": company, "create_by": effective_create_by, "po_ref_numbers": po_ref,
             }, timeout=15)
             body, status_code = _proxy_json(resp)
             if status_code == 200 and body.get("run_id"):
                 run_ids.append(body["run_id"])
         except requests.RequestException as exc:
-            return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+            return {"error": f"Could not reach rgmc-gcp-api: {exc}"}, 502
 
     if not run_ids:
-        return jsonify({"error": "Could not start the BC retrigger — no run_id returned."}), 502
+        return {"error": "Could not start the BC retrigger — no run_id returned."}, 502
 
     # Polled concurrently, not sequentially — each poll can take up to its own
     # timeout_s, and sequential polling would double the worst-case wait for no reason
@@ -4032,24 +4033,34 @@ def api_handoff_history_retrigger_bc_only():
 
     if any(r.get("status") == "error" for r in results):
         detail = "; ".join(r.get("error") or str(r.get("summary") or "") for r in results if r.get("status") == "error")
-        return jsonify({"status": "error", "detail": detail or "BC retrigger failed.", "runs": results})
+        return {"status": "error", "detail": detail or "BC retrigger failed.", "runs": results}, 200
     if all(r.get("status") == "done" for r in results):
-        return jsonify({"status": "done", "detail": "Business Central checked/updated for this PO.", "runs": results})
+        return {"status": "done", "detail": "Business Central checked/updated for this PO.", "runs": results}, 200
     if any(r.get("status") in (None, "unknown") for r in results):
         # The status endpoint never returned a usable response for at least one run —
         # a genuine failure (bad run_id, rgmc-bc-api unreachable), not legitimately
         # still processing. Reporting this as "pending" would tell the user to wait for
         # a retrigger that will never complete.
-        return jsonify({
+        return {
             "status": "error",
             "detail": "Could not confirm the BC retrigger's outcome — check Handoff History or try again.",
             "runs": results,
-        })
-    return jsonify({
+        }, 200
+    return {
         "status": "pending",
         "detail": "Still processing in the background — check Handoff History shortly.",
         "runs": results,
-    })
+    }, 200
+
+
+@app.route("/api/handoff-history/retrigger-bc-only", methods=["POST"])
+def api_handoff_history_retrigger_bc_only():
+    data = request.get_json(silent=True) or {}
+    po_ref = (data.get("po_ref_number") or "").strip()
+    if not po_ref:
+        return jsonify({"error": "po_ref_number is required"}), 400
+    body, status_code = _retrigger_bc_only_core(po_ref)
+    return jsonify(body), status_code
 
 
 def _resolve_po_refs_for_file(file_name: str) -> list[str]:
@@ -4067,6 +4078,72 @@ def _resolve_po_refs_for_file(file_name: str) -> list[str]:
     if status_code != 200:
         return []
     return sorted({r.get("poRefNumber") for r in (body.get("data") or []) if r.get("poRefNumber")})
+
+
+def _resolve_file_refs_by_mssql_presence(file_name: str) -> tuple[dict, list, list] | None:
+    """Every po_ref under file_name, split into present_refs_by_company (already in
+    CustomerPOUL, grouped by resolved BC company), missing (not yet promoted/deleted),
+    and company_unresolved. None if the file has no POs in CustomerPOULBQ at all."""
+    po_refs = _resolve_po_refs_for_file(file_name)
+    if not po_refs:
+        return None
+    with ThreadPoolExecutor(max_workers=min(20, len(po_refs))) as ex:
+        headers = list(ex.map(lambda ref: _fetch_from_customerpoul(ref)[0], po_refs))
+    present_refs_by_company: dict[str, list[str]] = {}
+    missing: list[str] = []
+    company_unresolved: list[str] = []
+    for po_ref, header in zip(po_refs, headers):
+        if not header:
+            missing.append(po_ref)
+            continue
+        company = _resolve_bc_company(header.get("company_name"), header.get("company_id"))
+        if not company:
+            company_unresolved.append(po_ref)
+            continue
+        present_refs_by_company.setdefault(company, []).append(po_ref)
+    return present_refs_by_company, missing, company_unresolved
+
+
+def _run_bc_only_for_refs_by_company(present_refs_by_company: dict) -> tuple[dict, int]:
+    """BC-only check/create for every ref in present_refs_by_company (grouped by
+    resolved BC company), one sync + one backfill call per company, polled to
+    completion. Returns (response_body, status_code); response_body always carries
+    "present" (the refs actually attempted)."""
+    present = [ref for refs in present_refs_by_company.values() for ref in refs]
+    if not present_refs_by_company:
+        return {"status": "error", "detail": "No POs under this file could be sent to BC.", "present": present, "runs": []}, 200
+
+    run_ids = []
+    for company, refs in present_refs_by_company.items():
+        refs_param = ",".join(refs)
+        for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
+            try:
+                resp = _gcp_api("POST", path, params={
+                    "companies": company, "create_by": "trigger-bc-only", "po_ref_numbers": refs_param,
+                }, timeout=15)
+                body, status_code = _proxy_json(resp)
+                if status_code == 200 and body.get("run_id"):
+                    run_ids.append(body["run_id"])
+            except requests.RequestException as exc:
+                return {"error": f"Could not reach rgmc-gcp-api: {exc}"}, 502
+
+    if not run_ids:
+        return {"error": "Could not start the BC retrigger — no run_id returned."}, 502
+
+    with ThreadPoolExecutor(max_workers=len(run_ids)) as ex:
+        results = list(ex.map(_poll_reprocess_run, run_ids))
+
+    if any(r.get("status") == "error" for r in results):
+        detail = "; ".join(r.get("error") or str(r.get("summary") or "") for r in results if r.get("status") == "error")
+        status, detail = "error", (detail or "BC retrigger failed.")
+    elif all(r.get("status") == "done" for r in results):
+        status, detail = "done", "Business Central checked/updated for these POs."
+    elif any(r.get("status") in (None, "unknown") for r in results):
+        status, detail = "error", "Could not confirm the BC retrigger's outcome — check Handoff History or try again."
+    else:
+        status, detail = "pending", "Still processing in the background — check Handoff History shortly."
+
+    return {"status": status, "detail": detail, "present": present, "runs": results}, 200
 
 
 @app.route("/api/handoff-history/retrigger-bc-only-file", methods=["POST"])
@@ -4089,69 +4166,61 @@ def api_handoff_history_retrigger_bc_only_file():
     if not file_name:
         return jsonify({"error": "file_name is required"}), 400
 
-    po_refs = _resolve_po_refs_for_file(file_name)
-    if not po_refs:
+    split = _resolve_file_refs_by_mssql_presence(file_name)
+    if split is None:
         return jsonify({"error": f"No POs found in MSSQL (CustomerPOULBQ) for file {file_name!r}."}), 404
+    present_refs_by_company, missing, company_unresolved = split
 
-    with ThreadPoolExecutor(max_workers=min(20, len(po_refs))) as ex:
-        headers = list(ex.map(lambda ref: _fetch_from_customerpoul(ref)[0], po_refs))
+    body, status_code = _run_bc_only_for_refs_by_company(present_refs_by_company)
+    if isinstance(body, dict):
+        body["missing"] = missing
+        body["company_unresolved"] = company_unresolved
+    return jsonify(body), status_code
 
-    present_refs_by_company: dict[str, list[str]] = {}
-    missing: list[str] = []
-    company_unresolved: list[str] = []
-    for po_ref, header in zip(po_refs, headers):
-        if not header:
-            missing.append(po_ref)
-            continue
-        company = _resolve_bc_company(header.get("company_name"), header.get("company_id"))
-        if not company:
-            company_unresolved.append(po_ref)
-            continue
-        present_refs_by_company.setdefault(company, []).append(po_ref)
 
-    if not present_refs_by_company:
-        return jsonify({
-            "status": "error",
-            "detail": "No POs under this file could be sent to BC.",
-            "present": [], "missing": missing, "company_unresolved": company_unresolved,
-            "runs": [],
-        })
+@app.route("/api/handoff-history/retrigger-file", methods=["POST"])
+def api_handoff_history_retrigger_file():
+    """Single file-scoped retrigger action — splits this file's PO refs by whether
+    each already has a row in CustomerPOUL and lets that decide the path per ref,
+    instead of a person choosing between "Retrigger Handoff (cleanup & re-insert
+    all)" and "Retrigger BC only": refs already in CustomerPOUL get the fast,
+    synchronous BC-only check/create (_run_bc_only_for_refs_by_company, same as
+    retrigger-bc-only-file); refs still missing get the full async cleanup+reinsert
+    (POST /customerpoul/retrigger-file), scoped to just those refs via
+    po_ref_numbers so already-good POs in the same file aren't redundantly re-fetched
+    from BigQuery. The missing-side result is a run_id only — the caller polls
+    GET /api/reprocess-status/<run_id> for it, same as the old whole-file retrigger.
+    """
+    data = request.get_json(silent=True) or {}
+    file_name = (data.get("file_name") or "").strip()
+    if not file_name:
+        return jsonify({"error": "file_name is required"}), 400
 
-    run_ids = []
-    for company, refs in present_refs_by_company.items():
-        refs_param = ",".join(refs)
-        for path in ("/customerpoul/sync-inserted-orders", "/customerpoul/backfill-from-cloudsql"):
-            try:
-                resp = _gcp_api("POST", path, params={
-                    "companies": company, "create_by": "trigger-bc-only", "po_ref_numbers": refs_param,
-                }, timeout=15)
-                body, status_code = _proxy_json(resp)
-                if status_code == 200 and body.get("run_id"):
-                    run_ids.append(body["run_id"])
-            except requests.RequestException as exc:
-                return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+    split = _resolve_file_refs_by_mssql_presence(file_name)
+    if split is None:
+        return jsonify({"error": f"No POs found in MSSQL (CustomerPOULBQ) for file {file_name!r}."}), 404
+    present_refs_by_company, missing, company_unresolved = split
 
-    if not run_ids:
-        return jsonify({"error": "Could not start the BC retrigger — no run_id returned."}), 502
+    bc_only_result = None
+    if present_refs_by_company:
+        bc_only_result, _bc_status_code = _run_bc_only_for_refs_by_company(present_refs_by_company)
 
-    with ThreadPoolExecutor(max_workers=len(run_ids)) as ex:
-        results = list(ex.map(_poll_reprocess_run, run_ids))
-
-    present = [ref for refs in present_refs_by_company.values() for ref in refs]
-    if any(r.get("status") == "error" for r in results):
-        detail = "; ".join(r.get("error") or str(r.get("summary") or "") for r in results if r.get("status") == "error")
-        status, detail = "error", (detail or "BC retrigger failed.")
-    elif all(r.get("status") == "done" for r in results):
-        status, detail = "done", "Business Central checked/updated for these POs."
-    elif any(r.get("status") in (None, "unknown") for r in results):
-        status, detail = "error", "Could not confirm the BC retrigger's outcome — check Handoff History or try again."
-    else:
-        status, detail = "pending", "Still processing in the background — check Handoff History shortly."
+    full_retrigger_run_id = None
+    if missing:
+        try:
+            resp = _gcp_api("POST", "/customerpoul/retrigger-file",
+                             params={"po_ref_numbers": ",".join(missing)}, timeout=15)
+            body, status_code = _proxy_json(resp)
+            if status_code == 200:
+                full_retrigger_run_id = body.get("run_id")
+        except requests.RequestException as exc:
+            return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
 
     return jsonify({
-        "status": status, "detail": detail,
-        "present": present, "missing": missing, "company_unresolved": company_unresolved,
-        "runs": results,
+        "bc_only_result": bc_only_result,
+        "missing": missing,
+        "company_unresolved": company_unresolved,
+        "full_retrigger_run_id": full_retrigger_run_id,
     })
 
 
@@ -4186,8 +4255,7 @@ def _cleanup_and_reinsert_po(po_ref: str, header: dict, details: list, file_name
     return body, status_code
 
 
-@app.route("/api/handoff-history/retrigger-mssql", methods=["POST"])
-def api_handoff_history_retrigger_mssql():
+def _retrigger_mssql_core(po_ref: str) -> tuple[dict, int]:
     """Full MSSQL-handoff retry for one PO, by po_ref_number alone — shared by both the
     Handoff History tab's own Retrigger button (a "not_promoted" record) and the
     Search tab's Check MSSQL result (either "not found in staging at all", or "in
@@ -4207,30 +4275,67 @@ def api_handoff_history_retrigger_mssql():
       3. Re-inserts fresh via the same insert-from-bigquery call + trigger-verification
          + history logging every other MSSQL handoff here uses (_insert_mssql_and_log),
          giving the trigger a brand-new INSERT to actually react to.
-    """
-    data = request.get_json(silent=True) or {}
-    po_ref = (data.get("po_ref_number") or "").strip()
-    if not po_ref:
-        return jsonify({"error": "po_ref_number is required"}), 400
 
+    On a successful insert, also fires the BC follow-up (fire-and-forget) so a fresh
+    MSSQL row doesn't just sit there until someone separately checks BC.
+    Returns (response_body, status_code).
+    """
     try:
         search_resp = _gcp_api("GET", "/bigquery_routes/document-ai/search",
                                 params={"po_ref_number": po_ref}, timeout=BQ_PROXY_TIMEOUT)
         search_body, search_status = _proxy_json(search_resp)
     except requests.RequestException as exc:
-        return jsonify({"error": f"Could not reach rgmc-gcp-api: {exc}"}), 502
+        return {"error": f"Could not reach rgmc-gcp-api: {exc}"}, 502
     if search_status != 200:
-        return jsonify(search_body), search_status
+        return search_body, search_status
     headers = search_body.get("data") or []
     details = search_body.get("detail_data") or []
     if not headers:
-        return jsonify({"error": f"No BigQuery int_document_ai row found for po_ref_number={po_ref!r} — nothing to re-insert."}), 404
+        return {"error": f"No BigQuery int_document_ai row found for po_ref_number={po_ref!r} — nothing to re-insert."}, 404
     header = _merge_duplicate_headers(headers, details)[0]
     file_name = header.get("file_name")
 
     body, status_code = _cleanup_and_reinsert_po(po_ref, header, details, file_name)
     if isinstance(body, dict) and body.get("mssql_status") == "inserted":
         _trigger_bc_followup(header.get("company_name"), [po_ref])
+    return body, status_code
+
+
+@app.route("/api/handoff-history/retrigger-mssql", methods=["POST"])
+def api_handoff_history_retrigger_mssql():
+    data = request.get_json(silent=True) or {}
+    po_ref = (data.get("po_ref_number") or "").strip()
+    if not po_ref:
+        return jsonify({"error": "po_ref_number is required"}), 400
+    body, status_code = _retrigger_mssql_core(po_ref)
+    return jsonify(body), status_code
+
+
+@app.route("/api/handoff-history/retrigger", methods=["POST"])
+def api_handoff_history_retrigger():
+    """Single retrigger action for one PO — decides BC-only vs the full MSSQL+BC path
+    itself (by checking whether CustomerPOUL already has this PO) instead of making
+    the person using this tool choose between "Retrigger MSSQL" and "Retrigger BC
+    only": a PO already in CustomerPOUL only needs the fast BC-only check/create
+    (_retrigger_bc_only_core); one that isn't needs the full BigQuery refetch + MSSQL
+    re-insert first (_retrigger_mssql_core, which already fires the BC follow-up once
+    that succeeds). Response always carries "path" ("bc_only" or "mssql_full") so the
+    UI can word its message correctly either way.
+    """
+    data = request.get_json(silent=True) or {}
+    po_ref = (data.get("po_ref_number") or "").strip()
+    if not po_ref:
+        return jsonify({"error": "po_ref_number is required"}), 400
+
+    header, _lines = _fetch_from_customerpoul(po_ref)
+    if header:
+        body, status_code = _retrigger_bc_only_core(po_ref)
+        path = "bc_only"
+    else:
+        body, status_code = _retrigger_mssql_core(po_ref)
+        path = "mssql_full"
+    if isinstance(body, dict):
+        body["path"] = path
     return jsonify(body), status_code
 
 

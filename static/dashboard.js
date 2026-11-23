@@ -58,6 +58,32 @@
     throw new Error("Still running after 20 minutes — check the Handoff History tab later for results.");
   }
 
+  // Renders the "already in MSSQL" side of /api/handoff-history/retrigger-file's
+  // response (bc_only_result + missing + company_unresolved) — shared by the file
+  // row's single Retrigger button whether or not it also had a missing-refs
+  // async retrigger to report alongside.
+  function renderBcOnlyFileResult(data) {
+    const bc = data.bc_only_result;
+    let html = "";
+    if (bc) {
+      const icon = bc.status === "pending" ? "⏳ " : bc.status === "error" ? "✗ " : "✓ ";
+      html += `<div class="search-hint">${icon}${escapeHtml(bc.detail || bc.status)}</div>`;
+      if ((bc.present || []).length) {
+        html += `<div class="order-row history-row">
+          <div class="order-row-head"><span class="order-badge ready">checked against BC</span></div>
+          <div class="order-detail">${escapeHtml(bc.present.join(", "))}</div>
+        </div>`;
+      }
+    }
+    if ((data.company_unresolved || []).length) {
+      html += `<div class="order-row history-row">
+        <div class="order-row-head"><span class="order-badge failed">company not BC-routable</span></div>
+        <div class="order-detail">${escapeHtml(data.company_unresolved.join(", "))}</div>
+      </div>`;
+    }
+    return html;
+  }
+
   function setStatus(msg, isError) {
     statusLine.textContent = msg || "";
     statusLine.classList.toggle("error", !!isError);
@@ -194,24 +220,20 @@
         <div class="dash-file-actions">
           <button class="btn-link-toggle dash-view-file-btn" type="button">View file</button>
           ${uploadType === "po" ? `<button class="btn-reprocess dash-queue-file-btn" type="button">Queue Missing Items</button>` : ""}
-          ${uploadType === "po" ? `<button class="btn-reset dash-retrigger-file-btn" type="button">Retrigger Handoff (cleanup &amp; re-insert all)</button>` : ""}
-          ${uploadType === "po" ? `<button class="btn-reset dash-retrigger-bc-file-btn" type="button">Retrigger BC only</button>` : ""}
+          ${uploadType === "po" ? `<button class="btn-reset dash-retrigger-file-btn" type="button">Retrigger</button>` : ""}
           <button class="btn-history-toggle dash-expand-btn" type="button">Expand ▾</button>
         </div>
       </div>
       <div class="dash-refs-list hidden"></div>
       <div class="handoff-history-list dash-retrigger-results hidden"></div>
-      <div class="handoff-history-list dash-retrigger-bc-results hidden"></div>
     `;
 
     const viewFileBtn = row.querySelector(".dash-view-file-btn");
     const queueFileBtn = row.querySelector(".dash-queue-file-btn");
     const retriggerFileBtn = row.querySelector(".dash-retrigger-file-btn");
-    const retriggerBcFileBtn = row.querySelector(".dash-retrigger-bc-file-btn");
     const expandBtn = row.querySelector(".dash-expand-btn");
     const refsListEl = row.querySelector(".dash-refs-list");
     const retriggerResultsEl = row.querySelector(".dash-retrigger-results");
-    const retriggerBcResultsEl = row.querySelector(".dash-retrigger-bc-results");
 
     viewFileBtn.addEventListener("click", async () => {
       viewFileBtn.disabled = true;
@@ -303,99 +325,58 @@
         const orig = retriggerFileBtn.textContent;
         retriggerFileBtn.textContent = "Retriggering…";
         retriggerResultsEl.classList.remove("hidden");
-        retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Starting retrigger for every PO in this file…</div>`;
+        retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Resolving POs for this file and checking Business Central…</div>`;
         try {
-          // Runs in rgmc-worker-pool, not this app's own request — a large file's
-          // BigQuery lookups can take several minutes (confirmed live, 2026-10-29).
-          // Start the job, then poll for its result instead of waiting on one HTTP call.
-          const startRes = await fetch("/api/handoff-history/retrigger-file-async", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ file_name: file.file_name }),
-          });
-          const startData = await startRes.json();
-          if (!startRes.ok) throw new Error(startData.error || startData.detail || "Could not start retrigger");
-
-          const finalData = await pollRunStatus(startData.run_id, (d) => {
-            retriggerResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> ${
-              d.status === "queued" ? "Queued — waiting for the worker pool…" : "Cleaning up and re-inserting in the background…"
-            }</div>`;
-          });
-          if (finalData.status === "error") throw new Error(finalData.error || "Retrigger failed");
-
-          const summary = finalData.summary || {};
-          const results = summary.results || [];
-          const summaryMsg = `Retriggered ${summary.total ?? results.length} PO(s) — ${summary.ok_count ?? 0} succeeded, ${summary.error_count ?? 0} failed.`;
-          // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger
-          // never promoted it) / "error" (the insert itself failed) — three distinct
-          // outcomes, not just a pass/fail pair, so each gets its own badge color.
-          retriggerResultsEl.innerHTML = `<div class="search-hint">${escapeHtml(summaryMsg)}</div>` + results.map((r) => {
-            const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
-            const label = r.status === "not_promoted" ? "not promoted" : r.status;
-            return `
-            <div class="order-row history-row">
-              <div class="order-row-head">
-                <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
-                <span class="order-badge ${badgeClass}">${escapeHtml(label)}</span>
-              </div>
-              <div class="order-detail">${escapeHtml(r.detail || "")}</div>
-            </div>
-          `;
-          }).join("");
-        } catch (e) {
-          retriggerResultsEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
-        } finally {
-          retriggerFileBtn.disabled = false;
-          retriggerFileBtn.textContent = orig;
-        }
-      });
-    }
-
-    if (retriggerBcFileBtn) {
-      retriggerBcFileBtn.addEventListener("click", async () => {
-        retriggerBcFileBtn.disabled = true;
-        const orig = retriggerBcFileBtn.textContent;
-        retriggerBcFileBtn.textContent = "Checking BC…";
-        retriggerBcResultsEl.classList.remove("hidden");
-        retriggerBcResultsEl.innerHTML = `<div class="search-hint search-loading"><span class="btn-spinner"></span> Resolving POs for this file and checking Business Central…</div>`;
-        try {
-          // Unlike the full retrigger above, this never touches BigQuery (MSSQL +
-          // BC only), so the server blocks on the result instead of a second
-          // poll-based flow — see /api/handoff-history/retrigger-bc-only-file.
-          const res = await fetch("/api/handoff-history/retrigger-bc-only-file", {
+          // Single call — the backend splits this file's refs into "already in
+          // MSSQL" (checked/created in BC synchronously, result comes back inline
+          // as bc_only_result) vs "not yet in MSSQL" (kicked off as an async
+          // cleanup+reinsert in rgmc-worker-pool, scoped to just those refs, and
+          // returned as full_retrigger_run_id to poll — large files' BigQuery
+          // lookups can take several minutes, confirmed live 2026-10-29).
+          const res = await fetch("/api/handoff-history/retrigger-file", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ file_name: file.file_name }),
           });
           const data = await res.json();
-          if (!res.ok) throw new Error(data.error || data.detail || "Could not start BC retrigger");
+          if (!res.ok) throw new Error(data.error || data.detail || "Could not start retrigger");
 
-          const icon = data.status === "pending" ? "⏳ " : data.status === "error" ? "✗ " : "✓ ";
-          let html = `<div class="search-hint">${icon}${escapeHtml(data.detail || data.status)}</div>`;
-          if ((data.present || []).length) {
-            html += `<div class="order-row history-row">
-              <div class="order-row-head"><span class="order-badge ready">checked against BC</span></div>
-              <div class="order-detail">${escapeHtml(data.present.join(", "))}</div>
-            </div>`;
+          let html = renderBcOnlyFileResult(data);
+
+          if (data.full_retrigger_run_id) {
+            retriggerResultsEl.innerHTML = html + `<div class="search-hint search-loading"><span class="btn-spinner"></span> Cleaning up and re-inserting the rest in the background…</div>`;
+            const finalData = await pollRunStatus(data.full_retrigger_run_id, (d) => {
+              retriggerResultsEl.innerHTML = html + `<div class="search-hint search-loading"><span class="btn-spinner"></span> ${
+                d.status === "queued" ? "Queued — waiting for the worker pool…" : "Cleaning up and re-inserting in the background…"
+              }</div>`;
+            });
+            if (finalData.status === "error") throw new Error(finalData.error || "Retrigger failed");
+            const summary = finalData.summary || {};
+            const results = summary.results || [];
+            const summaryMsg = `Retriggered ${summary.total ?? results.length} PO(s) not yet in MSSQL — ${summary.ok_count ?? 0} succeeded, ${summary.error_count ?? 0} failed.`;
+            // r.status is "success" / "not_promoted" (inserted, but the MSSQL trigger
+            // never promoted it) / "error" (the insert itself failed) — three distinct
+            // outcomes, not just a pass/fail pair, so each gets its own badge color.
+            html += `<div class="search-hint">${escapeHtml(summaryMsg)}</div>` + results.map((r) => {
+              const badgeClass = r.status === "success" ? "ready" : r.status === "not_promoted" ? "pending" : "failed";
+              const label = r.status === "not_promoted" ? "not promoted" : r.status;
+              return `
+              <div class="order-row history-row">
+                <div class="order-row-head">
+                  <span class="order-ref">${escapeHtml(r.po_ref || "—")}</span>
+                  <span class="order-badge ${badgeClass}">${escapeHtml(label)}</span>
+                </div>
+                <div class="order-detail">${escapeHtml(r.detail || "")}</div>
+              </div>
+            `;
+            }).join("");
           }
-          if ((data.missing || []).length) {
-            html += `<div class="order-row history-row">
-              <div class="order-row-head"><span class="order-badge pending">not in MSSQL (CustomerPOUL)</span></div>
-              <div class="order-detail">${escapeHtml(data.missing.join(", "))}</div>
-            </div>`;
-          }
-          if ((data.company_unresolved || []).length) {
-            html += `<div class="order-row history-row">
-              <div class="order-row-head"><span class="order-badge failed">company not BC-routable</span></div>
-              <div class="order-detail">${escapeHtml(data.company_unresolved.join(", "))}</div>
-            </div>`;
-          }
-          retriggerBcResultsEl.innerHTML = html;
+          retriggerResultsEl.innerHTML = html;
         } catch (e) {
-          retriggerBcResultsEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
+          retriggerResultsEl.innerHTML = `<div class="search-hint">Error: ${escapeHtml(e.message)}</div>`;
         } finally {
-          retriggerBcFileBtn.disabled = false;
-          retriggerBcFileBtn.textContent = orig;
+          retriggerFileBtn.disabled = false;
+          retriggerFileBtn.textContent = orig;
         }
       });
     }
@@ -708,69 +689,44 @@
     });
   }
 
-  // Same endpoint the Handoff History tab's own retrigger button uses
-  // (/api/handoff-history/retrigger-mssql) — re-fetches this PO's current header/
-  // detail straight from BigQuery by po_ref_number, deletes any stale CustomerPOULBQ/
-  // CustomerPOULDetailBQ rows first, then re-inserts fresh so the AFTER INSERT trigger
-  // gets a genuinely new row to react to. Safe whether nothing was ever inserted yet
-  // (cleanup is a harmless no-op) or a previous insert got stuck un-promoted.
+  // Single retrigger action (/api/handoff-history/retrigger) — the backend decides
+  // whether this PO only needs a BC-only check/create (already in CustomerPOUL) or
+  // the full BigQuery-refetch + MSSQL re-insert (not yet in CustomerPOUL), instead of
+  // the user having to pick between "Retrigger Handoff (MSSQL)" and "Retrigger BC
+  // only" themselves.
   function renderRetriggerAction(container, poRef) {
     container.classList.remove("hidden");
     container.innerHTML = `
-      <button class="btn-reprocess dash-retrigger-mssql-btn" type="button">Retrigger Handoff (MSSQL)</button>
+      <button class="btn-reprocess dash-retrigger-btn" type="button">Retrigger</button>
       <span class="dash-buffer-result"></span>
-      <button class="btn-reset dash-retrigger-bc-btn" type="button">Retrigger BC only</button>
-      <span class="dash-buffer-result dash-retrigger-bc-result"></span>
     `;
-    const btn = container.querySelector(".dash-retrigger-mssql-btn");
+    const btn = container.querySelector(".dash-retrigger-btn");
     const resultEl = container.querySelector(".dash-buffer-result");
     btn.addEventListener("click", async () => {
       btn.disabled = true;
-      resultEl.textContent = "Cleaning up and re-inserting…";
+      resultEl.textContent = "Retriggering…";
       resultEl.className = "dash-buffer-result";
       try {
-        const res = await fetch("/api/handoff-history/retrigger-mssql", {
+        const res = await fetch("/api/handoff-history/retrigger", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ po_ref_number: poRef }),
         });
         const data = await res.json();
-        if (!res.ok || data.status !== "success") throw new Error(data.message || data.error || data.detail || "Retrigger failed");
-        resultEl.textContent = "✓ Re-inserted — click Check MSSQL again to confirm.";
-        resultEl.className = "dash-buffer-result ok";
-        btn.remove();
+        if (!res.ok || data.status === "error") throw new Error(data.message || data.error || data.detail || "Retrigger failed");
+        if (data.path === "bc_only") {
+          const icon = data.status === "pending" ? "⏳ " : "✓ ";
+          resultEl.textContent = icon + (data.detail || "Business Central checked/updated.");
+          resultEl.className = "dash-buffer-result " + (data.status === "pending" ? "warn" : "ok");
+        } else {
+          resultEl.textContent = "✓ Re-inserted and sent to Business Central — click Check MSSQL again to confirm.";
+          resultEl.className = "dash-buffer-result ok";
+          btn.remove();
+        }
       } catch (e) {
         resultEl.textContent = "Error: " + e.message;
         resultEl.className = "dash-buffer-result warn";
         btn.disabled = false;
-      }
-    });
-
-    // "BC only" — skips MSSQL/BigQuery entirely, just re-checks/backfills Business
-    // Central from whatever MSSQL already has. Useful when MSSQL is already correct
-    // but BC is missing the order or short some lines.
-    const bcBtn = container.querySelector(".dash-retrigger-bc-btn");
-    const bcResultEl = container.querySelector(".dash-retrigger-bc-result");
-    bcBtn.addEventListener("click", async () => {
-      bcBtn.disabled = true;
-      bcResultEl.textContent = "Checking Business Central…";
-      bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result";
-      try {
-        const res = await fetch("/api/handoff-history/retrigger-bc-only", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ po_ref_number: poRef }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.status === "error") throw new Error(data.error || data.detail || "BC retrigger failed");
-        const icon = data.status === "pending" ? "⏳ " : "✓ ";
-        bcResultEl.textContent = icon + (data.detail || "Business Central checked/updated.");
-        bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result " + (data.status === "pending" ? "warn" : "ok");
-      } catch (e) {
-        bcResultEl.textContent = "Error: " + e.message;
-        bcResultEl.className = "dash-buffer-result dash-retrigger-bc-result warn";
-      } finally {
-        bcBtn.disabled = false;
       }
     });
   }
