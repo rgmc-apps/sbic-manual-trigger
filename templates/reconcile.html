@@ -10,6 +10,13 @@
 </head>
 <body>
 
+  {% macro company_options(placeholder="— Select a company —") %}
+  <option value="">{{ placeholder }}</option>
+  {% for c in companies %}
+  <option value="{{ c }}">{{ c }}</option>
+  {% endfor %}
+  {% endmacro %}
+
   <!-- ── Header ── -->
   <header class="site-header">
     <div class="header-inner">
@@ -92,10 +99,7 @@
               <label class="form-label" for="company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="company-select">
-                  <option value="">— Select a company —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options() }}
                 </select>
               </div>
             </div>
@@ -127,10 +131,7 @@
               <label class="form-label" for="cloudsql-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="cloudsql-company-select">
-                  <option value="">— Select a company —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options() }}
                 </select>
               </div>
             </div>
@@ -168,10 +169,7 @@
               <label class="form-label" for="history-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="history-company-select">
-                  <option value="">— All companies —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options("— All companies —") }}
                 </select>
               </div>
             </div>
@@ -225,10 +223,7 @@
               <label class="form-label" for="overrides-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="overrides-company-select">
-                  <option value="">— Select a company —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options() }}
                 </select>
               </div>
             </div>
@@ -273,10 +268,7 @@
               <label class="form-label" for="bq-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="bq-company-select">
-                  <option value="">— All companies —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options("— All companies —") }}
                 </select>
               </div>
             </div>
@@ -353,10 +345,7 @@
               <label class="form-label" for="missing-shipto-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="missing-shipto-company-select">
-                  <option value="">— Select a company —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options() }}
                 </select>
               </div>
             </div>
@@ -450,10 +439,7 @@
               <label class="form-label" for="missing-items-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="missing-items-company-select">
-                  <option value="">— Select a company —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options() }}
                 </select>
               </div>
             </div>
@@ -538,10 +524,7 @@
               <label class="form-label" for="customer-shipto-company-select">Company</label>
               <div class="select-wrapper">
                 <select class="form-select" id="customer-shipto-company-select">
-                  <option value="">— Select a company —</option>
-                  {% for c in companies %}
-                  <option value="{{ c }}">{{ c }}</option>
-                  {% endfor %}
+                  {{ company_options() }}
                 </select>
               </div>
             </div>
@@ -840,6 +823,6 @@
     </div>
   </template>
 
-  <script src="/static/reconcile.js"></script>
+  <script type="module" src="/static/reconcile/main.js"></script>
 </body>
 </html>
